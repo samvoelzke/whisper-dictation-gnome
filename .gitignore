@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Whisper model cache (groß, wird automatisch heruntergeladen)
+whisper/
+
+# Laufzeit-Daten
+*.log
+*.pid
+*.wav

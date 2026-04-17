@@ -1,0 +1,10 @@
+{
+  "double_tap_key": "ctrl_r",
+  "double_tap_window_ms": 400,
+  "language": "de",
+  "model": "turbo",
+  "paste_mode": "auto",
+  "record_device": "default",
+  "max_record_seconds": 180,
+  "initial_prompt": ""
+}
