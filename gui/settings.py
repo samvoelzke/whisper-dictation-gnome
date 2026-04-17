@@ -92,6 +92,7 @@ HOTKEY_OPTIONS = [
 PASTE_OPTIONS = [
     ("auto", "Auto"),
     ("ctrl_v", "Ctrl+V"),
+    ("cmd_v", "Cmd+V (macOS)"),
     ("ctrl_shift_v", "Ctrl+Shift+V"),
     ("shift_insert", "Shift+Insert"),
 ]

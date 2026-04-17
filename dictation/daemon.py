@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -24,11 +25,22 @@ import torch
 import whisper
 from pynput import keyboard
 
+IS_MACOS = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
+
 try:
     from Xlib import X, display as xdisplay
-except Exception:  # pragma: no cover - optional runtime dependency
+except Exception:
     X = None
     xdisplay = None
+
+if IS_MACOS:
+    try:
+        import sounddevice as sd
+    except ImportError:
+        sd = None  # type: ignore[assignment]
+else:
+    sd = None  # type: ignore[assignment]
 
 CONFIG_DIR = Path.home() / ".config" / "whisper-dictation"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -59,21 +71,17 @@ HOTKEYS: dict[str, tuple[keyboard.Key, frozenset[keyboard.Key], str]] = {
 }
 
 TERMINAL_HINTS = (
-    "gnome-terminal",
-    "kgx",
-    "tilix",
-    "terminator",
-    "kitty",
-    "alacritty",
-    "wezterm",
-    "konsole",
-    "xfce4-terminal",
-    "mate-terminal",
-    "lxterminal",
+    "gnome-terminal", "kgx", "tilix", "terminator", "kitty",
+    "alacritty", "wezterm", "konsole", "xfce4-terminal",
+    "mate-terminal", "lxterminal", "iterm2", "terminal",
 )
 
 
 def notify(summary: str, body: str = "") -> None:
+    if IS_MACOS:
+        script = f'display notification "{body}" with title "{summary}"'
+        subprocess.run(["osascript", "-e", script], check=False, capture_output=True)
+        return
     if shutil_which("notify-send") is None:
         return
     command = ["notify-send", "-a", "Whisper Dictation", summary]
@@ -90,12 +98,34 @@ def shutil_which(binary: str) -> str | None:
     return None
 
 
+def check_macos_accessibility() -> None:
+    """Warn if Accessibility permission is likely missing on macOS."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", "tell application \"System Events\" to get name of first process"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if result.returncode != 0:
+            print(
+                "[whisper-dictation] WARNING: Accessibility permission may be missing.\n"
+                "  Go to: System Settings → Privacy & Security → Accessibility\n"
+                "  Add and enable the Terminal (or Python) app you are running this from.",
+                flush=True,
+            )
+    except Exception:
+        pass
+
+
 def load_config() -> dict[str, Any]:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
+        defaults = DEFAULT_CONFIG.copy()
+        if IS_MACOS:
+            defaults["record_device"] = "default"
+            defaults["paste_mode"] = "cmd_v"
         CONFIG_FILE.write_text(
-            json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=True) + "\n",
+            json.dumps(defaults, indent=2, ensure_ascii=True) + "\n",
             encoding="utf-8",
         )
 
@@ -122,10 +152,18 @@ def read_wav_mono(path: Path) -> np.ndarray:
 
     if sample_rate != 16000:
         raise RuntimeError(
-            f"Unexpected sample rate {sample_rate}. Expected 16000 Hz from arecord."
+            f"Unexpected sample rate {sample_rate}. Expected 16000 Hz."
         )
 
     return audio
+
+
+def _best_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if IS_MACOS and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 class WhisperDictationDaemon:
@@ -141,19 +179,29 @@ class WhisperDictationDaemon:
         self.hotkey_name = hotkey_name
         self.hotkey, self.hotkey_fallbacks, self.hotkey_label = HOTKEYS[hotkey_name]
         self.double_tap_window = max(150, int(config["double_tap_window_ms"])) / 1000.0
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = _best_device()
         self.model: whisper.Whisper | None = None
         self.listener: keyboard.Listener | None = None
         self.controller = keyboard.Controller()
         self.lock = threading.RLock()
+
+        # Linux: arecord subprocess; macOS: sounddevice thread
         self.recording_process: subprocess.Popen[bytes] | None = None
+        self.recording_sd_thread: threading.Thread | None = None
+        self.recording_sd_stop: threading.Event | None = None
+        self.recording_sd_frames: list[np.ndarray] = []
+
         self.recording_file: Path | None = None
         self.recording_timer: threading.Timer | None = None
         self.last_hotkey_release: float | None = None
         self.busy = False
         self.stopping = False
 
+    # ── Linux: ALSA mic volume ────────────────────────────────────────────────
+
     def _init_mic_volume(self) -> None:
+        if not IS_LINUX:
+            return
         device = str(self.config.get("record_device", "default"))
         import re as _re
         m = _re.match(r"(?:plug)?hw:(\d+)", device)
@@ -172,13 +220,21 @@ class WhisperDictationDaemon:
         except (IndexError, ValueError):
             current_vol = -1
         if current_vol < 20:
-            subprocess.run(["amixer", "-c", card, "cset", "numid=6", "26"], check=False, capture_output=True)
+            subprocess.run(
+                ["amixer", "-c", card, "cset", "numid=6", "26"],
+                check=False, capture_output=True,
+            )
             print(f"[whisper-dictation] mic volume set to 26 on card {card}", flush=True)
 
+    # ── Startup ───────────────────────────────────────────────────────────────
+
     def run(self) -> None:
+        if IS_MACOS:
+            check_macos_accessibility()
         self._init_mic_volume()
         print(
-            f"[whisper-dictation] loading model={self.config['model']} device={self.device}",
+            f"[whisper-dictation] platform={platform.system()} "
+            f"loading model={self.config['model']} device={self.device}",
             flush=True,
         )
         notify("Lade Modell", f"{self.config['model']} auf {self.device}")
@@ -197,6 +253,8 @@ class WhisperDictationDaemon:
         print("[whisper-dictation] listener started", flush=True)
         self.listener.start()
         self.listener.join()
+
+    # ── Hotkey detection ──────────────────────────────────────────────────────
 
     def _is_hotkey(self, key: keyboard.Key | keyboard.KeyCode | None) -> bool:
         return key == self.hotkey or key in self.hotkey_fallbacks
@@ -225,41 +283,104 @@ class WhisperDictationDaemon:
         if self.busy:
             notify("Noch beschäftigt", "Bitte warten, die letzte Aufnahme wird noch verarbeitet.")
             return
-        if self.recording_process is None:
+        is_recording = (
+            self.recording_process is not None or self.recording_sd_thread is not None
+        )
+        if not is_recording:
             self.start_recording()
         else:
             self.stop_recording()
 
-    def start_recording(self) -> None:
-        if shutil_which("arecord") is None:
-            raise RuntimeError("arecord is not installed.")
+    # ── Recording: Linux (arecord) ────────────────────────────────────────────
 
+    def _start_recording_linux(self, output_path: Path) -> None:
+        if shutil_which("arecord") is None:
+            raise RuntimeError("arecord ist nicht installiert (sudo apt install alsa-utils).")
+
+        command = [
+            "arecord", "-q",
+            "-D", str(self.config["record_device"]),
+            "-f", "S16_LE",
+            "-r", "16000",
+            "-c", "1",
+            "-t", "wav",
+            str(output_path),
+        ]
+        self.recording_process = subprocess.Popen(command)
+
+    def _stop_recording_linux(self) -> subprocess.Popen[bytes]:
+        process = self.recording_process
+        self.recording_process = None
+        process.send_signal(signal.SIGINT)  # type: ignore[union-attr]
+        return process  # type: ignore[return-value]
+
+    # ── Recording: macOS (sounddevice) ───────────────────────────────────────
+
+    def _start_recording_macos(self, output_path: Path) -> None:
+        if sd is None:
+            raise RuntimeError(
+                "sounddevice ist nicht installiert (pip install sounddevice)."
+            )
+
+        self.recording_sd_frames = []
+        self.recording_sd_stop = threading.Event()
+        stop_event = self.recording_sd_stop
+        frames = self.recording_sd_frames
+
+        def _record() -> None:
+            device_cfg = str(self.config.get("record_device", "default"))
+            device_arg: str | int | None = None if device_cfg == "default" else device_cfg
+            try:
+                with sd.InputStream(
+                    samplerate=16000,
+                    channels=1,
+                    dtype="int16",
+                    device=device_arg,
+                    blocksize=1024,
+                ) as stream:
+                    while not stop_event.is_set():
+                        data, _ = stream.read(1024)
+                        frames.append(data.copy())
+            except Exception as exc:
+                print(f"[whisper-dictation] sounddevice error: {exc}", file=sys.stderr, flush=True)
+
+        self.recording_sd_thread = threading.Thread(target=_record, daemon=True)
+        self.recording_sd_thread.start()
+
+    def _stop_recording_macos(self, output_path: Path) -> None:
+        if self.recording_sd_stop is not None:
+            self.recording_sd_stop.set()
+        if self.recording_sd_thread is not None:
+            self.recording_sd_thread.join(timeout=3)
+        self.recording_sd_thread = None
+        self.recording_sd_stop = None
+
+        frames = self.recording_sd_frames
+        self.recording_sd_frames = []
+
+        if frames:
+            audio_data = np.concatenate(frames, axis=0)
+            with wave.open(str(output_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(audio_data.tobytes())
+
+    # ── Recording: common ─────────────────────────────────────────────────────
+
+    def start_recording(self) -> None:
         handle = tempfile.NamedTemporaryFile(
-            prefix="whisper-dictation-",
-            suffix=".wav",
-            delete=False,
+            prefix="whisper-dictation-", suffix=".wav", delete=False,
         )
         handle.close()
         output_path = Path(handle.name)
-
-        command = [
-            "arecord",
-            "-q",
-            "-D",
-            str(self.config["record_device"]),
-            "-f",
-            "S16_LE",
-            "-r",
-            "16000",
-            "-c",
-            "1",
-            "-t",
-            "wav",
-            str(output_path),
-        ]
-
-        self.recording_process = subprocess.Popen(command)
         self.recording_file = output_path
+
+        if IS_MACOS:
+            self._start_recording_macos(output_path)
+        else:
+            self._start_recording_linux(output_path)
+
         print(f"[whisper-dictation] recording started file={output_path}", flush=True)
         self.recording_timer = threading.Timer(
             int(self.config["max_record_seconds"]),
@@ -271,18 +392,19 @@ class WhisperDictationDaemon:
 
     def auto_stop_recording(self) -> None:
         with self.lock:
-            if self.recording_process is None or self.busy:
+            is_recording = (
+                self.recording_process is not None or self.recording_sd_thread is not None
+            )
+            if not is_recording or self.busy:
                 return
             notify("Aufnahme wird beendet", "Maximale Aufnahmedauer erreicht.")
             self.stop_recording()
 
     def stop_recording(self) -> None:
-        if self.recording_process is None or self.recording_file is None:
+        output_path = self.recording_file
+        if output_path is None:
             return
 
-        process = self.recording_process
-        output_path = self.recording_file
-        self.recording_process = None
         self.recording_file = None
         self.busy = True
         print(f"[whisper-dictation] recording stopped file={output_path}", flush=True)
@@ -291,35 +413,56 @@ class WhisperDictationDaemon:
             self.recording_timer.cancel()
             self.recording_timer = None
 
-        process.send_signal(signal.SIGINT)
-        worker = threading.Thread(
-            target=self.transcribe_and_paste,
-            args=(process, output_path),
-            daemon=True,
-        )
+        if IS_MACOS:
+            worker = threading.Thread(
+                target=self._stop_and_transcribe_macos,
+                args=(output_path,),
+                daemon=True,
+            )
+        else:
+            process = self._stop_recording_linux()
+            worker = threading.Thread(
+                target=self._stop_and_transcribe_linux,
+                args=(process, output_path),
+                daemon=True,
+            )
+
         worker.start()
         notify("Transkription läuft", "Die Aufnahme wird gerade erkannt und eingefügt.")
 
-    def transcribe_and_paste(
-        self,
-        process: subprocess.Popen[bytes],
-        output_path: Path,
+    def _stop_and_transcribe_macos(self, output_path: Path) -> None:
+        self._stop_recording_macos(output_path)
+        self._transcribe_and_paste(output_path)
+
+    def _stop_and_transcribe_linux(
+        self, process: subprocess.Popen[bytes], output_path: Path
     ) -> None:
         try:
             process.wait(timeout=5)
+        except Exception:
+            pass
+        self._transcribe_and_paste(output_path)
+
+    def _transcribe_and_paste(self, output_path: Path) -> None:
+        try:
+            if not output_path.exists() or output_path.stat().st_size < 100:
+                notify("Kein Text erkannt", "Die Aufnahme war leer.")
+                return
+
             audio = read_wav_mono(output_path)
             rms = float(np.sqrt(np.mean(audio ** 2)))
             print(f"[whisper-dictation] audio rms={rms:.5f}", flush=True)
             if rms < 0.002:
                 notify("Kein Text erkannt", "Die Aufnahme war leer oder zu leise.")
                 return
-            text = self.transcribe_audio(audio).strip()
+
+            text = self._transcribe_audio(audio).strip()
             if not text:
-                notify("Kein Text erkannt", "Die Aufnahme war leer oder zu leise.")
+                notify("Kein Text erkannt", "Nichts verstanden.")
                 return
 
             print(f"[whisper-dictation] transcription ready chars={len(text)}", flush=True)
-            self.paste_text(text)
+            self._paste_text(text)
             notify("Eingefügt", text[:100])
         except Exception as exc:
             notify("Fehler", str(exc))
@@ -328,7 +471,9 @@ class WhisperDictationDaemon:
             self.busy = False
             output_path.unlink(missing_ok=True)
 
-    def transcribe_audio(self, audio: np.ndarray) -> str:
+    # ── Transcription ─────────────────────────────────────────────────────────
+
+    def _transcribe_audio(self, audio: np.ndarray) -> str:
         if self.model is None:
             raise RuntimeError("Model is not loaded.")
 
@@ -348,42 +493,64 @@ class WhisperDictationDaemon:
             result = self.model.transcribe(audio, **options)
         return str(result["text"])
 
-    def paste_text(self, text: str) -> None:
-        if shutil_which("xclip") is None:
-            raise RuntimeError("xclip is not installed.")
+    # ── Paste ─────────────────────────────────────────────────────────────────
 
-        print(f"[whisper-dictation] paste mode={self.resolve_paste_mode()}", flush=True)
+    def _paste_text(self, text: str) -> None:
+        if IS_MACOS:
+            self._paste_macos(text)
+        else:
+            self._paste_linux(text)
+
+    def _paste_linux(self, text: str) -> None:
+        if shutil_which("xclip") is None:
+            raise RuntimeError("xclip ist nicht installiert (sudo apt install xclip).")
+
+        paste_mode = self._resolve_paste_mode()
+        print(f"[whisper-dictation] paste mode={paste_mode}", flush=True)
         subprocess.run(
             ["xclip", "-selection", "clipboard"],
             input=text.encode("utf-8"),
             check=True,
         )
         time.sleep(0.08)
-        self.send_paste_shortcut()
+        self._send_paste_shortcut(paste_mode)
 
-    def send_paste_shortcut(self) -> None:
-        paste_mode = self.resolve_paste_mode()
+    def _paste_macos(self, text: str) -> None:
+        subprocess.run(
+            ["pbcopy"],
+            input=text.encode("utf-8"),
+            check=True,
+        )
+        time.sleep(0.08)
+        paste_mode = self._resolve_paste_mode()
+        print(f"[whisper-dictation] paste mode={paste_mode}", flush=True)
+        self._send_paste_shortcut(paste_mode)
+
+    def _send_paste_shortcut(self, paste_mode: str) -> None:
         time.sleep(0.02)
-        if paste_mode == "ctrl_shift_v":
+        if paste_mode == "cmd_v":
+            with self.controller.pressed(keyboard.Key.cmd):
+                self.controller.tap("v")
+        elif paste_mode == "ctrl_shift_v":
             with self.controller.pressed(keyboard.Key.ctrl):
                 with self.controller.pressed(keyboard.Key.shift):
                     self.controller.tap("v")
-            return
-
-        if paste_mode == "shift_insert":
+        elif paste_mode == "shift_insert":
             with self.controller.pressed(keyboard.Key.shift):
                 self.controller.tap(keyboard.Key.insert)
-            return
+        else:
+            with self.controller.pressed(keyboard.Key.ctrl):
+                self.controller.tap("v")
 
-        with self.controller.pressed(keyboard.Key.ctrl):
-            self.controller.tap("v")
-
-    def resolve_paste_mode(self) -> str:
+    def _resolve_paste_mode(self) -> str:
         configured = str(self.config["paste_mode"]).lower()
         if configured != "auto":
             return configured
 
-        window_class = self.get_active_window_class()
+        if IS_MACOS:
+            return "cmd_v"
+
+        window_class = self._get_active_window_class()
         if not window_class:
             return "ctrl_v"
         if "xterm" in window_class or "uxterm" in window_class:
@@ -392,7 +559,7 @@ class WhisperDictationDaemon:
             return "ctrl_shift_v"
         return "ctrl_v"
 
-    def get_active_window_class(self) -> str | None:
+    def _get_active_window_class(self) -> str | None:
         if xdisplay is None or X is None:
             return None
 
@@ -412,6 +579,8 @@ class WhisperDictationDaemon:
         finally:
             display.close()
 
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+
     def shutdown(self) -> None:
         with self.lock:
             self.stopping = True
@@ -421,6 +590,8 @@ class WhisperDictationDaemon:
             if self.recording_process is not None:
                 self.recording_process.send_signal(signal.SIGINT)
                 self.recording_process = None
+            if self.recording_sd_stop is not None:
+                self.recording_sd_stop.set()
             if self.listener is not None:
                 self.listener.stop()
 
