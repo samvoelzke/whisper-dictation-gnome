@@ -55,6 +55,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "record_device": "default",
     "max_record_seconds": 180,
     "initial_prompt": "",
+    "ollama_postprocess": False,
+    "ollama_model": "llama3.2:3b",
+    "ollama_host": "http://localhost:11434",
 }
 
 # Each entry: (primary_key, fallback_keys_set, label)
@@ -488,6 +491,12 @@ class WhisperDictationDaemon:
                 return
 
             print(f"[whisper-dictation] transcription ready chars={len(text)}", flush=True)
+
+            if self.config.get("ollama_postprocess"):
+                notify("Verfeinere Text...", "Ollama läuft...")
+                text = self._ollama_postprocess(text)
+                print(f"[whisper-dictation] ollama postprocess done chars={len(text)}", flush=True)
+
             self._paste_text(text)
             notify("Eingefügt", text[:100])
         except Exception as exc:
@@ -518,6 +527,47 @@ class WhisperDictationDaemon:
         with torch.inference_mode():
             result = self.model.transcribe(audio, **options)
         return str(result["text"])
+
+    def _ollama_postprocess(self, text: str) -> str:
+        import urllib.request, json as _json
+        host = str(self.config.get("ollama_host", "http://localhost:11434")).rstrip("/")
+        model = str(self.config.get("ollama_model", "llama3.2:3b"))
+        language = str(self.config.get("language") or "de")
+
+        system = (
+            "Du bist ein Assistent der diktierten Text korrigiert. "
+            "Füge korrekte Satzzeichen, Groß-/Kleinschreibung und Absätze ein. "
+            "Korrigiere offensichtliche Erkennungsfehler. "
+            "Gib NUR den korrigierten Text zurück — keine Erklärungen, keine Anführungszeichen."
+        ) if language == "de" else (
+            "You are an assistant that cleans up dictated text. "
+            "Add correct punctuation, capitalization, and paragraph breaks. "
+            "Fix obvious speech recognition errors. "
+            "Return ONLY the corrected text — no explanations, no quotes."
+        )
+
+        payload = _json.dumps({
+            "model": model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": text},
+            ],
+        }).encode()
+
+        try:
+            req = urllib.request.Request(
+                f"{host}/api/chat",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = _json.loads(resp.read())
+                return str(data["message"]["content"]).strip() or text
+        except Exception as exc:
+            print(f"[whisper-dictation] ollama error (fallback to raw): {exc}", file=sys.stderr, flush=True)
+            return text
 
     # ── Paste ─────────────────────────────────────────────────────────────────
 

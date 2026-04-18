@@ -26,6 +26,9 @@ DEFAULT_CONFIG = {
     "record_device": "default",
     "max_record_seconds": 180,
     "initial_prompt": "",
+    "ollama_postprocess": False,
+    "ollama_model": "llama3.2:3b",
+    "ollama_host": "http://localhost:11434",
 }
 
 MODEL_OPTIONS = [
@@ -252,6 +255,19 @@ class SettingsApp(tk.Tk):
         prompt_entry = tk.Entry(self, textvariable=self.prompt_var, width=24)
         fields.append(("Initial Prompt", prompt_entry))
 
+        # ── Ollama Post-Processing ──────────────────────────────────────────
+        self.ollama_var = tk.BooleanVar(value=bool(self.config_data.get("ollama_postprocess", False)))
+        ollama_check = tk.Checkbutton(self, variable=self.ollama_var, text="Aktiv")
+        fields.append(("Ollama Text-Cleanup", ollama_check))
+
+        self.ollama_model_var = tk.StringVar(value=str(self.config_data.get("ollama_model", "llama3.2:3b")))
+        ollama_model_entry = tk.Entry(self, textvariable=self.ollama_model_var, width=24)
+        fields.append(("Ollama Modell", ollama_model_entry))
+
+        self.ollama_host_var = tk.StringVar(value=str(self.config_data.get("ollama_host", "http://localhost:11434")))
+        ollama_host_entry = tk.Entry(self, textvariable=self.ollama_host_var, width=24)
+        fields.append(("Ollama Host", ollama_host_entry))
+
         for i, (label_text, widget) in enumerate(fields):
             lbl = tk.Label(self, text=label_text, anchor="w")
             lbl.grid(row=row + i, column=0, sticky="w", **pad)
@@ -306,6 +322,9 @@ class SettingsApp(tk.Tk):
             "max_record_seconds": self.max_rec_var.get(),
             "record_device": self._device_map.get(self.device_var.get(), "default"),
             "initial_prompt": self.prompt_var.get().strip(),
+            "ollama_postprocess": self.ollama_var.get(),
+            "ollama_model": self.ollama_model_var.get().strip(),
+            "ollama_host": self.ollama_host_var.get().strip(),
         }
 
     def _refresh_status(self) -> None:
