@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Whisper Dictation – App Launcher
+# Findet das Projektverzeichnis relativ zur .app, startet Daemon + Menüleisten-App
+
+set -euo pipefail
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+PYTHON="${APP_DIR}/.venv/bin/python"
+DAEMON="${APP_DIR}/dictation/daemon.py"
+MENUBAR="${APP_DIR}/app/menubar.py"
+LOG="${HOME}/.cache/whisper-dictation/daemon.log"
+
+mkdir -p "${HOME}/.cache/whisper-dictation"
+
+# Falls venv noch nicht existiert: install-Skript ausführen
+if [[ ! -f "${PYTHON}" ]]; then
+  osascript -e "display dialog \"Whisper Dictation wird zum ersten Mal eingerichtet. Dies kann einige Minuten dauern.\" buttons {\"OK\"} default button \"OK\""
+  open -a Terminal "${APP_DIR}/bin/install-macos.sh"
+  exit 0
+fi
+
+# Daemon starten falls nicht läuft
+if ! pgrep -f "dictation/daemon.py" >/dev/null 2>&1; then
+  nohup "${PYTHON}" -u "${DAEMON}" >> "${LOG}" 2>&1 &
+fi
+
+# Menüleisten-App starten (blockiert bis geschlossen)
+exec "${PYTHON}" "${MENUBAR}"

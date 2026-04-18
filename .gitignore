@@ -13,3 +13,4 @@ whisper/
 *.log
 *.pid
 *.wav
+app/AppIcon.iconset/

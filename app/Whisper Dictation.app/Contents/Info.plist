@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Whisper Dictation</string>
+  <key>CFBundleDisplayName</key>
+  <string>Whisper Dictation</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.whisper-dictation.app</string>
+  <key>CFBundleVersion</key>
+  <string>1.0</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleExecutable</key>
+  <string>whisper-dictation-launcher</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSAccessibilityUsageDescription</key>
+  <string>Whisper Dictation benötigt Zugriff auf Bedienungshilfen um globale Tastendrücke zu erkennen und Text einzufügen.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Whisper Dictation benötigt das Mikrofon für die Spracherkennung.</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+</dict>
+</plist>

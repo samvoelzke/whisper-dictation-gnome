@@ -59,16 +59,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 # Each entry: (primary_key, fallback_keys_set, label)
 # Fallbacks handle systems where pynput reports the generic key instead of left/right variant.
-HOTKEYS: dict[str, tuple[keyboard.Key, frozenset[keyboard.Key], str]] = {
-    "ctrl_r": (keyboard.Key.ctrl_r, frozenset({keyboard.Key.ctrl}), "Right Ctrl"),
-    "ctrl_l": (keyboard.Key.ctrl_l, frozenset({keyboard.Key.ctrl}), "Left Ctrl"),
-    "alt_r": (keyboard.Key.alt_r, frozenset({keyboard.Key.alt}), "Right Alt"),
-    "alt_l": (keyboard.Key.alt_l, frozenset({keyboard.Key.alt}), "Left Alt"),
-    "f8": (keyboard.Key.f8, frozenset(), "F8"),
-    "f9": (keyboard.Key.f9, frozenset(), "F9"),
-    "f10": (keyboard.Key.f10, frozenset(), "F10"),
-    "pause": (keyboard.Key.pause, frozenset(), "Pause"),
-}
+def _hotkey_entry(key_name: str, fallbacks: frozenset, label: str):
+    try:
+        return (getattr(keyboard.Key, key_name), fallbacks, label)
+    except AttributeError:
+        return None
+
+HOTKEYS: dict[str, tuple] = {k: v for k, v in {
+    "ctrl_r": _hotkey_entry("ctrl_r", frozenset({keyboard.Key.ctrl}), "Right Ctrl"),
+    "ctrl_l": _hotkey_entry("ctrl_l", frozenset({keyboard.Key.ctrl}), "Left Ctrl"),
+    "alt_r":  _hotkey_entry("alt_r",  frozenset({keyboard.Key.alt}),  "Right Alt"),
+    "alt_l":  _hotkey_entry("alt_l",  frozenset({keyboard.Key.alt}),  "Left Alt"),
+    "f8":     _hotkey_entry("f8",     frozenset(), "F8"),
+    "f9":     _hotkey_entry("f9",     frozenset(), "F9"),
+    "f10":    _hotkey_entry("f10",    frozenset(), "F10"),
+    "pause":  _hotkey_entry("pause",  frozenset(), "Pause"),
+}.items() if v is not None}
 
 TERMINAL_HINTS = (
     "gnome-terminal", "kgx", "tilix", "terminator", "kitty",
@@ -98,22 +104,42 @@ def shutil_which(binary: str) -> str | None:
     return None
 
 
-def check_macos_accessibility() -> None:
-    """Warn if Accessibility permission is likely missing on macOS."""
+def _ax_is_process_trusted() -> bool:
     try:
-        result = subprocess.run(
-            ["osascript", "-e", "tell application \"System Events\" to get name of first process"],
-            capture_output=True, text=True, timeout=3, check=False,
+        import ctypes, ctypes.util
+        lib = ctypes.cdll.LoadLibrary(
+            ctypes.util.find_library("ApplicationServices") or
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
         )
-        if result.returncode != 0:
-            print(
-                "[whisper-dictation] WARNING: Accessibility permission may be missing.\n"
-                "  Go to: System Settings → Privacy & Security → Accessibility\n"
-                "  Add and enable the Terminal (or Python) app you are running this from.",
-                flush=True,
-            )
+        lib.AXIsProcessTrusted.restype = ctypes.c_bool
+        return bool(lib.AXIsProcessTrusted())
     except Exception:
-        pass
+        return True
+
+
+def check_macos_accessibility() -> None:
+    """Exit with clear instructions if Accessibility permission is missing."""
+    if _ax_is_process_trusted():
+        return
+
+    real_python = os.path.realpath(sys.executable)
+    print(
+        f"\n[whisper-dictation] FEHLER: Accessibility-Berechtigung fehlt!\n"
+        f"  Systemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen\n"
+        f"  → + klicken → Cmd+Shift+G → diesen Pfad einfügen:\n"
+        f"  {real_python}\n"
+        f"  → Schalter aktivieren → Daemon neu starten.\n",
+        flush=True,
+    )
+    notify(
+        "Accessibility-Berechtigung fehlt",
+        "Systemeinstellungen → Bedienungshilfen → Python eintragen, dann Daemon neu starten.",
+    )
+    subprocess.run(
+        ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+        check=False, capture_output=True,
+    )
+    sys.exit(1)
 
 
 def load_config() -> dict[str, Any]:

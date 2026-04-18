@@ -2,4 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
-exec /usr/bin/python3 "${ROOT}/gui/settings.py"
+
+if [[ "$(uname)" == "Darwin" ]]; then
+  exec "${ROOT}/.venv/bin/python" "${ROOT}/gui/settings_macos.py"
+else
+  exec "${ROOT}/.venv/bin/python" "${ROOT}/gui/settings.py"
+fi
