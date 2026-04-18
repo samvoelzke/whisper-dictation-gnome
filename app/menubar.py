@@ -23,6 +23,7 @@ SETTINGS_SCRIPT = PROJECT_ROOT / "gui" / "settings_macos.py"
 LOG_FILE = Path.home() / ".cache" / "whisper-dictation" / "daemon.log"
 CONFIG_FILE = Path.home() / ".config" / "whisper-dictation" / "config.json"
 
+OLLAMA_SETUP_SCRIPT = PROJECT_ROOT / "gui" / "ollama_setup.py"
 OLLAMA_MODELS = ["llama3.2:3b", "llama3.2:1b", "phi3:mini", "gemma3:1b", "mistral:7b"]
 
 
@@ -72,6 +73,25 @@ def ollama_running() -> bool:
 def ollama_installed() -> bool:
     r = subprocess.run(["which", "ollama"], capture_output=True, text=True, check=False)
     return r.returncode == 0
+
+
+def ollama_model_downloaded(model: str) -> bool:
+    """Prüft ob ein Modell lokal vorhanden ist."""
+    try:
+        r = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=False)
+        return any(model.split(":")[0] in line for line in r.stdout.splitlines())
+    except Exception:
+        return False
+
+
+def confirm_dialog(title: str, message: str) -> bool:
+    """Zeigt einen nativen macOS Bestätigungsdialog. Gibt True zurück wenn 'Ja' geklickt."""
+    script = (
+        f'display dialog "{message}" with title "{title}" '
+        f'buttons {{"Abbrechen", "Herunterladen"}} default button "Herunterladen"'
+    )
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+    return "Herunterladen" in r.stdout
 
 
 def load_config() -> dict:
@@ -128,33 +148,14 @@ class AppDelegate(NSObject):
         self.ollama_toggle = mi(ollama_menu, "◻  Text-Cleanup aktivieren", "toggleOllama:", t)
         ollama_menu.addItem_(NSMenuItem.separatorItem())
 
-        # Modell-Untermenü
-        model_menu = NSMenu.alloc().init()
-        self._model_items: dict = {}
-        cfg = load_config()
-        current_model = cfg.get("ollama_model", "llama3.2:3b")
-        for m in OLLAMA_MODELS:
-            prefix = "✓ " if m == current_model else "   "
-            item = mi(model_menu, f"{prefix}{m}", "selectModel:", t)
-            item.setRepresentedObject_(m)
-            self._model_items[m] = item
-
-        model_parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "🧠  Modell wählen", None, ""
-        )
-        model_parent.setSubmenu_(model_menu)
-        ollama_menu.addItem_(model_parent)
-
-        mi(ollama_menu, "⬇  Modell herunterladen", "downloadModel:", t)
-        ollama_menu.addItem_(NSMenuItem.separatorItem())
-        self.ollama_install = mi(ollama_menu, "📦  Ollama installieren (brew)", "installOllama:", t)
-        mi(ollama_menu, "▶  Ollama starten", "startOllama:", t)
+        mi(ollama_menu, "🧙  Einrichten (Schritt-für-Schritt)…", "openOllamaWizard:", t)
 
         ollama_parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "🤖  Ollama", None, ""
+            "🤖  Ollama Text-Cleanup", None, ""
         )
         ollama_parent.setSubmenu_(ollama_menu)
         menu.addItem_(ollama_parent)
+        self._model_items: dict = {}
 
         menu.addItem_(NSMenuItem.separatorItem())
         mi(menu, "⚙  Einstellungen",        "openSettings:", t)
@@ -184,7 +185,6 @@ class AppDelegate(NSObject):
     def _update_ollama_menu(self):
         cfg = load_config()
         postprocess = cfg.get("ollama_postprocess", False)
-        current_model = cfg.get("ollama_model", "llama3.2:3b")
         running = ollama_running()
         installed = ollama_installed()
 
@@ -195,10 +195,6 @@ class AppDelegate(NSObject):
         self.ollama_toggle.setTitle_(
             "◼  Text-Cleanup deaktivieren" if postprocess else "◻  Text-Cleanup aktivieren"
         )
-        self.ollama_install.setEnabled_(not installed)
-
-        for m, item in self._model_items.items():
-            item.setTitle_(("✓ " if m == current_model else "   ") + m)
 
     def updateStatus_(self, timer):
         self._update_status()
@@ -232,29 +228,11 @@ class AppDelegate(NSObject):
         time.sleep(1)
         self._update_ollama_menu()
 
-    def selectModel_(self, sender):
-        model = sender.representedObject()
-        if model:
-            save_config_key("ollama_model", model)
-            run_daemon("--restart")
-            self._update_ollama_menu()
-
-    def downloadModel_(self, sender):
-        model = load_config().get("ollama_model", "llama3.2:3b")
-        script = f'tell application "Terminal" to do script "ollama pull {model} && echo \\"✓ Fertig!\\""'
-        subprocess.run(["osascript", "-e", script], check=False)
-
-    def installOllama_(self, sender):
-        script = 'tell application "Terminal" to do script "brew install ollama && ollama serve"'
-        subprocess.run(["osascript", "-e", script], check=False)
-
-    def startOllama_(self, sender):
+    def openOllamaWizard_(self, sender):
         subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            [PYTHON, str(OLLAMA_SETUP_SCRIPT)],
+            start_new_session=True,
         )
-        time.sleep(2)
-        self._update_ollama_menu()
 
     # ── Sonstiges
 

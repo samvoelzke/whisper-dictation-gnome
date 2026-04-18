@@ -562,7 +562,7 @@ class WhisperDictationDaemon:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 data = _json.loads(resp.read())
                 return str(data["message"]["content"]).strip() or text
         except Exception as exc:
