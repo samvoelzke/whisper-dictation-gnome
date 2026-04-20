@@ -1,42 +1,21 @@
 #!/usr/bin/env python3
-
 from __future__ import annotations
 
 import json
 import re
 import subprocess
+import threading
 from pathlib import Path
 
 import gi
-
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gio, Gtk
-
-
-def detect_alsa_capture_devices() -> list[tuple[str, str]]:
-    """Return list of (alsa_device_string, human_label) for all capture cards."""
-    devices: list[tuple[str, str]] = [("default", "default (Systemstandard)")]
-    try:
-        out = subprocess.run(
-            ["arecord", "--list-devices"],
-            capture_output=True, text=True, check=False,
-        ).stdout
-        for line in out.splitlines():
-            m = re.match(r"card\s+(\d+):\s+\S+\s+\[(.+?)\].*device\s+(\d+):\s+\S+\s+\[(.+?)\]", line)
-            if m:
-                card, card_name, dev, dev_name = m.group(1), m.group(2), m.group(3), m.group(4)
-                hw = f"plughw:{card},{dev}"
-                label = f"{hw}  —  {card_name} / {dev_name}"
-                devices.append((hw, label))
-    except Exception:
-        pass
-    return devices
-
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gio, Gtk
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_DIR = Path.home() / ".config" / "whisper-dictation"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-LOG_FILE = Path.home() / ".cache" / "whisper-dictation" / "daemon.log"
+CONFIG_DIR   = Path.home() / ".config" / "whisper-dictation"
+CONFIG_FILE  = CONFIG_DIR / "config.json"
+LOG_FILE     = Path.home() / ".cache" / "whisper-dictation" / "daemon.log"
 DAEMON_SCRIPT = PROJECT_ROOT / "bin" / "whisper-dictation.sh"
 
 DEFAULT_CONFIG = {
@@ -48,290 +27,469 @@ DEFAULT_CONFIG = {
     "record_device": "default",
     "max_record_seconds": 180,
     "initial_prompt": "",
+    "push_to_talk": False,
+    "postprocess": False,
+    "postprocess_model": "qwen3:14b-q4_K_M",
+    "postprocess_prompt": "",
 }
 
-MODEL_OPTIONS = [
-    ("turbo", "turbo"),
-    ("tiny", "tiny"),
-    ("base", "base"),
-    ("small", "small"),
-    ("medium", "medium"),
-    ("large-v3", "large-v3"),
-    ("tiny.en", "tiny.en"),
-    ("base.en", "base.en"),
-    ("small.en", "small.en"),
-    ("medium.en", "medium.en"),
-    ("large-v2", "large-v2"),
+# value, display label, star-rating (1-5), short review
+MODEL_OPTIONS: list[tuple[str, str, int, str]] = [
+    ("turbo",     "turbo  ★★★★★  Empfohlen",   5, "Beste Wahl. Genauso gut wie large-v3, aber 6x schneller. Ideal fuer Deutsch."),
+    ("large-v3",  "large-v3  ★★★★★  Max. Qualitaet", 5, "Hoechste Genauigkeit, besonders bei Fachbegriffen. ~3x langsamer als turbo."),
+    ("medium",    "medium  ★★★☆☆  Mittelklasse", 3, "Gut fuer schwaeachere Hardware ohne dedizierte GPU."),
+    ("small",     "small  ★★☆☆☆  Leichtgewicht", 2, "Schnell, aber spuerbar ungenauer. Nur fuer sehr alte Hardware."),
+    ("base",      "base  ★☆☆☆☆  Minimal",       1, "Kaum brauchbar fuer Deutsch. Nur fuer Tests."),
+    ("tiny",      "tiny  ★☆☆☆☆  Winzig",        1, "Extrem ungenau. Nicht fuer produktiven Einsatz geeignet."),
+    ("large-v2",  "large-v2  ★★★★☆  Veraltet",  4, "Vorgaenger von large-v3. Nur fuer Vergleiche interessant."),
+    ("medium.en", "medium.en  ★★★☆☆  Nur Englisch", 3, "Englisch-optimiert, etwas schneller als medium."),
+    ("small.en",  "small.en  ★★☆☆☆  Nur Englisch", 2, "Englisch-only, kompakt."),
+    ("base.en",   "base.en  ★☆☆☆☆  Nur Englisch", 1, "Englisch-only, minimal."),
+    ("tiny.en",   "tiny.en  ★☆☆☆☆  Nur Englisch", 1, "Englisch-only, winzig."),
+]
+MODEL_OPTS_SIMPLE = [(v, l) for v, l, _, _ in MODEL_OPTIONS]
+MODEL_REVIEWS     = {v: (s, r) for v, _, s, r in MODEL_OPTIONS}
+
+LANGUAGE_OPTIONS = [
+    ("de",  "Deutsch (de)"),
+    ("en",  "Englisch (en)"),
+    ("",    "Automatisch erkennen"),
+    ("fr",  "Französisch (fr)"),
+    ("es",  "Spanisch (es)"),
+    ("it",  "Italienisch (it)"),
+    ("pt",  "Portugiesisch (pt)"),
+    ("nl",  "Niederländisch (nl)"),
+    ("pl",  "Polnisch (pl)"),
+    ("ru",  "Russisch (ru)"),
+    ("zh",  "Chinesisch (zh)"),
+    ("ja",  "Japanisch (ja)"),
 ]
 
-MODEL_HINTS = {
-    "turbo": "Schnell und sehr stark. Gute Standardwahl fuer lokale Diktate.",
-    "tiny": "Extrem schnell, aber die geringste Genauigkeit.",
-    "base": "Etwas genauer als tiny, immer noch sehr leicht.",
-    "small": "Guter Mittelweg fuer viele Systeme.",
-    "medium": "Deutlich genauer, aber merklich schwerer.",
-    "large-v3": "Beste Qualitaet, braucht am meisten VRAM und Ladezeit.",
-    "tiny.en": "Nur Englisch, maximal leichtgewichtig.",
-    "base.en": "Nur Englisch, kompakt und etwas praeziser.",
-    "small.en": "Nur Englisch, guter Kompromiss.",
-    "medium.en": "Nur Englisch, stark aber schwerer.",
-    "large-v2": "Aelteres grosses Modell. Meist nur noetig fuer direkte Vergleiche.",
-}
-
 HOTKEY_OPTIONS = [
-    ("ctrl_r", "Right Ctrl"),
-    ("ctrl_l", "Left Ctrl"),
-    ("alt_r", "Right Alt"),
-    ("alt_l", "Left Alt"),
-    ("f8", "F8"),
-    ("f9", "F9"),
-    ("f10", "F10"),
-    ("pause", "Pause"),
+    ("ctrl_r", "Rechtes Strg"),
+    ("ctrl_l", "Linkes Strg"),
+    ("alt_r",  "Rechtes Alt"),
+    ("alt_l",  "Linkes Alt"),
+    ("f8",     "F8"),
+    ("f9",     "F9"),
+    ("f10",    "F10"),
+    ("pause",  "Pause"),
 ]
 
 PASTE_OPTIONS = [
-    ("auto", "Auto"),
-    ("ctrl_v", "Ctrl+V"),
-    ("cmd_v", "Cmd+V (macOS)"),
-    ("ctrl_shift_v", "Ctrl+Shift+V"),
-    ("shift_insert", "Shift+Insert"),
+    ("auto",        "Auto (empfohlen)"),
+    ("ctrl_v",      "Ctrl+V"),
+    ("cmd_v",       "Cmd+V (macOS)"),
+    ("ctrl_shift_v","Ctrl+Shift+V (Terminal)"),
+    ("shift_insert","Shift+Insert (xterm)"),
 ]
+
+
+def detect_alsa_capture_devices() -> list[tuple[str, str]]:
+    devices: list[tuple[str, str]] = [("default", "Standard-Mikrofon")]
+    try:
+        out = subprocess.run(
+            ["arecord", "--list-devices"], capture_output=True, text=True, check=False,
+        ).stdout
+        for line in out.splitlines():
+            m = re.match(r"card\s+(\d+):\s+\S+\s+\[(.+?)\].*device\s+(\d+):\s+\S+\s+\[(.+?)\]", line)
+            if m:
+                card, card_name, dev, dev_name = m.group(1), m.group(2), m.group(3), m.group(4)
+                hw = f"plughw:{card},{dev}"
+                devices.append((hw, f"{card_name} / {dev_name}  ({hw})"))
+    except Exception:
+        pass
+    return devices
+
+
+OLLAMA_RATINGS: list[tuple[str, int, str]] = [
+    ("gemma4:27b", 5, "Neu & stark. Google Gemma 4 27B — Top 3 weltweit, exzellent fuer Deutsch/Englisch. Empfohlen fuer maximale Qualitaet."),
+    ("qwen3:32b",  5, "Maximale Qualitaet. Erkennbar besser bei langen Saetzen & Fachbegriffen. ~3-5 Sek. auf GPU."),
+    ("qwen3:14b",  4, "Beste Balance. Schnell (~1-2 Sek.), sehr gute Bereinigung. Ideal fuer den taeglichen Einsatz."),
+    ("qwen3:8b",   3, "Gut & schnell. Merklich kompakter als 14b, fuer die meisten Texte ausreichend."),
+    ("qwen3:4b",   2, "Kompakt, aber bei komplexen Saetzen spuerbar ungenauer als 14b/8b."),
+    ("qwen3:1b",   1, "Sehr schnell, aber Bereinigungsqualitaet gering — nur fuer schwache Hardware."),
+    ("llama3",     3, "Gutes Allround-Modell, Deutsch etwas schlechter als Qwen3."),
+    ("mistral",    2, "Solide fuer Englisch, fuer Deutsche Transkripte nicht ideal."),
+    ("gemma3",     3, "Vorgaenger von Gemma 4. Gute Qualitaet bei kurzen Texten."),
+]
+
+def _ollama_rating_for(name: str) -> tuple[int, str]:
+    nl = name.lower()
+    for prefix, stars, review in OLLAMA_RATINGS:
+        if nl.startswith(prefix.lower()):
+            return stars, review
+    return 3, "Kein Bewertungsprofil fuer dieses Modell vorhanden."
+
+
+def detect_ollama_models() -> list[tuple[str, str]]:
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2) as r:
+            data = json.loads(r.read())
+        result = []
+        for m in data.get("models", []):
+            name = m["name"]
+            stars, _ = _ollama_rating_for(name)
+            bar = "★" * stars + "☆" * (5 - stars)
+            result.append((name, f"{name}  {bar}"))
+        return result if result else [("qwen3:14b-q4_K_M", "qwen3:14b-q4_K_M  ★★★★★")]
+    except Exception:
+        return [("qwen3:14b-q4_K_M", "qwen3:14b-q4_K_M  ★★★★★  (Ollama nicht erreichbar)")]
 
 
 def load_config() -> dict:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
-        CONFIG_FILE.write_text(
-            json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=True) + "\n",
-            encoding="utf-8",
-        )
+        CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
     loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    config = DEFAULT_CONFIG.copy()
-    config.update(loaded)
-    return config
+    cfg = DEFAULT_CONFIG.copy()
+    cfg.update(loaded)
+    return cfg
 
 
 def save_config(config: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(
-        json.dumps(config, indent=2, ensure_ascii=True) + "\n",
-        encoding="utf-8",
-    )
+    CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
 
 def daemon_running() -> bool:
-    result = subprocess.run(
-        ["pgrep", "-f", "dictation/daemon.py"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.returncode == 0 and bool(result.stdout.strip())
+    r = subprocess.run(["pgrep", "-f", "dictation/daemon.py"], capture_output=True, text=True, check=False)
+    return r.returncode == 0 and bool(r.stdout.strip())
 
 
-class SettingsWindow(Gtk.ApplicationWindow):
+# ── Main Window ───────────────────────────────────────────────────────────────
+
+class SettingsWindow(Adw.ApplicationWindow):
     def __init__(self, app: Gtk.Application):
         super().__init__(application=app, title="Whisper Dictation")
-        self.set_default_size(620, 520)
+        self.set_default_size(660, -1)
         self.config = load_config()
+        self._apply_button: Gtk.Button | None = None
 
-        outer = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=14,
-            margin_top=18,
-            margin_bottom=18,
-            margin_start=18,
-            margin_end=18,
-        )
-        self.set_child(outer)
-
-        title = Gtk.Label(
-            label="Lokale Whisper-Diktierfunktion fuer GNOME",
-            xalign=0,
-        )
-        title.add_css_class("title-2")
-        outer.append(title)
-
-        subtitle = Gtk.Label(
-            label=(
-                "Die GUI schreibt dieselbe Config wie der Hintergrunddienst. "
-                "Mit Speichern und Neustarten wird das gewaehlte Modell sofort aktiv."
-            ),
-            wrap=True,
-            xalign=0,
-        )
-        outer.append(subtitle)
-
-        grid = Gtk.Grid(column_spacing=12, row_spacing=12)
-        outer.append(grid)
-
-        self.model_dropdown = self._dropdown(MODEL_OPTIONS, str(self.config["model"]))
-        self.hotkey_dropdown = self._dropdown(
-            HOTKEY_OPTIONS, str(self.config["double_tap_key"])
-        )
-        self.paste_dropdown = self._dropdown(
-            PASTE_OPTIONS, str(self.config["paste_mode"])
+        # CSS
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+            .section-title { font-weight: bold; font-size: 11pt; margin-top: 6px; }
+            .review-box { background: alpha(currentColor, 0.06); border-radius: 8px; padding: 8px 12px; }
+            .status-running { color: #26a269; }
+            .status-stopped { color: #e5a50a; }
+            dropdown > button { border-radius: 6px; }
+            spinbutton { border-radius: 6px; }
+            .textarea-field { border-radius: 6px; border: 1px solid alpha(currentColor, 0.2); }
+            .placeholder-active { color: alpha(currentColor, 0.45); }
+        """)
+        Gtk.StyleContext.add_provider_for_display(
+            self.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
-        self.language_entry = Gtk.Entry(text=str(self.config["language"]))
-        self.language_entry.set_placeholder_text("de, en oder leer fuer auto")
+        toolbar = Adw.ToolbarView()
+        self.set_content(toolbar)
 
-        self.double_tap_spin = Gtk.SpinButton.new_with_range(150, 1200, 10)
-        self.double_tap_spin.set_value(float(self.config["double_tap_window_ms"]))
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title="Whisper Dictation", subtitle="Lokale Spracherkennung"))
+        toolbar.add_top_bar(header)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        toolbar.set_content(scroll)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                        margin_top=12, margin_bottom=12, margin_start=20, margin_end=20)
+        scroll.set_child(outer)
+
+        # ── Whisper-Modell ────────────────────────────────────────────────────
+        outer.append(self._section("Whisper-Modell"))
+
+        self.model_opts = MODEL_OPTS_SIMPLE
+        self.model_dropdown = self._dropdown(self.model_opts, str(self.config["model"]))
+        self.model_dropdown.connect("notify::selected", self._on_model_changed)
+        outer.append(self._row("Modell", self.model_dropdown))
+
+        self.model_review = Gtk.Label(wrap=True, xalign=0)
+        self.model_review.add_css_class("review-box")
+        self._update_model_review()
+        outer.append(self.model_review)
+
+        self.language_dropdown = self._dropdown(LANGUAGE_OPTIONS, str(self.config["language"]))
+        outer.append(self._row("Sprache", self.language_dropdown))
+
+        self.initial_prompt_entry = self._textarea(
+            str(self.config["initial_prompt"]),
+            "z.B. Python, CUDA, Fachbegriffe — hilft Whisper beim Erkennen"
+        )
+        outer.append(self._row("Whisper-Prompt", self.initial_prompt_entry))
+
+        # ── Aufnahme ──────────────────────────────────────────────────────────
+        outer.append(self._section("Aufnahme"))
+
+        self.device_options = detect_alsa_capture_devices()
+        self.device_dropdown = self._dropdown(self.device_options, str(self.config["record_device"]))
+        outer.append(self._row("Mikrofon", self.device_dropdown))
 
         self.max_record_spin = Gtk.SpinButton.new_with_range(15, 900, 5)
         self.max_record_spin.set_value(float(self.config["max_record_seconds"]))
+        outer.append(self._row("Max. Aufnahmedauer (s)", self.max_record_spin))
 
-        self.device_options = detect_alsa_capture_devices()
-        self.device_dropdown = self._dropdown(
-            self.device_options, str(self.config["record_device"])
+        # ── Steuerung ─────────────────────────────────────────────────────────
+        outer.append(self._section("Steuerung"))
+
+        self.hotkey_dropdown = self._dropdown(HOTKEY_OPTIONS, str(self.config["double_tap_key"]))
+        outer.append(self._row("Aktivierungstaste", self.hotkey_dropdown))
+
+        self.ptt_switch = self._switch(bool(self.config.get("push_to_talk", False)))
+        outer.append(self._row("Push-to-Talk  (halten statt doppelt tippen)", self.ptt_switch, expand=False))
+
+        self.double_tap_spin = Gtk.SpinButton.new_with_range(150, 1200, 10)
+        self.double_tap_spin.set_value(float(self.config["double_tap_window_ms"]))
+        outer.append(self._row("Doppeltipp-Fenster (ms)", self.double_tap_spin))
+
+        self.paste_dropdown = self._dropdown(PASTE_OPTIONS, str(self.config["paste_mode"]))
+        outer.append(self._row("Einfuge-Modus", self.paste_dropdown))
+
+        # ── LLM-Bereinigung ───────────────────────────────────────────────────
+        outer.append(self._section("LLM-Bereinigung (Ollama)"))
+
+        hint = Gtk.Label(
+            label="Verbessert den transkribierten Text: entfernt Fuellwoerter, korrigiert Grammatik und Zeichensetzung.",
+            wrap=True, xalign=0,
         )
-        self.initial_prompt_entry = Gtk.Entry(text=str(self.config["initial_prompt"]))
-        self.initial_prompt_entry.set_placeholder_text("Optionaler Whisper-Prompt")
+        hint.add_css_class("dim-label")
+        outer.append(hint)
 
-        self._attach_row(grid, 0, "Modell", self.model_dropdown)
-        self._attach_row(grid, 1, "Sprache", self.language_entry)
-        self._attach_row(grid, 2, "Doppeltaste", self.hotkey_dropdown)
-        self._attach_row(grid, 3, "Double-Tap Fenster (ms)", self.double_tap_spin)
-        self._attach_row(grid, 4, "Paste-Modus", self.paste_dropdown)
-        self._attach_row(grid, 5, "Max. Aufnahme (s)", self.max_record_spin)
-        self._attach_row(grid, 6, "Mikrofon", self.device_dropdown)
-        self._attach_row(grid, 7, "Initial Prompt", self.initial_prompt_entry)
+        self.postprocess_switch = self._switch(bool(self.config.get("postprocess", False)))
+        outer.append(self._row("Bereinigung aktivieren", self.postprocess_switch, expand=False))
 
-        self.model_hint = Gtk.Label(wrap=True, xalign=0)
-        outer.append(self.model_hint)
-        self._update_model_hint()
-        self.model_dropdown.connect("notify::selected", self._on_model_changed)
+        self.ollama_options = detect_ollama_models()
+        self.ollama_dropdown = self._dropdown(
+            self.ollama_options, str(self.config.get("postprocess_model", "qwen3:14b-q4_K_M"))
+        )
+        self.ollama_dropdown.connect("notify::selected", self._on_ollama_model_changed)
+        outer.append(self._row("Ollama-Modell", self.ollama_dropdown))
+
+        self.ollama_review = Gtk.Label(wrap=True, xalign=0)
+        self.ollama_review.add_css_class("review-box")
+        self._update_ollama_review()
+        outer.append(self.ollama_review)
+
+        self.postprocess_thinking_switch = self._switch(bool(self.config.get("postprocess_thinking", False)))
+        outer.append(self._row("Thinking-Modus  (langsamer, gründlicher)", self.postprocess_thinking_switch, expand=False))
+
+        self.postprocess_prompt_entry = self._textarea(
+            str(self.config.get("postprocess_prompt", "")),
+            "Leer = Standard-Prompt wird verwendet"
+        )
+        outer.append(self._row("Eigene Anweisung", self.postprocess_prompt_entry))
+
+        # ── Status ────────────────────────────────────────────────────────────
+        outer.append(self._section("Status"))
 
         self.status_label = Gtk.Label(wrap=True, xalign=0)
         outer.append(self.status_label)
-        self._set_status()
+        self._refresh_status()
 
-        button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        outer.append(button_row)
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_top=4)
+        btn_box.set_homogeneous(True)
+        outer.append(btn_box)
 
-        apply_button = Gtk.Button(label="Speichern und Daemon neu starten")
-        apply_button.connect("clicked", self._on_apply_clicked)
-        apply_button.add_css_class("suggested-action")
-        button_row.append(apply_button)
+        self._apply_button = Gtk.Button(label="Speichern & Neustart")
+        self._apply_button.add_css_class("suggested-action")
+        self._apply_button.connect("clicked", self._on_apply_clicked)
+        btn_box.append(self._apply_button)
 
-        start_button = Gtk.Button(label="Daemon starten")
-        start_button.connect("clicked", self._on_start_clicked)
-        button_row.append(start_button)
+        start_btn = Gtk.Button(label="Starten")
+        start_btn.connect("clicked", self._on_start_clicked)
+        btn_box.append(start_btn)
 
-        stop_button = Gtk.Button(label="Daemon stoppen")
-        stop_button.connect("clicked", self._on_stop_clicked)
-        button_row.append(stop_button)
+        stop_btn = Gtk.Button(label="Stoppen")
+        stop_btn.connect("clicked", self._on_stop_clicked)
+        btn_box.append(stop_btn)
 
-        log_button = Gtk.Button(label="Log oeffnen")
-        log_button.connect("clicked", self._on_log_clicked)
-        button_row.append(log_button)
+        log_btn = Gtk.Button(label="Log")
+        log_btn.connect("clicked", self._on_log_clicked)
+        btn_box.append(log_btn)
 
-    def _attach_row(self, grid: Gtk.Grid, row: int, label_text: str, widget: Gtk.Widget) -> None:
-        label = Gtk.Label(label=label_text, xalign=0)
-        grid.attach(label, 0, row, 1, 1)
-        widget.set_hexpand(True)
-        grid.attach(widget, 1, row, 1, 1)
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _dropdown(self, options: list[tuple[str, str]], current_value: str) -> Gtk.DropDown:
-        labels = [label for _, label in options]
-        dropdown = Gtk.DropDown.new_from_strings(labels)
-        selected = next(
-            (index for index, (value, _) in enumerate(options) if value == current_value),
-            0,
-        )
-        dropdown.set_selected(selected)
-        return dropdown
+    def _section(self, title: str) -> Gtk.Label:
+        lbl = Gtk.Label(label=title, xalign=0)
+        lbl.add_css_class("section-title")
+        lbl.add_css_class("heading")
+        return lbl
 
-    def _selected_value(self, dropdown: Gtk.DropDown, options: list[tuple[str, str]]) -> str:
-        return options[dropdown.get_selected()][0]
+    def _row(self, label: str, widget: Gtk.Widget, expand: bool = True) -> Gtk.Box:
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        lbl = Gtk.Label(label=label, xalign=0, width_chars=28, wrap=True)
+        lbl.add_css_class("dim-label")
+        lbl.set_halign(Gtk.Align.START)
+        if expand:
+            widget.set_hexpand(True)
+        else:
+            widget.set_halign(Gtk.Align.START)
+        box.append(lbl)
+        box.append(widget)
+        return box
+
+    def _textarea(self, text: str, placeholder: str = "") -> Gtk.TextView:
+        tv = Gtk.TextView()
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        tv.set_top_margin(6)
+        tv.set_bottom_margin(6)
+        tv.set_left_margin(8)
+        tv.set_right_margin(8)
+        tv.set_size_request(-1, 52)
+        tv.add_css_class("card")
+
+        is_placeholder = not text.strip()
+        tv.get_buffer().set_text(placeholder if is_placeholder else text)
+        if is_placeholder:
+            tv.add_css_class("placeholder-active")
+
+        def _on_enter(ctrl, *_):
+            widget = ctrl.get_widget()
+            if "placeholder-active" in widget.get_css_classes():
+                widget.get_buffer().set_text("")
+                widget.remove_css_class("placeholder-active")
+
+        def _on_leave(ctrl, *_):
+            widget = ctrl.get_widget()
+            buf = widget.get_buffer()
+            if not buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip():
+                buf.set_text(placeholder)
+                widget.add_css_class("placeholder-active")
+
+        fc_in = Gtk.EventControllerFocus()
+        fc_in.connect("enter", _on_enter)
+        fc_out = Gtk.EventControllerFocus()
+        fc_out.connect("leave", _on_leave)
+        tv.add_controller(fc_in)
+        tv.add_controller(fc_out)
+        return tv
+
+    def _textarea_text(self, tv: Gtk.TextView) -> str:
+        if "placeholder-active" in tv.get_css_classes():
+            return ""
+        buf = tv.get_buffer()
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+
+    def _dropdown(self, options: list[tuple[str, str]], current: str) -> Gtk.DropDown:
+        labels = [lbl for _, lbl in options]
+        dd = Gtk.DropDown.new_from_strings(labels)
+        idx = next((i for i, (v, _) in enumerate(options) if v == current), 0)
+        dd.set_selected(idx)
+        return dd
+
+    def _selected(self, dd: Gtk.DropDown, options: list[tuple[str, str]]) -> str:
+        return options[dd.get_selected()][0]
+
+    def _switch(self, active: bool) -> Gtk.Switch:
+        sw = Gtk.Switch()
+        sw.set_active(active)
+        sw.set_valign(Gtk.Align.CENTER)
+        return sw
+
+    def _update_model_review(self) -> None:
+        model = self._selected(self.model_dropdown, self.model_opts)
+        stars, review = MODEL_REVIEWS.get(model, (3, ""))
+        bar = "★" * stars + "☆" * (5 - stars)
+        self.model_review.set_label(f"{bar}  {review}")
+
+    def _refresh_status(self, extra: str = "") -> None:
+        running = daemon_running()
+        if running:
+            self.status_label.set_label(f"Daemon laeuft  ·  Config: {CONFIG_FILE}" + (f"\n{extra}" if extra else ""))
+            self.status_label.remove_css_class("status-stopped")
+            self.status_label.add_css_class("status-running")
+        else:
+            self.status_label.set_label(f"Daemon gestoppt" + (f"\n{extra}" if extra else ""))
+            self.status_label.remove_css_class("status-running")
+            self.status_label.add_css_class("status-stopped")
 
     def _config_from_form(self) -> dict:
         return {
-            "model": self._selected_value(self.model_dropdown, MODEL_OPTIONS),
-            "language": self.language_entry.get_text().strip(),
-            "double_tap_key": self._selected_value(self.hotkey_dropdown, HOTKEY_OPTIONS),
-            "double_tap_window_ms": int(self.double_tap_spin.get_value()),
-            "paste_mode": self._selected_value(self.paste_dropdown, PASTE_OPTIONS),
-            "max_record_seconds": int(self.max_record_spin.get_value()),
-            "record_device": self._selected_value(self.device_dropdown, self.device_options),
-            "initial_prompt": self.initial_prompt_entry.get_text().strip(),
+            "model":               self._selected(self.model_dropdown, self.model_opts),
+            "language":            self._selected(self.language_dropdown, LANGUAGE_OPTIONS),
+            "double_tap_key":      self._selected(self.hotkey_dropdown, HOTKEY_OPTIONS),
+            "double_tap_window_ms":int(self.double_tap_spin.get_value()),
+            "paste_mode":          self._selected(self.paste_dropdown, PASTE_OPTIONS),
+            "max_record_seconds":  int(self.max_record_spin.get_value()),
+            "record_device":       self._selected(self.device_dropdown, self.device_options),
+            "initial_prompt":      self._textarea_text(self.initial_prompt_entry),
+            "push_to_talk":        self.ptt_switch.get_active(),
+            "postprocess":         self.postprocess_switch.get_active(),
+            "postprocess_model":   self._selected(self.ollama_dropdown, self.ollama_options),
+            "postprocess_thinking": self.postprocess_thinking_switch.get_active(),
+            "postprocess_prompt":  self._textarea_text(self.postprocess_prompt_entry),
         }
 
-    def _update_model_hint(self) -> None:
-        model = self._selected_value(self.model_dropdown, MODEL_OPTIONS)
-        hint = MODEL_HINTS.get(model, "")
-        self.model_hint.set_label(
-            f"Modellhinweis: {hint}\nHinweis: Ein Modellwechsel fuehrt beim naechsten Start einmalig zu einem Download, falls es noch nicht lokal im Cache liegt."
-        )
+    # ── Events ────────────────────────────────────────────────────────────────
 
-    def _set_status(self, extra: str = "") -> None:
-        running = daemon_running()
-        state = "Daemon laeuft im Hintergrund." if running else "Daemon ist gerade gestoppt."
-        active_model = self._selected_value(self.model_dropdown, MODEL_OPTIONS)
-        suffix = f"\n{extra}" if extra else ""
-        self.status_label.set_label(
-            f"{state}\nAktuell ausgewaehltes Modell: {active_model}\nConfig: {CONFIG_FILE}{suffix}"
-        )
+    def _update_ollama_review(self) -> None:
+        model = self._selected(self.ollama_dropdown, self.ollama_options)
+        stars, review = _ollama_rating_for(model)
+        bar = "★" * stars + "☆" * (5 - stars)
+        self.ollama_review.set_label(f"{bar}  {review}")
 
-    def _run_daemon_command(self, arg: str) -> tuple[int, str]:
-        result = subprocess.run(
-            [str(DAEMON_SCRIPT), arg],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        output = (result.stdout + result.stderr).strip()
-        return result.returncode, output
+    def _on_model_changed(self, *_: object) -> None:
+        self._update_model_review()
 
-    def _on_model_changed(self, *_args) -> None:
-        self._update_model_hint()
-        self._set_status()
+    def _on_ollama_model_changed(self, *_: object) -> None:
+        self._update_ollama_review()
 
-    def _on_apply_clicked(self, _button: Gtk.Button) -> None:
-        config = self._config_from_form()
-        save_config(config)
-        code, output = self._run_daemon_command("--restart")
-        message = "Gespeichert und Daemon neu gestartet."
-        if code != 0:
-            message = f"Config gespeichert, aber Neustart schlug fehl: {output}"
-        self._set_status(message)
+    def _run_daemon_cmd(self, arg: str) -> tuple[int, str]:
+        r = subprocess.run([str(DAEMON_SCRIPT), arg], capture_output=True, text=True, check=False)
+        return r.returncode, (r.stdout + r.stderr).strip()
 
-    def _on_start_clicked(self, _button: Gtk.Button) -> None:
-        code, output = self._run_daemon_command("--restart")
-        message = "Daemon gestartet."
-        if code != 0:
-            message = f"Start fehlgeschlagen: {output}"
-        self._set_status(message)
+    def _run_async(self, btn: Gtk.Button, busy_label: str, arg: str, done_msg: str) -> None:
+        original = btn.get_label()
+        btn.set_label(busy_label)
+        btn.set_sensitive(False)
+        self._refresh_status(busy_label)
 
-    def _on_stop_clicked(self, _button: Gtk.Button) -> None:
-        code, output = self._run_daemon_command("--stop")
-        message = "Daemon gestoppt."
-        if code != 0:
-            message = f"Stop meldete einen Fehler: {output}"
-        self._set_status(message)
+        def _work() -> None:
+            code, out = self._run_daemon_cmd(arg)
+            msg = done_msg if code == 0 else f"Fehler: {out}"
+            GLib.idle_add(self._done_async, btn, original, msg)
 
-    def _on_log_clicked(self, _button: Gtk.Button) -> None:
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _done_async(self, btn: Gtk.Button, original_label: str, msg: str) -> bool:
+        btn.set_label(original_label)
+        btn.set_sensitive(True)
+        self._refresh_status(msg)
+        return False
+
+    def _on_apply_clicked(self, btn: Gtk.Button) -> None:
+        save_config(self._config_from_form())
+        self._run_async(btn, "Wird neu gestartet...", "--restart", "Gespeichert und neu gestartet.")
+
+    def _on_start_clicked(self, btn: Gtk.Button) -> None:
+        self._run_async(btn, "Startet...", "--restart", "Daemon gestartet.")
+
+    def _on_stop_clicked(self, btn: Gtk.Button) -> None:
+        self._run_async(btn, "Stoppt...", "--stop", "Daemon gestoppt.")
+
+    def _on_log_clicked(self, _btn: Gtk.Button) -> None:
         if LOG_FILE.exists():
             Gio.AppInfo.launch_default_for_uri(f"file://{LOG_FILE}", None)
-            self._set_status("Logdatei geoeffnet.")
-            return
-        self._set_status("Noch keine Logdatei vorhanden.")
+        self._refresh_status("Logdatei geöffnet.")
 
 
-class SettingsApplication(Gtk.Application):
-    def __init__(self):
-        super().__init__(application_id="local.whisper.dictation.settings")
-
-    def do_activate(self) -> None:
-        window = self.props.active_window
-        if window is None:
-            window = SettingsWindow(self)
-        window.present()
-
+# ── App ───────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    app = SettingsApplication()
+    import uuid
+    app = Adw.Application(
+        application_id=f"local.whisper.dictation.s{uuid.uuid4().hex[:12]}",
+        flags=Gio.ApplicationFlags.NON_UNIQUE,
+    )
+
+    def on_activate(a):
+        win = SettingsWindow(a)
+        win.set_default_size(740, 860)
+        win.present()
+
+    app.connect("activate", on_activate)
     return app.run([])
 
 

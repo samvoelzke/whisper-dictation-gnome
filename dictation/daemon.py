@@ -34,6 +34,8 @@ except Exception:
     X = None
     xdisplay = None
 
+TRAY_SOCKET = Path.home() / ".cache" / "whisper-dictation" / "tray.sock"
+
 if IS_MACOS:
     try:
         import sounddevice as sd
@@ -49,12 +51,17 @@ CACHE_DIR = Path.home() / ".cache" / "whisper-dictation"
 DEFAULT_CONFIG: dict[str, Any] = {
     "double_tap_key": "ctrl_r",
     "double_tap_window_ms": 400,
+    "push_to_talk": False,
     "language": "de",
     "model": "turbo",
     "paste_mode": "auto",
     "record_device": "default",
     "max_record_seconds": 180,
     "initial_prompt": "",
+    "postprocess": False,
+    "postprocess_model": "qwen3:14b-q4_K_M",
+    "postprocess_prompt": "",
+    "postprocess_thinking": False,
 }
 
 # Each entry: (primary_key, fallback_keys_set, label)
@@ -77,14 +84,18 @@ TERMINAL_HINTS = (
 )
 
 
-def notify(summary: str, body: str = "") -> None:
+def notify(summary: str, body: str = "", replace: bool = False) -> None:
     if IS_MACOS:
         script = f'display notification "{body}" with title "{summary}"'
         subprocess.run(["osascript", "-e", script], check=False, capture_output=True)
         return
     if shutil_which("notify-send") is None:
         return
-    command = ["notify-send", "-a", "Whisper Dictation", summary]
+    # -r 888 ersetzt immer dieselbe Notification statt neue zu stapeln
+    command = ["notify-send", "-a", "Whisper Dictation", "-r", "888"]
+    if replace:
+        command += ["-t", "0"]  # kein auto-close bei persistenter Meldung
+    command.append(summary)
     if body:
         command.append(body)
     subprocess.run(command, check=False)
@@ -196,6 +207,7 @@ class WhisperDictationDaemon:
         self.last_hotkey_release: float | None = None
         self.busy = False
         self.stopping = False
+        self.tray_icon: Any = None
 
     # ── Linux: ALSA mic volume ────────────────────────────────────────────────
 
@@ -244,7 +256,7 @@ class WhisperDictationDaemon:
             download_root=str(CACHE_DIR / "models"),
         )
         print("[whisper-dictation] model ready", flush=True)
-        notify("Bereit", f"Doppelt {self.hotkey_label} startet oder stoppt die Aufnahme")
+        self._start_tray()
 
         self.listener = keyboard.Listener(
             on_press=self.on_press,
@@ -254,18 +266,69 @@ class WhisperDictationDaemon:
         self.listener.start()
         self.listener.join()
 
+    # ── Tray Icon (separater Prozess via Unix-Socket) ─────────────────────────
+
+    def _start_tray(self) -> None:
+        if IS_MACOS:
+            return
+        tray_script = PROJECT_ROOT / "dictation" / "tray.py"
+        if not tray_script.exists():
+            return
+        env = os.environ.copy()
+        proc = subprocess.Popen(
+            ["python3", str(tray_script)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.tray_icon = proc
+        time.sleep(0.8)
+        print("[whisper-dictation] tray icon started", flush=True)
+
+    def _tray_set(self, state: str, _tooltip: str = "") -> None:
+        if self.tray_icon is None:
+            return
+        try:
+            import socket as _sock
+            s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+            s.settimeout(0.3)
+            s.connect(str(TRAY_SOCKET))
+            s.sendall(state.encode())
+            s.close()
+        except Exception:
+            pass
+
     # ── Hotkey detection ──────────────────────────────────────────────────────
 
     def _is_hotkey(self, key: keyboard.Key | keyboard.KeyCode | None) -> bool:
         return key == self.hotkey or key in self.hotkey_fallbacks
 
     def on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        if not self._is_hotkey(key):
-            with self.lock:
-                self.last_hotkey_release = None
+        if self._is_hotkey(key):
+            if self.config.get("push_to_talk"):
+                with self.lock:
+                    is_recording = (
+                        self.recording_process is not None
+                        or self.recording_sd_thread is not None
+                    )
+                    if not is_recording and not self.busy:
+                        self.start_recording()
+            return
+        with self.lock:
+            self.last_hotkey_release = None
 
     def on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
         if not self._is_hotkey(key):
+            return
+
+        if self.config.get("push_to_talk"):
+            with self.lock:
+                is_recording = (
+                    self.recording_process is not None
+                    or self.recording_sd_thread is not None
+                )
+                if is_recording:
+                    self.stop_recording()
             return
 
         now = time.monotonic()
@@ -281,7 +344,6 @@ class WhisperDictationDaemon:
 
     def toggle_recording(self) -> None:
         if self.busy:
-            notify("Noch beschäftigt", "Bitte warten, die letzte Aufnahme wird noch verarbeitet.")
             return
         is_recording = (
             self.recording_process is not None or self.recording_sd_thread is not None
@@ -388,7 +450,7 @@ class WhisperDictationDaemon:
         )
         self.recording_timer.daemon = True
         self.recording_timer.start()
-        notify("Aufnahme gestartet", f"Zum Stoppen wieder doppelt {self.hotkey_label} drücken")
+        self._tray_set("recording", "Whisper Dictation - nimmt auf")
 
     def auto_stop_recording(self) -> None:
         with self.lock:
@@ -397,7 +459,6 @@ class WhisperDictationDaemon:
             )
             if not is_recording or self.busy:
                 return
-            notify("Aufnahme wird beendet", "Maximale Aufnahmedauer erreicht.")
             self.stop_recording()
 
     def stop_recording(self) -> None:
@@ -428,7 +489,7 @@ class WhisperDictationDaemon:
             )
 
         worker.start()
-        notify("Transkription läuft", "Die Aufnahme wird gerade erkannt und eingefügt.")
+        self._tray_set("processing", "Whisper Dictation - transkribiert")
 
     def _stop_and_transcribe_macos(self, output_path: Path) -> None:
         self._stop_recording_macos(output_path)
@@ -446,30 +507,79 @@ class WhisperDictationDaemon:
     def _transcribe_and_paste(self, output_path: Path) -> None:
         try:
             if not output_path.exists() or output_path.stat().st_size < 100:
-                notify("Kein Text erkannt", "Die Aufnahme war leer.")
+                notify("Kein Text erkannt", "Aufnahme war leer.", replace=True)
                 return
 
             audio = read_wav_mono(output_path)
             rms = float(np.sqrt(np.mean(audio ** 2)))
             print(f"[whisper-dictation] audio rms={rms:.5f}", flush=True)
             if rms < 0.002:
-                notify("Kein Text erkannt", "Die Aufnahme war leer oder zu leise.")
+                notify("Kein Text erkannt", "Zu leise.", replace=True)
                 return
 
             text = self._transcribe_audio(audio).strip()
             if not text:
-                notify("Kein Text erkannt", "Nichts verstanden.")
+                notify("Kein Text erkannt", "Nichts verstanden.", replace=True)
                 return
 
             print(f"[whisper-dictation] transcription ready chars={len(text)}", flush=True)
+
+            if self.config.get("postprocess"):
+                try:
+                    text = self._postprocess_text(text)
+                except Exception as exc:
+                    print(f"[whisper-dictation] postprocess failed, using raw: {exc}", flush=True)
+
             self._paste_text(text)
-            notify("Eingefügt", text[:100])
+            self._tray_set("done", "Whisper Dictation - eingefügt")
+            threading.Timer(2.0, lambda: self._tray_set("ready", "Whisper Dictation - bereit")).start()
         except Exception as exc:
-            notify("Fehler", str(exc))
+            notify("Fehler", str(exc), replace=True)
             print(f"[whisper-dictation] {exc}", file=sys.stderr, flush=True)
+            self._tray_set("ready", "Whisper Dictation - bereit")
         finally:
             self.busy = False
             output_path.unlink(missing_ok=True)
+
+    # ── LLM Post-Processing ───────────────────────────────────────────────────
+
+    def _postprocess_text(self, text: str) -> str:
+        import urllib.request
+        import json as _json
+
+        model = str(self.config.get("postprocess_model", "qwen3:14b"))
+        custom_prompt = str(self.config.get("postprocess_prompt", "")).strip()
+        system_prompt = custom_prompt or (
+            "Du bist ein Korrekturassistent für Spracherkennungs-Transkripte. Der Input ist ein Rohtranskript auf Deutsch (manchmal mit englischen Begriffen gemischt).\n"
+            "Deine Aufgaben:\n"
+            "1. Entferne Füllwörter: ähm, äh, halt, quasi, sozusagen, irgendwie, und so, also (wenn als Füllwort verwendet).\n"
+            "2. Korrigiere Groß- und Kleinschreibung nach deutschen Rechtschreibregeln: Satzanfänge groß, alle Nomen groß (z.B. 'das haus' → 'das Haus', 'ich gehe nach hause' → 'Ich gehe nach Hause').\n"
+            "3. Setze Satzzeichen korrekt (Kommas, Punkte, Fragezeichen).\n"
+            "4. Korrigiere falsch erkannte Wörter: Wenn ein Wort im Kontext keinen Sinn ergibt, ersetze es durch das wahrscheinlich gemeinte Wort (Bedeutung + Klang). Beispiel: 'ich iPad morgen nach Hause' → 'Ich fahre morgen nach Hause'.\n"
+            "5. Kürze NICHT, fasse NICHT zusammen, ändere NICHT die Bedeutung.\n"
+            "6. Gib NUR den korrigierten Text aus. Keine Erklärungen, keine Anführungszeichen, keine Präambel."
+        )
+        thinking = bool(self.config.get("postprocess_thinking", False))
+        payload = {
+            "model": model,
+            "prompt": text,
+            "system": system_prompt,
+            "stream": False,
+            "options": {"temperature": 0.1},
+            "think": thinking,
+        }
+        req = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = _json.loads(resp.read())
+        import re as _re
+        cleaned = _re.sub(r"<think>.*?</think>", "", str(result["response"]), flags=_re.DOTALL).strip()
+        print(f"[whisper-dictation] postprocessed chars={len(cleaned)}", flush=True)
+        return cleaned
 
     # ── Transcription ─────────────────────────────────────────────────────────
 
@@ -594,6 +704,7 @@ class WhisperDictationDaemon:
                 self.recording_sd_stop.set()
             if self.listener is not None:
                 self.listener.stop()
+            self._tray_set("quit")
 
 
 def main() -> int:
