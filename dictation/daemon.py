@@ -62,6 +62,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "postprocess_model": "qwen3:14b-q4_K_M",
     "postprocess_prompt": "",
     "postprocess_thinking": False,
+    "rewrite_model": "",
 }
 
 # Each entry: (primary_key, fallback_keys_set, label)
@@ -205,6 +206,13 @@ class WhisperDictationDaemon:
         self.recording_file: Path | None = None
         self.recording_timer: threading.Timer | None = None
         self.last_hotkey_release: float | None = None
+        self.last_shift_release: float | None = None
+        self._rewrite_copying: bool = False  # suppress hotkey during Ctrl+C simulation
+        self.shift_keys: frozenset = frozenset({
+            keyboard.Key.shift,
+            keyboard.Key.shift_l,
+            keyboard.Key.shift_r,
+        })
         self.busy = False
         self.stopping = False
         self.tray_icon: Any = None
@@ -298,6 +306,66 @@ class WhisperDictationDaemon:
         except Exception:
             pass
 
+    # ── Text Rewrite ──────────────────────────────────────────────────────────
+
+    def _trigger_rewrite(self) -> None:
+        try:
+            self._rewrite_copying = True
+            with self.lock:
+                self.last_hotkey_release = None
+            with self.controller.pressed(keyboard.Key.ctrl):
+                self.controller.tap("c")
+            with self.lock:
+                self.last_hotkey_release = None
+            time.sleep(0.15)
+            self._rewrite_copying = False
+
+            result = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-o"],
+                capture_output=True, timeout=2,
+            )
+            selected_text = result.stdout.decode("utf-8", errors="replace").strip()
+
+            if not selected_text:
+                wl = shutil_which("wl-paste")
+                if wl:
+                    r2 = subprocess.run([wl], capture_output=True, timeout=2)
+                    selected_text = r2.stdout.decode("utf-8", errors="replace").strip()
+
+            if not selected_text:
+                print("[whisper-dictation] rewrite: clipboard empty, aborting", flush=True)
+                return
+
+            rewrite_script = PROJECT_ROOT / "gui" / "rewrite.py"
+            model = str(
+                self.config.get("rewrite_model") or
+                self.config.get("postprocess_model", "qwen3:14b-q4_K_M")
+            )
+            # Get mouse position to place popup near cursor
+            mouse_x, mouse_y = 960, 540
+            try:
+                mp = subprocess.run(
+                    ["xdotool", "getmouselocation", "--shell"],
+                    capture_output=True, timeout=1, text=True,
+                )
+                for line in mp.stdout.splitlines():
+                    if line.startswith("X="):
+                        mouse_x = int(line.split("=")[1])
+                    elif line.startswith("Y="):
+                        mouse_y = int(line.split("=")[1])
+            except Exception:
+                pass
+
+            subprocess.Popen(
+                ["python3", str(rewrite_script), selected_text, model,
+                 str(mouse_x), str(mouse_y)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"[whisper-dictation] rewrite launched chars={len(selected_text)}", flush=True)
+        except Exception as exc:
+            print(f"[whisper-dictation] rewrite trigger failed: {exc}", file=sys.stderr, flush=True)
+
     # ── Hotkey detection ──────────────────────────────────────────────────────
 
     def _is_hotkey(self, key: keyboard.Key | keyboard.KeyCode | None) -> bool:
@@ -316,9 +384,27 @@ class WhisperDictationDaemon:
             return
         with self.lock:
             self.last_hotkey_release = None
+        if key not in self.shift_keys:
+            with self.lock:
+                self.last_shift_release = None
 
     def on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+        if key in self.shift_keys:
+            now = time.monotonic()
+            with self.lock:
+                if self.last_shift_release is not None:
+                    delta = now - self.last_shift_release
+                    self.last_shift_release = None
+                    if delta <= self.double_tap_window and not self.busy:
+                        threading.Thread(target=self._trigger_rewrite, daemon=True).start()
+                        return
+                self.last_shift_release = now
+            return
+
         if not self._is_hotkey(key):
+            return
+
+        if self._rewrite_copying:
             return
 
         if self.config.get("push_to_talk"):

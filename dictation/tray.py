@@ -44,6 +44,12 @@ class TrayApp:
 
         menu = Gtk.Menu()
 
+        item_rewrite = Gtk.MenuItem(label="✨  Markierung umformulieren")
+        item_rewrite.connect("activate", self._open_rewrite)
+        menu.append(item_rewrite)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
         item_settings = Gtk.MenuItem(label="Einstellungen")
         item_settings.connect("activate", self._open_settings)
         menu.append(item_settings)
@@ -65,6 +71,36 @@ class TrayApp:
             return False
 
         GLib.idle_add(_update)
+
+    def _open_rewrite(self, _widget: object) -> None:
+        import subprocess, json, time
+        # Simulate Ctrl+C to copy current selection, then launch rewrite popup
+        try:
+            from pynput import keyboard as kb
+            ctrl = kb.Controller()
+            with ctrl.pressed(kb.Key.ctrl):
+                ctrl.tap("c")
+            time.sleep(0.15)
+        except Exception:
+            pass
+        try:
+            result = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-o"],
+                capture_output=True, timeout=2,
+            )
+            text = result.stdout.decode("utf-8", errors="replace").strip()
+        except Exception:
+            text = ""
+        if not text:
+            return
+        cfg_file = Path.home() / ".config" / "whisper-dictation" / "config.json"
+        try:
+            cfg = json.loads(cfg_file.read_text())
+            model = str(cfg.get("rewrite_model") or cfg.get("postprocess_model", "qwen3:14b-q4_K_M"))
+        except Exception:
+            model = "qwen3:14b-q4_K_M"
+        rewrite_script = PROJECT_ROOT / "gui" / "rewrite.py"
+        subprocess.Popen(["python3", str(rewrite_script), text, model])
 
     def _open_settings(self, _widget: object) -> None:
         import subprocess
