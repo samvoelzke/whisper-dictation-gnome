@@ -51,6 +51,7 @@ case "${1:-}" in
     stop_daemon
     ;;
   *)
-    exec "${ROOT}/.venv/bin/python" -u "${ROOT}/dictation/daemon.py"
+    stop_daemon
+    start_daemon
     ;;
 esac

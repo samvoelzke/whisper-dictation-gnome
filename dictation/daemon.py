@@ -283,19 +283,20 @@ class WhisperDictationDaemon:
         if not tray_script.exists():
             return
         env = os.environ.copy()
+        if "DISPLAY" not in env:
+            env["DISPLAY"] = ":1"
         proc = subprocess.Popen(
             ["python3", str(tray_script)],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
         self.tray_icon = proc
         time.sleep(0.8)
         print("[whisper-dictation] tray icon started", flush=True)
 
     def _tray_set(self, state: str, _tooltip: str = "") -> None:
-        if self.tray_icon is None:
-            return
         try:
             import socket as _sock
             s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
