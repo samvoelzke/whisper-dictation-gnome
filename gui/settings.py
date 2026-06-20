@@ -106,12 +106,8 @@ BACKEND_OPTIONS = [
     ("faster", "faster-whisper (CPU)"),
 ]
 
-OV_DEVICE_OPTIONS = [
-    ("AUTO", "Auto (GPU > NPU > CPU)"),
-    ("GPU", "GPU (Intel Arc)"),
-    ("NPU", "NPU (experimentell)"),
-    ("CPU", "CPU"),
-]
+# ov_device stays in config (default AUTO -> GPU); the daemon auto-falls back
+# NPU->GPU->CPU, so it is not exposed in the GUI.
 
 HOTKEY_OPTIONS = [
     ("ctrl_r", "Right Ctrl"),
@@ -216,10 +212,6 @@ class SettingsWindow(Adw.ApplicationWindow):
         rec.add(self.model_row)
         self.backend_row = self._combo("Backend", BACKEND_OPTIONS, str(self.config.get("backend", "auto")))
         rec.add(self.backend_row)
-        self.ov_device_row = self._combo(
-            "OpenVINO-Geraet", OV_DEVICE_OPTIONS, str(self.config.get("ov_device", "AUTO")).upper()
-        )
-        rec.add(self.ov_device_row)
         self.language_row = Adw.EntryRow(title="Sprache (de, en, leer=auto)")
         self.language_row.set_text(str(self.config["language"]))
         rec.add(self.language_row)
@@ -313,7 +305,6 @@ class SettingsWindow(Adw.ApplicationWindow):
         config.update({
             "model": self._combo_value(self.model_row, MODEL_OPTIONS),
             "backend": self._combo_value(self.backend_row, BACKEND_OPTIONS),
-            "ov_device": self._combo_value(self.ov_device_row, OV_DEVICE_OPTIONS),
             "language": self.language_row.get_text().strip(),
             "hotwords": self.hotwords_row.get_text().strip(),
             "vad_filter": bool(self.vad_row.get_active()),
