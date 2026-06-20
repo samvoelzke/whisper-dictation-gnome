@@ -116,6 +116,27 @@ journalctl --user -u whisper-dictation -f      # Live-Log
 | `language` | `de` (Standard), `en`, oder leer/`auto` |
 | `paste_mode` | `auto`/`ctrl_v` (Standard), `ctrl_shift_v` (Terminal), `shift_insert` |
 | `record_device` | ALSA-Gerät, Standard `default` |
+| `ollama_postprocess` | `false` (Standard). LLM-Textverbesserung an/aus |
+| `ollama_model` | `qwen2.5:7b` (Standard) |
+
+## Textverbesserung (Ollama, optional)
+
+Ein optionaler LLM-Schritt entfernt Füllwörter (äh, halt, …), korrigiert
+Grammatik/Zeichensetzung und behält englische Fachbegriffe im DE+EN-Mix.
+**Standard: aus** (kostet ~2–4 s extra pro Diktat auf CPU).
+
+Aktivieren:
+
+```bash
+sudo dnf install ollama          # falls noch nicht vorhanden
+sudo systemctl enable --now ollama
+ollama pull qwen2.5:7b           # empfohlenes Modell (DE+EN, gute Qualität)
+```
+
+Dann in der GUI **„Ollama-Nachbearbeitung"** einschalten (oder
+`ollama_postprocess: true`). Läuft Ollama nicht, fällt der Daemon automatisch
+auf den Rohtext zurück. Kleinere Modelle (< 7B) neigen dazu, den Text zu
+*beantworten* statt zu korrigieren — `qwen2.5:7b` ist der getestete Sweet Spot.
 
 ## Logs
 

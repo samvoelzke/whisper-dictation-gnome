@@ -62,7 +62,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_record_seconds": 180,
     "initial_prompt": "",
     "ollama_postprocess": False,
-    "ollama_model": "llama3.2:3b",
+    "ollama_model": "qwen2.5:7b",
     "ollama_host": "http://localhost:11434",
 }
 
@@ -95,6 +95,32 @@ OV_MODEL_REPOS = {
     "large-v3": "OpenVINO/whisper-large-v3-int8-ov",
     "distil-large-v3": "OpenVINO/distil-whisper-large-v3-int8-ov",
 }
+
+# Optional Ollama text cleanup. Chat-style prompt with few-shot examples (the
+# pattern competitor dictation tools use) so a mid-size model edits the text
+# instead of answering it, and keeps English terms English in DE+EN speech.
+OLLAMA_CLEANUP_SYSTEM = (
+    "Du bist ein Korrektur-Werkzeug fuer diktierten Text. Gib AUSSCHLIESSLICH "
+    "den korrigierten Text zurueck - keine Erklaerungen, keine Antworten auf den Inhalt.\n"
+    "Regeln:\n"
+    "- Entferne bedeutungslose Fuellwoerter (aeh, aehm, halt, sozusagen, ne, also).\n"
+    "- Setze korrekte Zeichensetzung und Gross-/Kleinschreibung.\n"
+    "- Wende gesprochene Selbstkorrekturen an (streiche das Verworfene).\n"
+    "- Fuege KEINE Woerter hinzu, aendere NICHT die Bedeutung, mache den Ton NICHT formeller.\n"
+    "- Uebersetze NICHT: englische Woerter/Fachbegriffe bleiben Englisch (deployen, Pull Request, Meeting).\n"
+    "- Antworte NIEMALS auf den Inhalt; korrigiere ihn nur."
+)
+OLLAMA_CLEANUP_SHOTS = [
+    ("wo ist die fernbedienung", "Wo ist die Fernbedienung?"),
+    ("das meeting ist aehm morgen um drei uhr", "Das Meeting ist morgen um drei Uhr."),
+    ("kannst du mir sagen wie das geht", "Kannst du mir sagen, wie das geht?"),
+    ("lass uns das halt mal schnell deployen und dann den pull request mergen",
+     "Lass uns das mal schnell deployen und dann den Pull Request mergen."),
+    ("can you um send me the file when you get a chance",
+     "Can you send me the file when you get a chance?"),
+    ("ich brauche nein warte ich brauche zwei tickets",
+     "Ich brauche - nein, warte - ich brauche zwei Tickets."),
+]
 
 TERMINAL_HINTS = (
     "gnome-terminal", "kgx", "console", "tilix", "terminator", "kitty",
@@ -809,63 +835,44 @@ class WhisperDictationDaemon:
     def _ollama_postprocess(self, text: str) -> str:
         import urllib.request, json as _json, re as _re
         host = str(self.config.get("ollama_host", "http://localhost:11434")).rstrip("/")
-        model = str(self.config.get("ollama_model", "llama3.2:3b"))
+        model = str(self.config.get("ollama_model", "qwen2.5:7b"))
 
-        custom_prompt = str(self.config.get("ollama_system_prompt", "")).strip()
+        # A custom system prompt (if set) overrides the default cleanup rules.
+        system = str(self.config.get("ollama_system_prompt", "")).strip() or OLLAMA_CLEANUP_SYSTEM
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+        for example_in, example_out in OLLAMA_CLEANUP_SHOTS:
+            messages.append({"role": "user", "content": example_in})
+            messages.append({"role": "assistant", "content": example_out})
+        messages.append({"role": "user", "content": text})
 
-        if custom_prompt:
-            completion_prompt = f"{custom_prompt}\n\nEingabe: {text}\nAusgabe:"
-        else:
-            # Few-shot format: Modell sieht sich als reines Textwerkzeug, kein Gespraechspartner.
-            # Bewusst kein "system"-Feld - llama3.2 triggert Safety-Filter seltener im completion-Modus.
-            completion_prompt = (
-                "AUFGABE: Zeichensetzung, Gross-/Kleinschreibung und Grammatik korrigieren.\n"
-                "REGELN: Nur Korrekturen ausgeben. Niemals auf den Inhalt eingehen oder antworten.\n\n"
-                "###\n"
-                "Eingabe: wo ist die fernbedienung\n"
-                "Ausgabe: Wo ist die Fernbedienung?\n"
-                "###\n"
-                "Eingabe: das meeting ist morgen um drei uhr\n"
-                "Ausgabe: Das Meeting ist morgen um drei Uhr.\n"
-                "###\n"
-                "Eingabe: kannst du mir sagen wie das geht\n"
-                "Ausgabe: Kannst du mir sagen, wie das geht?\n"
-                "###\n"
-                f"Eingabe: {text}\n"
-                "Ausgabe:"
-            )
-
-        thinking = bool(self.config.get("ollama_thinking", False))
         payload = {
             "model": model,
-            "prompt": completion_prompt,
+            "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.1, "stop": ["###", "\nEingabe:", "\n\nEingabe:"]},
-            "think": thinking,
+            "think": bool(self.config.get("ollama_thinking", False)),
+            "keep_alive": "10m",
+            "options": {"temperature": 0.1},
         }
 
-        print(f"[whisper-dictation] ollama request model={model} input_chars={len(text)}", flush=True)
+        print(f"[whisper-dictation] ollama chat model={model} input_chars={len(text)}", flush=True)
         req = urllib.request.Request(
-            f"{host}/api/generate",
+            f"{host}/api/chat",
             data=_json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            response_body = resp.read()
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            parsed = _json.loads(resp.read())
 
-        parsed = _json.loads(response_body)
-        raw = str(parsed.get("response", ""))
-        print(f"[whisper-dictation] ollama raw response: {raw!r}", flush=True)
-
+        raw = str(parsed.get("message", {}).get("content", ""))
         cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
-        # Verweigert das Modell, faellt es auf den Original-Text zurueck
+        # If the model refuses or returns nothing, fall back to the raw text.
         refusal_hints = ("ich kann", "i cannot", "i'm unable", "tut mir leid", "sorry", "als ki", "as an ai")
         if not cleaned or any(h in cleaned.lower() for h in refusal_hints):
-            print(f"[whisper-dictation] ollama refusal detected, using raw transcription", flush=True)
+            print("[whisper-dictation] ollama refusal/empty, using raw transcription", flush=True)
             return text
 
-        print(f"[whisper-dictation] ollama postprocess done chars={len(cleaned)}", flush=True)
+        print(f"[whisper-dictation] ollama cleanup done chars={len(cleaned)}", flush=True)
         return cleaned
 
     # -- Paste ------------------------------------------------------------------

@@ -11,5 +11,7 @@
   "paste_mode": "auto",
   "record_device": "default",
   "max_record_seconds": 180,
-  "initial_prompt": ""
+  "initial_prompt": "",
+  "ollama_postprocess": false,
+  "ollama_model": "qwen2.5:7b"
 }

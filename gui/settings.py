@@ -60,6 +60,8 @@ DEFAULT_CONFIG = {
     "record_device": "default",
     "max_record_seconds": 180,
     "initial_prompt": "",
+    "ollama_postprocess": False,
+    "ollama_model": "qwen2.5:7b",
 }
 
 # turbo/large-v3/distil-large-v3 run on the OpenVINO backend (Intel GPU/NPU)
@@ -253,6 +255,23 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.device_row = self._combo("Mikrofon", self.device_options, str(self.config["record_device"]))
         audio.add(self.device_row)
 
+        # ── Textverbesserung (Ollama, optional) ──────────────────────────────
+        llm = Adw.PreferencesGroup(
+            title="Textverbesserung (Ollama)",
+            description="Optionaler LLM-Schritt: entfernt Fuellwoerter, fixt Grammatik. "
+                        "Kostet ~2-4 s extra. Standard: aus.",
+        )
+        page.add(llm)
+        self.ollama_row = Adw.SwitchRow(
+            title="Ollama-Nachbearbeitung",
+            subtitle="Braucht laufenden Ollama-Server",
+        )
+        self.ollama_row.set_active(bool(self.config.get("ollama_postprocess", False)))
+        llm.add(self.ollama_row)
+        self.ollama_model_row = Adw.EntryRow(title="Ollama-Modell")
+        self.ollama_model_row.set_text(str(self.config.get("ollama_model", "qwen2.5:7b")))
+        llm.add(self.ollama_model_row)
+
         adv = Adw.PreferencesGroup(title="Erweitert")
         page.add(adv)
         self.initial_prompt_row = Adw.EntryRow(title="Initial Prompt")
@@ -305,6 +324,8 @@ class SettingsWindow(Adw.ApplicationWindow):
             "max_record_seconds": int(self.max_record_row.get_value()),
             "record_device": self._combo_value(self.device_row, self.device_options),
             "initial_prompt": self.initial_prompt_row.get_text().strip(),
+            "ollama_postprocess": bool(self.ollama_row.get_active()),
+            "ollama_model": self.ollama_model_row.get_text().strip() or "qwen2.5:7b",
         })
         return config
 
