@@ -277,16 +277,20 @@ class SettingsWindow(Adw.ApplicationWindow):
         llm.add(self.ollama_model_row)
 
         adv = Adw.PreferencesGroup(
-            title="Erweitert",
-            description="Kontext, der die Erkennung Richtung deiner Begriffe lenkt "
-                        "(wird nicht mitgeschrieben).",
+            title="Kontext (Initial Prompt)",
+            description="Lenkt die Erkennung Richtung deiner Begriffe — wird nicht "
+                        "mitgeschrieben. Leer lassen = aus.",
         )
         page.add(adv)
-        self.initial_prompt_row = Adw.EntryRow(title="Kontext (Initial Prompt)")
-        self.initial_prompt_row.set_text(
-            str(self.config.get("initial_prompt") or "").strip() or DEFAULT_INITIAL_PROMPT
+        prompt_scroller = Gtk.ScrolledWindow(min_content_height=84)
+        prompt_scroller.add_css_class("card")
+        self.prompt_view = Gtk.TextView(
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            top_margin=8, bottom_margin=8, left_margin=8, right_margin=8,
         )
-        adv.add(self.initial_prompt_row)
+        self.prompt_view.get_buffer().set_text(str(self.config.get("initial_prompt", "")))
+        prompt_scroller.set_child(self.prompt_view)
+        adv.add(prompt_scroller)
 
         self._update_model_hint()
         self._refresh_status()
@@ -312,6 +316,10 @@ class SettingsWindow(Adw.ApplicationWindow):
         running = daemon_running()
         self.status_row.set_subtitle("● läuft" if running else "○ gestoppt")
 
+    def _prompt_text(self) -> str:
+        buf = self.prompt_view.get_buffer()
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+
     def _toast(self, text: str) -> None:
         self.toasts.add_toast(Adw.Toast.new(text))
 
@@ -328,7 +336,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             "paste_mode": self._combo_value(self.paste_row, PASTE_OPTIONS),
             "max_record_seconds": int(self.max_record_row.get_value()),
             "record_device": self._combo_value(self.device_row, self.device_options),
-            "initial_prompt": self.initial_prompt_row.get_text().strip(),
+            "initial_prompt": self._prompt_text(),
             "ollama_postprocess": bool(self.ollama_row.get_active()),
             "ollama_model": self.ollama_model_row.get_text().strip() or "qwen2.5:7b",
         })
