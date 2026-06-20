@@ -152,6 +152,36 @@ def notify(summary: str, body: str = "") -> None:
     subprocess.run(command, check=False)
 
 
+def _notify_send_linux(
+    summary: str,
+    body: str = "",
+    urgency: str = "normal",
+    timeout_ms: int | None = None,
+    replace_id: int | None = None,
+) -> int | None:
+    """Send/update a notification in place; returns its id (for replacing).
+
+    Using --replace-id keeps a single status bubble that changes its text
+    instead of stacking one popup per state. --print-id returns the id.
+    """
+    if shutil_which("notify-send") is None:
+        return replace_id
+    command = [
+        "notify-send", "-a", "Whisper Dictation",
+        "-i", "io.voelzke.WhisperDictation", "-p", "-u", urgency,
+    ]
+    if timeout_ms is not None:
+        command += ["-t", str(int(timeout_ms))]
+    if replace_id is not None:
+        command += ["-r", str(int(replace_id))]
+    command.append(summary)
+    if body:
+        command.append(body)
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    out = result.stdout.strip()
+    return int(out) if out.isdigit() else replace_id
+
+
 def shutil_which(binary: str) -> str | None:
     for directory in os.environ.get("PATH", "").split(os.pathsep):
         candidate = Path(directory) / binary
@@ -290,6 +320,8 @@ class WhisperDictationDaemon:
         self.last_hotkey_release: float | None = None
         self.busy = False
         self.stopping = False
+        # Single, in-place-updated status notification for the dictation cycle.
+        self._notify_id: int | None = None
 
     def _resolve_backend(self) -> str:
         backend = str(self.config.get("backend", "auto")).lower()
@@ -579,7 +611,7 @@ class WhisperDictationDaemon:
 
     def toggle_recording(self) -> None:
         if self.busy:
-            notify("Noch beschaeftigt", "Bitte warten, die letzte Aufnahme wird noch verarbeitet.")
+            self._status("Noch beschäftigt", "Letzte Aufnahme wird verarbeitet.", timeout_ms=3000)
             return
         is_recording = (
             self.recording_process is not None or self.recording_sd_thread is not None
@@ -686,7 +718,11 @@ class WhisperDictationDaemon:
         )
         self.recording_timer.daemon = True
         self.recording_timer.start()
-        notify("Aufnahme gestartet", f"Zum Stoppen wieder doppelt {self.hotkey_label} druecken")
+        self._status(
+            "🔴 Aufnahme läuft",
+            f"Doppelt {self.hotkey_label} zum Stoppen",
+            urgency="critical", timeout_ms=0,
+        )
         self._play_sound("start")
 
     def auto_stop_recording(self) -> None:
@@ -696,7 +732,6 @@ class WhisperDictationDaemon:
             )
             if not is_recording or self.busy:
                 return
-            notify("Aufnahme wird beendet", "Maximale Aufnahmedauer erreicht.")
             self.stop_recording()
 
     def stop_recording(self) -> None:
@@ -727,7 +762,7 @@ class WhisperDictationDaemon:
             )
 
         worker.start()
-        notify("Transkription laeuft", "Die Aufnahme wird gerade erkannt und eingefuegt.")
+        self._status("✍️ Transkribiere…", "Aufnahme wird erkannt", urgency="critical", timeout_ms=0)
 
     def _stop_and_transcribe_macos(self, output_path: Path) -> None:
         self._stop_recording_macos(output_path)
@@ -745,35 +780,38 @@ class WhisperDictationDaemon:
     def _transcribe_and_paste(self, output_path: Path) -> None:
         try:
             if not output_path.exists() or output_path.stat().st_size < 100:
-                notify("Kein Text erkannt", "Die Aufnahme war leer.")
+                self._status("Kein Text erkannt", "Die Aufnahme war leer.", timeout_ms=4000)
                 return
 
             audio = read_wav_mono(output_path)
             rms = float(np.sqrt(np.mean(audio ** 2)))
             print(f"[whisper-dictation] audio rms={rms:.5f}", flush=True)
             if rms < 0.002:
-                notify("Kein Text erkannt", "Die Aufnahme war leer oder zu leise.")
+                self._status("Kein Text erkannt", "Die Aufnahme war leer oder zu leise.", timeout_ms=4000)
                 return
 
             text = self._transcribe_audio(audio).strip()
             if not text:
-                notify("Kein Text erkannt", "Nichts verstanden.")
+                self._status("Kein Text erkannt", "Nichts verstanden.", timeout_ms=4000)
                 return
 
             print(f"[whisper-dictation] transcription ready chars={len(text)}", flush=True)
 
             if self.config.get("ollama_postprocess"):
-                notify("Verfeinere Text...", "Ollama laeuft...")
+                self._status("🤖 Verfeinere Text…", "Ollama läuft…", urgency="critical", timeout_ms=0)
                 try:
                     text = self._ollama_postprocess(text)
                 except Exception as exc:
                     print(f"[whisper-dictation] ollama failed, using raw: {exc}", file=sys.stderr, flush=True)
 
-            self._paste_text(text)
-            notify("Eingefuegt", text[:100])
+            pasted = self._paste_text(text)
+            if pasted:
+                self._status("✓ Eingefügt", text[:120], timeout_ms=4000)
+            else:
+                self._status("📋 In Zwischenablage", "Manuell mit Strg+V: " + text[:90], timeout_ms=6000)
             self._play_sound("done")
         except Exception as exc:
-            notify("Fehler", str(exc))
+            self._status("Fehler", str(exc), urgency="critical", timeout_ms=6000)
             print(f"[whisper-dictation] {exc}", file=sys.stderr, flush=True)
         finally:
             self.busy = False
@@ -877,13 +915,13 @@ class WhisperDictationDaemon:
 
     # -- Paste ------------------------------------------------------------------
 
-    def _paste_text(self, text: str) -> None:
+    def _paste_text(self, text: str) -> bool:
+        """Returns True if the text was auto-pasted, False if only copied."""
         if IS_MACOS:
-            self._paste_macos(text)
-        else:
-            self._paste_linux(text)
+            return self._paste_macos(text)
+        return self._paste_linux(text)
 
-    def _paste_linux(self, text: str) -> None:
+    def _paste_linux(self, text: str) -> bool:
         if shutil_which("wl-copy") is None:
             raise RuntimeError("wl-copy ist nicht installiert (sudo dnf install wl-clipboard).")
 
@@ -894,27 +932,21 @@ class WhisperDictationDaemon:
         print(f"[whisper-dictation] paste mode={paste_mode}", flush=True)
 
         if shutil_which("ydotool") is None:
-            notify(
-                "Text in der Zwischenablage",
-                "ydotool fehlt - bitte manuell mit Strg+V einfuegen.",
-            )
-            return
+            return False
 
         keys = _YDOTOOL_KEYS.get(paste_mode, _YDOTOOL_KEYS["ctrl_v"])
         result = subprocess.run(
             ["ydotool", "key", *keys], check=False, capture_output=True, text=True
         )
         if result.returncode != 0:
-            notify(
-                "Text in der Zwischenablage",
-                "ydotool-Inject fehlgeschlagen - bitte manuell mit Strg+V einfuegen.",
-            )
             print(
                 f"[whisper-dictation] ydotool failed rc={result.returncode}: {result.stderr.strip()}",
                 file=sys.stderr, flush=True,
             )
+            return False
+        return True
 
-    def _paste_macos(self, text: str) -> None:
+    def _paste_macos(self, text: str) -> bool:
         subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
         time.sleep(0.15)
         print("[whisper-dictation] paste mode=osascript", flush=True)
@@ -923,6 +955,7 @@ class WhisperDictationDaemon:
              'tell application "System Events" to keystroke "v" using command down'],
             check=False, capture_output=True,
         )
+        return True
 
     def _resolve_paste_mode(self) -> str:
         configured = str(self.config["paste_mode"]).lower()
@@ -931,6 +964,23 @@ class WhisperDictationDaemon:
         # On Wayland the focused window class is not exposed, so we cannot
         # auto-switch to the terminal paste shortcut. Default to Ctrl+V.
         return "ctrl_v"
+
+    # -- Status notification (single, in-place) ---------------------------------
+
+    def _status(self, summary: str, body: str = "", urgency: str = "normal",
+                timeout_ms: int | None = None) -> None:
+        """Update the one dictation status bubble instead of stacking popups.
+
+        urgency="critical" with timeout_ms=0 pins it on screen for the duration
+        of the memo; terminal states use "normal" + a short timeout so the
+        bubble auto-dismisses.
+        """
+        if IS_MACOS:
+            notify(summary, body)
+            return
+        self._notify_id = _notify_send_linux(
+            summary, body, urgency, timeout_ms, self._notify_id
+        )
 
     # -- Sound feedback ---------------------------------------------------------
 
