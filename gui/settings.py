@@ -361,12 +361,22 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     # ── Actions ────────────────────────────────────────────────────────────────
 
+    # Changing these keys re-grabs the evdev listener, which only happens at
+    # startup -> a full restart is needed. Everything else applies live.
+    RESTART_KEYS = ("double_tap_key", "llm_toggle_key")
+
     def _on_save(self, _button: Gtk.Button) -> None:
-        self.config = self._config_from_form()
-        save_config(self.config)
-        code, output = self._run_daemon("--reload")
-        self._toast("Gespeichert — Aenderungen sind aktiv." if code == 0
-                    else f"Gespeichert, Reload-Fehler: {output}")
+        old, new = self.config, self._config_from_form()
+        self.config = new
+        save_config(new)
+        needs_restart = any(old.get(k) != new.get(k) for k in self.RESTART_KEYS)
+        if needs_restart:
+            code, output = self._run_daemon("--restart")
+            msg = "Gespeichert & Daemon neu gestartet." if code == 0 else f"Neustart-Fehler: {output}"
+        else:
+            code, output = self._run_daemon("--reload")
+            msg = "Gespeichert — Aenderungen sind aktiv." if code == 0 else f"Reload-Fehler: {output}"
+        self._toast(msg)
         self._refresh_status()
 
     def _on_start(self, *_a) -> None:
