@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""Whisper Dictation settings — a libadwaita (GNOME) app.
+
+Writes ~/.config/whisper-dictation/config.json and applies changes live via
+`whisper-dictation.sh --reload` (no model reload unless model/device changed).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,8 @@ from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gio, Gtk
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk
 
 
 def detect_alsa_capture_devices() -> list[tuple[str, str]]:
@@ -44,39 +50,66 @@ DEFAULT_CONFIG = {
     "double_tap_window_ms": 400,
     "language": "de",
     "model": "turbo",
+    "backend": "auto",
+    "ov_device": "AUTO",
+    "beam_size": 5,
+    "vad_filter": True,
+    "hotwords": "",
+    "sound_cue": True,
     "paste_mode": "auto",
     "record_device": "default",
     "max_record_seconds": 180,
     "initial_prompt": "",
 }
 
+# turbo/large-v3/distil-large-v3 run on the OpenVINO backend (Intel GPU/NPU)
+# when available; the others fall back to faster-whisper on CPU. The German
+# finetune is a CTranslate2 HF model and always runs via faster-whisper.
+DE_FINETUNE = "TheChola/whisper-large-v3-turbo-german-faster-whisper"
 MODEL_OPTIONS = [
-    ("turbo", "turbo"),
-    ("tiny", "tiny"),
-    ("base", "base"),
-    ("small", "small"),
-    ("medium", "medium"),
-    ("large-v3", "large-v3"),
-    ("tiny.en", "tiny.en"),
-    ("base.en", "base.en"),
-    ("small.en", "small.en"),
-    ("medium.en", "medium.en"),
-    ("large-v2", "large-v2"),
+    ("turbo", "turbo (large-v3-turbo) — GPU"),
+    (DE_FINETUNE, "Deutsch-Finetune (turbo, CPU)"),
+    ("distil-large-v3", "distil-large-v3 (EN) — GPU"),
+    ("large-v3", "large-v3 — GPU"),
+    ("tiny", "tiny (CPU)"),
+    ("base", "base (CPU)"),
+    ("small", "small (CPU)"),
+    ("medium", "medium (CPU)"),
+    ("tiny.en", "tiny.en (CPU)"),
+    ("base.en", "base.en (CPU)"),
+    ("small.en", "small.en (CPU)"),
+    ("medium.en", "medium.en (CPU)"),
+    ("large-v2", "large-v2 (CPU)"),
 ]
 
 MODEL_HINTS = {
-    "turbo": "Schnell und sehr stark. Gute Standardwahl fuer lokale Diktate.",
-    "tiny": "Extrem schnell, aber die geringste Genauigkeit.",
-    "base": "Etwas genauer als tiny, immer noch sehr leicht.",
-    "small": "Guter Mittelweg fuer viele Systeme.",
-    "medium": "Deutlich genauer, aber merklich schwerer.",
-    "large-v3": "Beste Qualitaet, braucht am meisten VRAM und Ladezeit.",
-    "tiny.en": "Nur Englisch, maximal leichtgewichtig.",
-    "base.en": "Nur Englisch, kompakt und etwas praeziser.",
-    "small.en": "Nur Englisch, guter Kompromiss.",
-    "medium.en": "Nur Englisch, stark aber schwerer.",
-    "large-v2": "Aelteres grosses Modell. Meist nur noetig fuer direkte Vergleiche.",
+    "turbo": "Beste Standardwahl: stark + multilingual (DE/EN gemischt), laeuft auf der Intel-GPU.",
+    DE_FINETUNE: "Deutsch-Finetune (WER ~2.6%). Bestes Deutsch, aber CPU-only und schwaecher bei Englisch.",
+    "distil-large-v3": "Nur Englisch, distilliert: am schnellsten. Laeuft auf der GPU.",
+    "large-v3": "Hoechste Qualitaet, multilingual, GPU. Etwas langsamer als turbo.",
+    "tiny": "Extrem schnell, aber die geringste Genauigkeit (CPU).",
+    "base": "Etwas genauer als tiny, immer noch sehr leicht (CPU).",
+    "small": "Guter Mittelweg (CPU).",
+    "medium": "Deutlich genauer, aber merklich schwerer (CPU).",
+    "tiny.en": "Nur Englisch, maximal leichtgewichtig (CPU).",
+    "base.en": "Nur Englisch, kompakt (CPU).",
+    "small.en": "Nur Englisch, guter Kompromiss (CPU).",
+    "medium.en": "Nur Englisch, stark aber schwerer (CPU).",
+    "large-v2": "Aelteres grosses Modell (CPU). Meist nur fuer Vergleiche.",
 }
+
+BACKEND_OPTIONS = [
+    ("auto", "Auto (GPU wenn moeglich)"),
+    ("openvino", "OpenVINO (Intel GPU/NPU)"),
+    ("faster", "faster-whisper (CPU)"),
+]
+
+OV_DEVICE_OPTIONS = [
+    ("AUTO", "Auto (NPU > GPU > CPU)"),
+    ("GPU", "GPU (Intel Arc)"),
+    ("NPU", "NPU"),
+    ("CPU", "CPU"),
+]
 
 HOTKEY_OPTIONS = [
     ("ctrl_r", "Right Ctrl"),
@@ -90,10 +123,9 @@ HOTKEY_OPTIONS = [
 ]
 
 PASTE_OPTIONS = [
-    ("auto", "Auto"),
+    ("auto", "Auto (Ctrl+V)"),
     ("ctrl_v", "Ctrl+V"),
-    ("cmd_v", "Cmd+V (macOS)"),
-    ("ctrl_shift_v", "Ctrl+Shift+V"),
+    ("ctrl_shift_v", "Ctrl+Shift+V (Terminal)"),
     ("shift_insert", "Shift+Insert"),
 ]
 
@@ -121,207 +153,202 @@ def save_config(config: dict) -> None:
 
 def daemon_running() -> bool:
     result = subprocess.run(
-        ["pgrep", "-f", "dictation/daemon.py"],
-        capture_output=True,
-        text=True,
-        check=False,
+        [str(DAEMON_SCRIPT), "--status"],
+        capture_output=True, text=True, check=False,
     )
-    return result.returncode == 0 and bool(result.stdout.strip())
+    return result.stdout.strip() == "running"
 
 
-class SettingsWindow(Gtk.ApplicationWindow):
-    def __init__(self, app: Gtk.Application):
+class SettingsWindow(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application):
         super().__init__(application=app, title="Whisper Dictation")
-        self.set_default_size(620, 520)
+        self.set_default_size(560, 720)
         self.config = load_config()
-
-        outer = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=14,
-            margin_top=18,
-            margin_bottom=18,
-            margin_start=18,
-            margin_end=18,
-        )
-        self.set_child(outer)
-
-        title = Gtk.Label(
-            label="Lokale Whisper-Diktierfunktion fuer GNOME",
-            xalign=0,
-        )
-        title.add_css_class("title-2")
-        outer.append(title)
-
-        subtitle = Gtk.Label(
-            label=(
-                "Die GUI schreibt dieselbe Config wie der Hintergrunddienst. "
-                "Mit Speichern und Neustarten wird das gewaehlte Modell sofort aktiv."
-            ),
-            wrap=True,
-            xalign=0,
-        )
-        outer.append(subtitle)
-
-        grid = Gtk.Grid(column_spacing=12, row_spacing=12)
-        outer.append(grid)
-
-        self.model_dropdown = self._dropdown(MODEL_OPTIONS, str(self.config["model"]))
-        self.hotkey_dropdown = self._dropdown(
-            HOTKEY_OPTIONS, str(self.config["double_tap_key"])
-        )
-        self.paste_dropdown = self._dropdown(
-            PASTE_OPTIONS, str(self.config["paste_mode"])
-        )
-
-        self.language_entry = Gtk.Entry(text=str(self.config["language"]))
-        self.language_entry.set_placeholder_text("de, en oder leer fuer auto")
-
-        self.double_tap_spin = Gtk.SpinButton.new_with_range(150, 1200, 10)
-        self.double_tap_spin.set_value(float(self.config["double_tap_window_ms"]))
-
-        self.max_record_spin = Gtk.SpinButton.new_with_range(15, 900, 5)
-        self.max_record_spin.set_value(float(self.config["max_record_seconds"]))
-
         self.device_options = detect_alsa_capture_devices()
-        self.device_dropdown = self._dropdown(
-            self.device_options, str(self.config["record_device"])
+
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+
+        toolbar = Adw.ToolbarView()
+        self.toasts.set_child(toolbar)
+
+        header = Adw.HeaderBar()
+        toolbar.add_top_bar(header)
+
+        save_button = Gtk.Button(label="Speichern")
+        save_button.add_css_class("suggested-action")
+        save_button.connect("clicked", self._on_save)
+        header.pack_start(save_button)
+
+        menu = Gio.Menu()
+        menu.append("Daemon starten", "win.start")
+        menu.append("Daemon neu starten", "win.restart")
+        menu.append("Daemon stoppen", "win.stop")
+        menu.append("Log oeffnen", "win.log")
+        menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
+        header.pack_end(menu_button)
+        for name, handler in (
+            ("start", self._on_start), ("restart", self._on_restart),
+            ("stop", self._on_stop), ("log", self._on_log),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self.add_action(action)
+
+        page = Adw.PreferencesPage()
+        toolbar.set_content(page)
+
+        # ── Status ───────────────────────────────────────────────────────────
+        status_group = Adw.PreferencesGroup()
+        page.add(status_group)
+        self.status_row = Adw.ActionRow(title="Daemon")
+        status_icon = Gtk.Image(icon_name="audio-input-microphone-symbolic")
+        self.status_row.add_prefix(status_icon)
+        status_group.add(self.status_row)
+
+        # ── Erkennung ────────────────────────────────────────────────────────
+        rec = Adw.PreferencesGroup(title="Erkennung")
+        page.add(rec)
+        self.model_row = self._combo("Modell", MODEL_OPTIONS, str(self.config["model"]))
+        self.model_row.connect("notify::selected", lambda *_: self._update_model_hint())
+        rec.add(self.model_row)
+        self.backend_row = self._combo("Backend", BACKEND_OPTIONS, str(self.config.get("backend", "auto")))
+        rec.add(self.backend_row)
+        self.ov_device_row = self._combo(
+            "OpenVINO-Geraet", OV_DEVICE_OPTIONS, str(self.config.get("ov_device", "AUTO")).upper()
         )
-        self.initial_prompt_entry = Gtk.Entry(text=str(self.config["initial_prompt"]))
-        self.initial_prompt_entry.set_placeholder_text("Optionaler Whisper-Prompt")
+        rec.add(self.ov_device_row)
+        self.language_row = Adw.EntryRow(title="Sprache (de, en, leer=auto)")
+        self.language_row.set_text(str(self.config["language"]))
+        rec.add(self.language_row)
+        self.hotwords_row = Adw.EntryRow(title="Hotwords (Komma-getrennt)")
+        self.hotwords_row.set_text(str(self.config.get("hotwords", "")))
+        rec.add(self.hotwords_row)
+        self.vad_row = Adw.SwitchRow(title="VAD", subtitle="Stille filtern (weniger Halluzinationen)")
+        self.vad_row.set_active(bool(self.config.get("vad_filter", True)))
+        rec.add(self.vad_row)
 
-        self._attach_row(grid, 0, "Modell", self.model_dropdown)
-        self._attach_row(grid, 1, "Sprache", self.language_entry)
-        self._attach_row(grid, 2, "Doppeltaste", self.hotkey_dropdown)
-        self._attach_row(grid, 3, "Double-Tap Fenster (ms)", self.double_tap_spin)
-        self._attach_row(grid, 4, "Paste-Modus", self.paste_dropdown)
-        self._attach_row(grid, 5, "Max. Aufnahme (s)", self.max_record_spin)
-        self._attach_row(grid, 6, "Mikrofon", self.device_dropdown)
-        self._attach_row(grid, 7, "Initial Prompt", self.initial_prompt_entry)
+        # ── Eingabe ──────────────────────────────────────────────────────────
+        inp = Adw.PreferencesGroup(title="Eingabe")
+        page.add(inp)
+        self.hotkey_row = self._combo("Doppeltaste", HOTKEY_OPTIONS, str(self.config["double_tap_key"]))
+        inp.add(self.hotkey_row)
+        self.double_tap_row = Adw.SpinRow.new_with_range(150, 1200, 10)
+        self.double_tap_row.set_title("Double-Tap-Fenster (ms)")
+        self.double_tap_row.set_value(float(self.config["double_tap_window_ms"]))
+        inp.add(self.double_tap_row)
+        self.paste_row = self._combo("Paste-Modus", PASTE_OPTIONS, str(self.config["paste_mode"]))
+        inp.add(self.paste_row)
+        self.max_record_row = Adw.SpinRow.new_with_range(15, 900, 5)
+        self.max_record_row.set_title("Max. Aufnahme (s)")
+        self.max_record_row.set_value(float(self.config["max_record_seconds"]))
+        inp.add(self.max_record_row)
+        self.sound_row = Adw.SwitchRow(title="Sound-Feedback", subtitle="Ton bei Start/Fertig")
+        self.sound_row.set_active(bool(self.config.get("sound_cue", True)))
+        inp.add(self.sound_row)
 
-        self.model_hint = Gtk.Label(wrap=True, xalign=0)
-        outer.append(self.model_hint)
+        # ── Audio + Erweitert ────────────────────────────────────────────────
+        audio = Adw.PreferencesGroup(title="Audio")
+        page.add(audio)
+        self.device_row = self._combo("Mikrofon", self.device_options, str(self.config["record_device"]))
+        audio.add(self.device_row)
+
+        adv = Adw.PreferencesGroup(title="Erweitert")
+        page.add(adv)
+        self.initial_prompt_row = Adw.EntryRow(title="Initial Prompt")
+        self.initial_prompt_row.set_text(str(self.config["initial_prompt"]))
+        adv.add(self.initial_prompt_row)
+
         self._update_model_hint()
-        self.model_dropdown.connect("notify::selected", self._on_model_changed)
+        self._refresh_status()
 
-        self.status_label = Gtk.Label(wrap=True, xalign=0)
-        outer.append(self.status_label)
-        self._set_status()
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-        button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        outer.append(button_row)
+    def _combo(self, title: str, options: list[tuple[str, str]], current: str) -> Adw.ComboRow:
+        row = Adw.ComboRow(title=title)
+        row.set_model(Gtk.StringList.new([label for _, label in options]))
+        idx = next((i for i, (value, _) in enumerate(options) if value == current), 0)
+        row.set_selected(idx)
+        return row
 
-        apply_button = Gtk.Button(label="Speichern und Daemon neu starten")
-        apply_button.connect("clicked", self._on_apply_clicked)
-        apply_button.add_css_class("suggested-action")
-        button_row.append(apply_button)
-
-        start_button = Gtk.Button(label="Daemon starten")
-        start_button.connect("clicked", self._on_start_clicked)
-        button_row.append(start_button)
-
-        stop_button = Gtk.Button(label="Daemon stoppen")
-        stop_button.connect("clicked", self._on_stop_clicked)
-        button_row.append(stop_button)
-
-        log_button = Gtk.Button(label="Log oeffnen")
-        log_button.connect("clicked", self._on_log_clicked)
-        button_row.append(log_button)
-
-    def _attach_row(self, grid: Gtk.Grid, row: int, label_text: str, widget: Gtk.Widget) -> None:
-        label = Gtk.Label(label=label_text, xalign=0)
-        grid.attach(label, 0, row, 1, 1)
-        widget.set_hexpand(True)
-        grid.attach(widget, 1, row, 1, 1)
-
-    def _dropdown(self, options: list[tuple[str, str]], current_value: str) -> Gtk.DropDown:
-        labels = [label for _, label in options]
-        dropdown = Gtk.DropDown.new_from_strings(labels)
-        selected = next(
-            (index for index, (value, _) in enumerate(options) if value == current_value),
-            0,
-        )
-        dropdown.set_selected(selected)
-        return dropdown
-
-    def _selected_value(self, dropdown: Gtk.DropDown, options: list[tuple[str, str]]) -> str:
-        return options[dropdown.get_selected()][0]
-
-    def _config_from_form(self) -> dict:
-        return {
-            "model": self._selected_value(self.model_dropdown, MODEL_OPTIONS),
-            "language": self.language_entry.get_text().strip(),
-            "double_tap_key": self._selected_value(self.hotkey_dropdown, HOTKEY_OPTIONS),
-            "double_tap_window_ms": int(self.double_tap_spin.get_value()),
-            "paste_mode": self._selected_value(self.paste_dropdown, PASTE_OPTIONS),
-            "max_record_seconds": int(self.max_record_spin.get_value()),
-            "record_device": self._selected_value(self.device_dropdown, self.device_options),
-            "initial_prompt": self.initial_prompt_entry.get_text().strip(),
-        }
+    @staticmethod
+    def _combo_value(row: Adw.ComboRow, options: list[tuple[str, str]]) -> str:
+        return options[row.get_selected()][0]
 
     def _update_model_hint(self) -> None:
-        model = self._selected_value(self.model_dropdown, MODEL_OPTIONS)
-        hint = MODEL_HINTS.get(model, "")
-        self.model_hint.set_label(
-            f"Modellhinweis: {hint}\nHinweis: Ein Modellwechsel fuehrt beim naechsten Start einmalig zu einem Download, falls es noch nicht lokal im Cache liegt."
-        )
+        model = self._combo_value(self.model_row, MODEL_OPTIONS)
+        self.model_row.set_subtitle(MODEL_HINTS.get(model, ""))
 
-    def _set_status(self, extra: str = "") -> None:
+    def _refresh_status(self) -> None:
         running = daemon_running()
-        state = "Daemon laeuft im Hintergrund." if running else "Daemon ist gerade gestoppt."
-        active_model = self._selected_value(self.model_dropdown, MODEL_OPTIONS)
-        suffix = f"\n{extra}" if extra else ""
-        self.status_label.set_label(
-            f"{state}\nAktuell ausgewaehltes Modell: {active_model}\nConfig: {CONFIG_FILE}{suffix}"
+        self.status_row.set_subtitle(
+            ("● laeuft" if running else "○ gestoppt")
+            + f"  ·  Backend: {self._combo_value(self.backend_row, BACKEND_OPTIONS)}"
         )
 
-    def _run_daemon_command(self, arg: str) -> tuple[int, str]:
+    def _toast(self, text: str) -> None:
+        self.toasts.add_toast(Adw.Toast.new(text))
+
+    def _config_from_form(self) -> dict:
+        config = dict(self.config)
+        config.update({
+            "model": self._combo_value(self.model_row, MODEL_OPTIONS),
+            "backend": self._combo_value(self.backend_row, BACKEND_OPTIONS),
+            "ov_device": self._combo_value(self.ov_device_row, OV_DEVICE_OPTIONS),
+            "language": self.language_row.get_text().strip(),
+            "hotwords": self.hotwords_row.get_text().strip(),
+            "vad_filter": bool(self.vad_row.get_active()),
+            "sound_cue": bool(self.sound_row.get_active()),
+            "double_tap_key": self._combo_value(self.hotkey_row, HOTKEY_OPTIONS),
+            "double_tap_window_ms": int(self.double_tap_row.get_value()),
+            "paste_mode": self._combo_value(self.paste_row, PASTE_OPTIONS),
+            "max_record_seconds": int(self.max_record_row.get_value()),
+            "record_device": self._combo_value(self.device_row, self.device_options),
+            "initial_prompt": self.initial_prompt_row.get_text().strip(),
+        })
+        return config
+
+    def _run_daemon(self, arg: str) -> tuple[int, str]:
         result = subprocess.run(
-            [str(DAEMON_SCRIPT), arg],
-            capture_output=True,
-            text=True,
-            check=False,
+            [str(DAEMON_SCRIPT), arg], capture_output=True, text=True, check=False,
         )
-        output = (result.stdout + result.stderr).strip()
-        return result.returncode, output
+        return result.returncode, (result.stdout + result.stderr).strip()
 
-    def _on_model_changed(self, *_args) -> None:
-        self._update_model_hint()
-        self._set_status()
+    # ── Actions ────────────────────────────────────────────────────────────────
 
-    def _on_apply_clicked(self, _button: Gtk.Button) -> None:
-        config = self._config_from_form()
-        save_config(config)
-        code, output = self._run_daemon_command("--restart")
-        message = "Gespeichert und Daemon neu gestartet."
-        if code != 0:
-            message = f"Config gespeichert, aber Neustart schlug fehl: {output}"
-        self._set_status(message)
+    def _on_save(self, _button: Gtk.Button) -> None:
+        self.config = self._config_from_form()
+        save_config(self.config)
+        code, output = self._run_daemon("--reload")
+        self._toast("Gespeichert — Aenderungen sind aktiv." if code == 0
+                    else f"Gespeichert, Reload-Fehler: {output}")
+        self._refresh_status()
 
-    def _on_start_clicked(self, _button: Gtk.Button) -> None:
-        code, output = self._run_daemon_command("--restart")
-        message = "Daemon gestartet."
-        if code != 0:
-            message = f"Start fehlgeschlagen: {output}"
-        self._set_status(message)
+    def _on_start(self, *_a) -> None:
+        code, output = self._run_daemon("--restart")
+        self._toast("Daemon gestartet." if code == 0 else f"Start fehlgeschlagen: {output}")
+        self._refresh_status()
 
-    def _on_stop_clicked(self, _button: Gtk.Button) -> None:
-        code, output = self._run_daemon_command("--stop")
-        message = "Daemon gestoppt."
-        if code != 0:
-            message = f"Stop meldete einen Fehler: {output}"
-        self._set_status(message)
+    def _on_restart(self, *_a) -> None:
+        code, output = self._run_daemon("--restart")
+        self._toast("Daemon neu gestartet." if code == 0 else f"Neustart fehlgeschlagen: {output}")
+        self._refresh_status()
 
-    def _on_log_clicked(self, _button: Gtk.Button) -> None:
+    def _on_stop(self, *_a) -> None:
+        code, output = self._run_daemon("--stop")
+        self._toast("Daemon gestoppt." if code == 0 else f"Stop-Fehler: {output}")
+        self._refresh_status()
+
+    def _on_log(self, *_a) -> None:
         if LOG_FILE.exists():
-            Gio.AppInfo.launch_default_for_uri(f"file://{LOG_FILE}", None)
-            self._set_status("Logdatei geoeffnet.")
-            return
-        self._set_status("Noch keine Logdatei vorhanden.")
+            Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(str(LOG_FILE), None), None)
+        else:
+            self._toast("Noch keine Logdatei vorhanden.")
 
 
-class SettingsApplication(Gtk.Application):
+class WhisperDictationApp(Adw.Application):
     def __init__(self):
-        super().__init__(application_id="local.whisper.dictation.settings")
+        super().__init__(application_id="io.voelzke.WhisperDictation")
 
     def do_activate(self) -> None:
         window = self.props.active_window
@@ -331,7 +358,7 @@ class SettingsApplication(Gtk.Application):
 
 
 def main() -> int:
-    app = SettingsApplication()
+    app = WhisperDictationApp()
     return app.run([])
 
 

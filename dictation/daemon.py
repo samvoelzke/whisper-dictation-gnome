@@ -15,25 +15,18 @@ import wave
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+# hf-xet transfers can stall on some networks; force plain HTTPS downloads.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WHISPER_REPO_ROOT = PROJECT_ROOT / "whisper"
-if str(WHISPER_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(WHISPER_REPO_ROOT))
-
-import numpy as np
-import torch
-import whisper
-from pynput import keyboard
 
 IS_MACOS = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
 
-try:
-    from Xlib import X, display as xdisplay
-except Exception:
-    X = None
-    xdisplay = None
-
+# macOS records via sounddevice; Linux records via arecord (PipeWire/ALSA).
 if IS_MACOS:
     try:
         import sounddevice as sd
@@ -51,6 +44,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "double_tap_window_ms": 400,
     "language": "de",
     "model": "turbo",
+    # "auto": openvino on Linux when available, else faster-whisper; openai on macOS.
+    "backend": "auto",
+    # OpenVINO device preference: AUTO picks NPU > GPU > CPU.
+    "ov_device": "AUTO",
+    "beam_size": 5,
+    # VAD trims silence before transcription: fewer hallucinations + less compute.
+    "vad_filter": True,
+    # Comma-separated domain words to bias recognition (names, jargon).
+    "hotwords": "",
+    # Audible feedback on record start / text inserted (no tray on GNOME).
+    "sound_cue": True,
     "paste_mode": "auto",
     "record_device": "default",
     "max_record_seconds": 180,
@@ -60,30 +64,48 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ollama_host": "http://localhost:11434",
 }
 
-# Each entry: (primary_key, fallback_keys_set, label)
-# Fallbacks handle systems where pynput reports the generic key instead of left/right variant.
-def _hotkey_entry(key_name: str, fallbacks: frozenset, label: str):
-    try:
-        return (getattr(keyboard.Key, key_name), fallbacks, label)
-    except AttributeError:
-        return None
+# Hotkey spec per logical name:
+#   (label, pynput_attr, pynput_fallback_attrs, evdev_ecode_name)
+# pynput_* are used on macOS, evdev_ecode_name on Linux/Wayland.
+HOTKEY_SPECS: dict[str, tuple[str, str, list[str], str]] = {
+    "ctrl_r": ("Right Ctrl", "ctrl_r", ["ctrl"], "KEY_RIGHTCTRL"),
+    "ctrl_l": ("Left Ctrl", "ctrl_l", ["ctrl"], "KEY_LEFTCTRL"),
+    "alt_r": ("Right Alt", "alt_r", ["alt"], "KEY_RIGHTALT"),
+    "alt_l": ("Left Alt", "alt_l", ["alt"], "KEY_LEFTALT"),
+    "f8": ("F8", "f8", [], "KEY_F8"),
+    "f9": ("F9", "f9", [], "KEY_F9"),
+    "f10": ("F10", "f10", [], "KEY_F10"),
+    "pause": ("Pause", "pause", [], "KEY_PAUSE"),
+}
 
-HOTKEYS: dict[str, tuple] = {k: v for k, v in {
-    "ctrl_r": _hotkey_entry("ctrl_r", frozenset({keyboard.Key.ctrl}), "Right Ctrl"),
-    "ctrl_l": _hotkey_entry("ctrl_l", frozenset({keyboard.Key.ctrl}), "Left Ctrl"),
-    "alt_r":  _hotkey_entry("alt_r",  frozenset({keyboard.Key.alt}),  "Right Alt"),
-    "alt_l":  _hotkey_entry("alt_l",  frozenset({keyboard.Key.alt}),  "Left Alt"),
-    "f8":     _hotkey_entry("f8",     frozenset(), "F8"),
-    "f9":     _hotkey_entry("f9",     frozenset(), "F9"),
-    "f10":    _hotkey_entry("f10",    frozenset(), "F10"),
-    "pause":  _hotkey_entry("pause",  frozenset(), "Pause"),
-}.items() if v is not None}
+# faster-whisper model id mapping (openai short names -> CTranslate2 ids).
+FASTER_MODEL_MAP = {
+    "turbo": "large-v3-turbo",
+}
+
+# Official, openvino-genai-2026-compatible pre-converted Whisper models.
+# (Community exports often lack the `beam_idx` input and fail to load.)
+# Only models listed here can use the OpenVINO backend; others fall back to
+# faster-whisper. No torch/optimum needed at runtime.
+OV_MODEL_REPOS = {
+    "turbo": "OpenVINO/whisper-large-v3-turbo-fp16-ov",
+    "large-v3-turbo": "OpenVINO/whisper-large-v3-turbo-fp16-ov",
+    "large-v3": "OpenVINO/whisper-large-v3-int8-ov",
+    "distil-large-v3": "OpenVINO/distil-whisper-large-v3-int8-ov",
+}
 
 TERMINAL_HINTS = (
-    "gnome-terminal", "kgx", "tilix", "terminator", "kitty",
+    "gnome-terminal", "kgx", "console", "tilix", "terminator", "kitty",
     "alacritty", "wezterm", "konsole", "xfce4-terminal",
     "mate-terminal", "lxterminal", "iterm2", "terminal",
 )
+
+# Linux input event codes for ydotool paste injection.
+_YDOTOOL_KEYS = {
+    "ctrl_v": ["29:1", "47:1", "47:0", "29:0"],
+    "ctrl_shift_v": ["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
+    "shift_insert": ["42:1", "110:1", "110:0", "42:0"],
+}
 
 
 def notify(summary: str, body: str = "") -> None:
@@ -128,15 +150,15 @@ def check_macos_accessibility() -> None:
     real_python = os.path.realpath(sys.executable)
     print(
         f"\n[whisper-dictation] FEHLER: Accessibility-Berechtigung fehlt!\n"
-        f"  Systemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen\n"
-        f"  → + klicken → Cmd+Shift+G → diesen Pfad einfügen:\n"
+        f"  Systemeinstellungen -> Datenschutz & Sicherheit -> Bedienungshilfen\n"
+        f"  -> + klicken -> Cmd+Shift+G -> diesen Pfad einfuegen:\n"
         f"  {real_python}\n"
-        f"  → Schalter aktivieren → Daemon neu starten.\n",
+        f"  -> Schalter aktivieren -> Daemon neu starten.\n",
         flush=True,
     )
     notify(
         "Accessibility-Berechtigung fehlt",
-        "Systemeinstellungen → Bedienungshilfen → Python eintragen, dann Daemon neu starten.",
+        "Systemeinstellungen -> Bedienungshilfen -> Python eintragen, dann Daemon neu starten.",
     )
     subprocess.run(
         ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
@@ -187,38 +209,50 @@ def read_wav_mono(path: Path) -> np.ndarray:
     return audio
 
 
-def _best_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if IS_MACOS and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        try:
+            import ctranslate2
+            return ctranslate2.get_cuda_device_count() > 0
+        except Exception:
+            return False
 
 
 class WhisperDictationDaemon:
     def __init__(self, config: dict[str, Any]):
         self.config = config
         hotkey_name = str(config["double_tap_key"]).lower()
-        if hotkey_name not in HOTKEYS:
-            valid = ", ".join(sorted(HOTKEYS))
+        if hotkey_name not in HOTKEY_SPECS:
+            valid = ", ".join(sorted(HOTKEY_SPECS))
             raise RuntimeError(
                 f"Unsupported hotkey '{hotkey_name}'. Valid values: {valid}"
             )
 
         self.hotkey_name = hotkey_name
-        self.hotkey, self.hotkey_fallbacks, self.hotkey_label = HOTKEYS[hotkey_name]
+        self.hotkey_label = HOTKEY_SPECS[hotkey_name][0]
         self.double_tap_window = max(150, int(config["double_tap_window_ms"])) / 1000.0
-        self.device = _best_device()
-        self.model: whisper.Whisper | None = None
-        self.listener: keyboard.Listener | None = None
-        self.controller = keyboard.Controller()
+        self.backend = self._resolve_backend()
+
+        # Transcription models (only one is populated, depending on backend).
+        self.fw_model: Any = None
+        self.model: Any = None
+        self.ov_pipe: Any = None
+
         self.lock = threading.RLock()
 
-        # Linux: arecord subprocess; macOS: sounddevice thread
+        # Linux: arecord subprocess; macOS: sounddevice thread.
         self.recording_process: subprocess.Popen[bytes] | None = None
         self.recording_sd_thread: threading.Thread | None = None
         self.recording_sd_stop: threading.Event | None = None
         self.recording_sd_frames: list[np.ndarray] = []
+
+        # Hotkey listener handles (one path per platform).
+        self.listener: Any = None  # pynput listener (macOS)
+        self.listener_thread: threading.Thread | None = None  # evdev (Linux)
+        self._evdev_devices: list[Any] = []
 
         self.recording_file: Path | None = None
         self.recording_timer: threading.Timer | None = None
@@ -226,7 +260,25 @@ class WhisperDictationDaemon:
         self.busy = False
         self.stopping = False
 
-    # ── Linux: ALSA mic volume ────────────────────────────────────────────────
+    def _resolve_backend(self) -> str:
+        backend = str(self.config.get("backend", "auto")).lower()
+        if backend in ("faster", "openai", "openvino"):
+            return backend
+        # auto: openai-whisper on macOS (keeps MPS); on Linux prefer OpenVINO
+        # (Intel GPU/NPU) when available and the model has an OV export, else
+        # fall back to faster-whisper on CPU.
+        if IS_MACOS:
+            return "openai"
+        import importlib.util
+        model_name = str(self.config.get("model", "turbo"))
+        if (
+            importlib.util.find_spec("openvino_genai") is not None
+            and model_name in OV_MODEL_REPOS
+        ):
+            return "openvino"
+        return "faster"
+
+    # -- Linux: ALSA mic volume -------------------------------------------------
 
     def _init_mic_volume(self) -> None:
         if not IS_LINUX:
@@ -255,48 +307,222 @@ class WhisperDictationDaemon:
             )
             print(f"[whisper-dictation] mic volume set to 26 on card {card}", flush=True)
 
-    # ── Startup ───────────────────────────────────────────────────────────────
+    # -- Startup ----------------------------------------------------------------
 
     def run(self) -> None:
         if IS_MACOS:
             check_macos_accessibility()
         self._init_mic_volume()
+        self._load_model()
+
+        if IS_MACOS:
+            self._start_listener_macos()
+        else:
+            self._start_listener_linux()
+
+    def _load_model(self) -> None:
+        model_name = str(self.config["model"])
         print(
-            f"[whisper-dictation] platform={platform.system()} "
-            f"loading model={self.config['model']} device={self.device}",
+            f"[whisper-dictation] platform={platform.system()} backend={self.backend} "
+            f"loading model={model_name}",
             flush=True,
         )
-        notify("Lade Modell", f"{self.config['model']} auf {self.device}")
-        self.model = whisper.load_model(
-            str(self.config["model"]),
-            device=self.device,
-            download_root=str(CACHE_DIR / "models"),
-        )
+        notify("Lade Modell", f"{model_name} ({self.backend})")
+
+        if self.backend == "openvino":
+            try:
+                self._load_openvino(model_name)
+            except Exception as exc:
+                print(
+                    f"[whisper-dictation] OpenVINO load failed ({exc}); "
+                    f"falling back to faster-whisper on CPU",
+                    file=sys.stderr, flush=True,
+                )
+                notify("OpenVINO nicht verfuegbar", "Nutze faster-whisper (CPU).")
+                self.backend = "faster"
+                self.ov_pipe = None
+
+        if self.backend == "faster":
+            from faster_whisper import WhisperModel
+
+            fw_name = FASTER_MODEL_MAP.get(model_name, model_name)
+            if _cuda_available():
+                device, compute_type = "cuda", "float16"
+            else:
+                device, compute_type = "cpu", "int8"
+            print(
+                f"[whisper-dictation] faster-whisper model={fw_name} "
+                f"device={device} compute_type={compute_type}",
+                flush=True,
+            )
+            self.fw_model = WhisperModel(
+                fw_name,
+                device=device,
+                compute_type=compute_type,
+                download_root=str(CACHE_DIR / "models-faster"),
+            )
+        elif self.backend == "openai":
+            if str(WHISPER_REPO_ROOT) not in sys.path:
+                sys.path.insert(0, str(WHISPER_REPO_ROOT))
+            import whisper
+
+            device = "cuda" if _cuda_available() else (
+                "mps" if (IS_MACOS and self._mps_available()) else "cpu"
+            )
+            print(f"[whisper-dictation] openai-whisper device={device}", flush=True)
+            self.model = whisper.load_model(
+                model_name,
+                device=device,
+                download_root=str(CACHE_DIR / "models"),
+            )
+            self._openai_device = device
+
         print("[whisper-dictation] model ready", flush=True)
         notify("Bereit", f"Doppelt {self.hotkey_label} startet oder stoppt die Aufnahme")
 
-        self.listener = keyboard.Listener(
-            on_press=self.on_press,
-            on_release=self.on_release,
+    def _load_openvino(self, model_name: str) -> None:
+        import openvino_genai as ov_genai
+        from huggingface_hub import snapshot_download
+
+        repo = OV_MODEL_REPOS[model_name]
+        device = self._resolve_ov_device()
+        print(f"[whisper-dictation] OpenVINO model={repo} device={device}", flush=True)
+        notify("Lade Modell", f"OpenVINO {device}: {model_name}")
+        model_dir = snapshot_download(
+            repo,
+            local_dir=str(CACHE_DIR / "ov-models" / repo.replace("/", "__")),
         )
-        print("[whisper-dictation] listener started", flush=True)
+        kwargs: dict[str, Any] = {}
+        if device == "NPU":
+            # NPU needs a static-shape pipeline for Whisper.
+            kwargs["STATIC_PIPELINE"] = True
+        self.ov_pipe = ov_genai.WhisperPipeline(model_dir, device, **kwargs)
+        self._ov_device = device
+
+    def _resolve_ov_device(self) -> str:
+        import openvino as ov
+
+        available = ov.Core().available_devices
+        want = str(self.config.get("ov_device", "AUTO")).upper()
+        if want != "AUTO" and want in available:
+            return want
+        for preferred in ("NPU", "GPU", "CPU"):
+            if preferred in available:
+                return preferred
+        return "CPU"
+
+    @staticmethod
+    def _mps_available() -> bool:
+        try:
+            import torch
+            return bool(torch.backends.mps.is_available())
+        except Exception:
+            return False
+
+    # -- Hotkey: macOS (pynput) -------------------------------------------------
+
+    def _start_listener_macos(self) -> None:
+        from pynput import keyboard
+
+        _, pynput_attr, fallback_attrs, _ = HOTKEY_SPECS[self.hotkey_name]
+        self._mac_hotkey = getattr(keyboard.Key, pynput_attr)
+        self._mac_fallbacks = frozenset(
+            getattr(keyboard.Key, name) for name in fallback_attrs
+        )
+
+        def is_hotkey(key: Any) -> bool:
+            return key == self._mac_hotkey or key in self._mac_fallbacks
+
+        def on_press(key: Any) -> None:
+            if not is_hotkey(key):
+                with self.lock:
+                    self.last_hotkey_release = None
+
+        def on_release(key: Any) -> None:
+            if is_hotkey(key):
+                self._register_release()
+
+        self.listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        print("[whisper-dictation] pynput listener started", flush=True)
         self.listener.start()
         self.listener.join()
 
-    # ── Hotkey detection ──────────────────────────────────────────────────────
+    # -- Hotkey: Linux/Wayland (evdev) ------------------------------------------
 
-    def _is_hotkey(self, key: keyboard.Key | keyboard.KeyCode | None) -> bool:
-        return key == self.hotkey or key in self.hotkey_fallbacks
+    def _start_listener_linux(self) -> None:
+        try:
+            import evdev
+            from evdev import ecodes
+        except ImportError:
+            raise RuntimeError(
+                "python-evdev fehlt. Bitte 'pip install evdev' im venv ausfuehren."
+            )
 
-    def on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        if not self._is_hotkey(key):
-            with self.lock:
-                self.last_hotkey_release = None
+        target = getattr(ecodes, HOTKEY_SPECS[self.hotkey_name][3])
 
-    def on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        if not self._is_hotkey(key):
-            return
+        devices: list[Any] = []
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+            except Exception:
+                continue
+            caps = dev.capabilities()
+            if ecodes.EV_KEY in caps and target in caps[ecodes.EV_KEY]:
+                devices.append(dev)
 
+        if not devices:
+            notify(
+                "Hotkey nicht moeglich",
+                "Keine Tastatur lesbar. Ist dein User in der 'input'-Gruppe?",
+            )
+            raise RuntimeError(
+                "Keine Eingabegeraete mit der Hotkey-Taste lesbar "
+                "(/dev/input). User muss in der 'input'-Gruppe sein."
+            )
+
+        self._evdev_devices = devices
+        labels = ", ".join(d.name for d in devices)
+        print(
+            f"[whisper-dictation] evdev listener on {len(devices)} device(s): {labels}",
+            flush=True,
+        )
+
+        self.listener_thread = threading.Thread(
+            target=self._evdev_loop, args=(target, ecodes), daemon=True
+        )
+        self.listener_thread.start()
+        self.listener_thread.join()
+
+    def _evdev_loop(self, target: int, ecodes: Any) -> None:
+        import selectors
+
+        selector = selectors.DefaultSelector()
+        for dev in self._evdev_devices:
+            selector.register(dev, selectors.EVENT_READ)
+
+        while not self.stopping:
+            for key, _mask in selector.select(timeout=0.5):
+                dev = key.fileobj
+                try:
+                    for event in dev.read():
+                        if event.type != ecodes.EV_KEY:
+                            continue
+                        if event.code == target:
+                            if event.value == 0:  # release
+                                self._register_release()
+                        elif event.value == 1:  # other key pressed -> reset
+                            with self.lock:
+                                self.last_hotkey_release = None
+                except OSError:
+                    # Device went away (unplugged); stop watching it.
+                    try:
+                        selector.unregister(dev)
+                    except Exception:
+                        pass
+
+    # -- Double-tap detection (shared) ------------------------------------------
+
+    def _register_release(self) -> None:
         now = time.monotonic()
         with self.lock:
             if self.last_hotkey_release is not None:
@@ -305,12 +531,11 @@ class WhisperDictationDaemon:
                 if delta <= self.double_tap_window:
                     self.toggle_recording()
                     return
-
             self.last_hotkey_release = now
 
     def toggle_recording(self) -> None:
         if self.busy:
-            notify("Noch beschäftigt", "Bitte warten, die letzte Aufnahme wird noch verarbeitet.")
+            notify("Noch beschaeftigt", "Bitte warten, die letzte Aufnahme wird noch verarbeitet.")
             return
         is_recording = (
             self.recording_process is not None or self.recording_sd_thread is not None
@@ -320,11 +545,11 @@ class WhisperDictationDaemon:
         else:
             self.stop_recording()
 
-    # ── Recording: Linux (arecord) ────────────────────────────────────────────
+    # -- Recording: Linux (arecord) ---------------------------------------------
 
     def _start_recording_linux(self, output_path: Path) -> None:
         if shutil_which("arecord") is None:
-            raise RuntimeError("arecord ist nicht installiert (sudo apt install alsa-utils).")
+            raise RuntimeError("arecord ist nicht installiert (sudo dnf install alsa-utils).")
 
         command = [
             "arecord", "-q",
@@ -343,7 +568,7 @@ class WhisperDictationDaemon:
         process.send_signal(signal.SIGINT)  # type: ignore[union-attr]
         return process  # type: ignore[return-value]
 
-    # ── Recording: macOS (sounddevice) ───────────────────────────────────────
+    # -- Recording: macOS (sounddevice) -----------------------------------------
 
     def _start_recording_macos(self, output_path: Path) -> None:
         if sd is None:
@@ -395,7 +620,7 @@ class WhisperDictationDaemon:
                 wf.setframerate(16000)
                 wf.writeframes(audio_data.tobytes())
 
-    # ── Recording: common ─────────────────────────────────────────────────────
+    # -- Recording: common ------------------------------------------------------
 
     def start_recording(self) -> None:
         handle = tempfile.NamedTemporaryFile(
@@ -417,7 +642,8 @@ class WhisperDictationDaemon:
         )
         self.recording_timer.daemon = True
         self.recording_timer.start()
-        notify("Aufnahme gestartet", f"Zum Stoppen wieder doppelt {self.hotkey_label} drücken")
+        notify("Aufnahme gestartet", f"Zum Stoppen wieder doppelt {self.hotkey_label} druecken")
+        self._play_sound("start")
 
     def auto_stop_recording(self) -> None:
         with self.lock:
@@ -457,7 +683,7 @@ class WhisperDictationDaemon:
             )
 
         worker.start()
-        notify("Transkription läuft", "Die Aufnahme wird gerade erkannt und eingefügt.")
+        notify("Transkription laeuft", "Die Aufnahme wird gerade erkannt und eingefuegt.")
 
     def _stop_and_transcribe_macos(self, output_path: Path) -> None:
         self._stop_recording_macos(output_path)
@@ -493,12 +719,15 @@ class WhisperDictationDaemon:
             print(f"[whisper-dictation] transcription ready chars={len(text)}", flush=True)
 
             if self.config.get("ollama_postprocess"):
-                notify("Verfeinere Text...", "Ollama läuft...")
-                text = self._ollama_postprocess(text)
-                print(f"[whisper-dictation] ollama postprocess done chars={len(text)}", flush=True)
+                notify("Verfeinere Text...", "Ollama laeuft...")
+                try:
+                    text = self._ollama_postprocess(text)
+                except Exception as exc:
+                    print(f"[whisper-dictation] ollama failed, using raw: {exc}", file=sys.stderr, flush=True)
 
             self._paste_text(text)
-            notify("Eingefügt", text[:100])
+            notify("Eingefuegt", text[:100])
+            self._play_sound("done")
         except Exception as exc:
             notify("Fehler", str(exc))
             print(f"[whisper-dictation] {exc}", file=sys.stderr, flush=True)
@@ -506,18 +735,49 @@ class WhisperDictationDaemon:
             self.busy = False
             output_path.unlink(missing_ok=True)
 
-    # ── Transcription ─────────────────────────────────────────────────────────
+    # -- Transcription ----------------------------------------------------------
 
     def _transcribe_audio(self, audio: np.ndarray) -> str:
+        lang_cfg = str(self.config.get("language") or "").strip().lower()
+        language = None if lang_cfg in ("", "auto") else lang_cfg
+        initial_prompt = str(self.config.get("initial_prompt") or "").strip() or None
+
+        hotwords = str(self.config.get("hotwords") or "").strip() or None
+
+        if self.backend == "openvino":
+            if self.ov_pipe is None:
+                raise RuntimeError("Model is not loaded.")
+            kwargs: dict[str, Any] = {"task": "transcribe"}
+            if language:
+                kwargs["language"] = f"<|{language}|>"
+            if initial_prompt:
+                kwargs["initial_prompt"] = initial_prompt
+            result = self.ov_pipe.generate(audio, **kwargs)
+            return str(result)
+
+        if self.backend == "faster":
+            if self.fw_model is None:
+                raise RuntimeError("Model is not loaded.")
+            beam_size = int(self.config.get("beam_size", 5))
+            segments, _info = self.fw_model.transcribe(
+                audio,
+                language=language,
+                initial_prompt=initial_prompt,
+                hotwords=hotwords,
+                beam_size=beam_size,
+                condition_on_previous_text=False,
+                vad_filter=bool(self.config.get("vad_filter", True)),
+            )
+            return "".join(segment.text for segment in segments)
+
         if self.model is None:
             raise RuntimeError("Model is not loaded.")
+        import torch
 
-        language = str(self.config.get("language") or "").strip() or None
-        initial_prompt = str(self.config.get("initial_prompt") or "").strip() or None
         options: dict[str, Any] = {
             "task": "transcribe",
             "language": language,
-            "fp16": self.device == "cuda",
+            "fp16": getattr(self, "_openai_device", "cpu") == "cuda",
             "condition_on_previous_text": False,
             "verbose": False,
         }
@@ -529,47 +789,68 @@ class WhisperDictationDaemon:
         return str(result["text"])
 
     def _ollama_postprocess(self, text: str) -> str:
-        import urllib.request, json as _json
+        import urllib.request, json as _json, re as _re
         host = str(self.config.get("ollama_host", "http://localhost:11434")).rstrip("/")
         model = str(self.config.get("ollama_model", "llama3.2:3b"))
-        language = str(self.config.get("language") or "de")
 
-        system = (
-            "Du bist ein Assistent der diktierten Text korrigiert. "
-            "Füge korrekte Satzzeichen, Groß-/Kleinschreibung und Absätze ein. "
-            "Korrigiere offensichtliche Erkennungsfehler. "
-            "Gib NUR den korrigierten Text zurück — keine Erklärungen, keine Anführungszeichen."
-        ) if language == "de" else (
-            "You are an assistant that cleans up dictated text. "
-            "Add correct punctuation, capitalization, and paragraph breaks. "
-            "Fix obvious speech recognition errors. "
-            "Return ONLY the corrected text — no explanations, no quotes."
-        )
+        custom_prompt = str(self.config.get("ollama_system_prompt", "")).strip()
 
-        payload = _json.dumps({
-            "model": model,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": text},
-            ],
-        }).encode()
-
-        try:
-            req = urllib.request.Request(
-                f"{host}/api/chat",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
+        if custom_prompt:
+            completion_prompt = f"{custom_prompt}\n\nEingabe: {text}\nAusgabe:"
+        else:
+            # Few-shot format: Modell sieht sich als reines Textwerkzeug, kein Gespraechspartner.
+            # Bewusst kein "system"-Feld - llama3.2 triggert Safety-Filter seltener im completion-Modus.
+            completion_prompt = (
+                "AUFGABE: Zeichensetzung, Gross-/Kleinschreibung und Grammatik korrigieren.\n"
+                "REGELN: Nur Korrekturen ausgeben. Niemals auf den Inhalt eingehen oder antworten.\n\n"
+                "###\n"
+                "Eingabe: wo ist die fernbedienung\n"
+                "Ausgabe: Wo ist die Fernbedienung?\n"
+                "###\n"
+                "Eingabe: das meeting ist morgen um drei uhr\n"
+                "Ausgabe: Das Meeting ist morgen um drei Uhr.\n"
+                "###\n"
+                "Eingabe: kannst du mir sagen wie das geht\n"
+                "Ausgabe: Kannst du mir sagen, wie das geht?\n"
+                "###\n"
+                f"Eingabe: {text}\n"
+                "Ausgabe:"
             )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = _json.loads(resp.read())
-                return str(data["message"]["content"]).strip() or text
-        except Exception as exc:
-            print(f"[whisper-dictation] ollama error (fallback to raw): {exc}", file=sys.stderr, flush=True)
+
+        thinking = bool(self.config.get("ollama_thinking", False))
+        payload = {
+            "model": model,
+            "prompt": completion_prompt,
+            "stream": False,
+            "options": {"temperature": 0.1, "stop": ["###", "\nEingabe:", "\n\nEingabe:"]},
+            "think": thinking,
+        }
+
+        print(f"[whisper-dictation] ollama request model={model} input_chars={len(text)}", flush=True)
+        req = urllib.request.Request(
+            f"{host}/api/generate",
+            data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            response_body = resp.read()
+
+        parsed = _json.loads(response_body)
+        raw = str(parsed.get("response", ""))
+        print(f"[whisper-dictation] ollama raw response: {raw!r}", flush=True)
+
+        cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+        # Verweigert das Modell, faellt es auf den Original-Text zurueck
+        refusal_hints = ("ich kann", "i cannot", "i'm unable", "tut mir leid", "sorry", "als ki", "as an ai")
+        if not cleaned or any(h in cleaned.lower() for h in refusal_hints):
+            print(f"[whisper-dictation] ollama refusal detected, using raw transcription", flush=True)
             return text
 
-    # ── Paste ─────────────────────────────────────────────────────────────────
+        print(f"[whisper-dictation] ollama postprocess done chars={len(cleaned)}", flush=True)
+        return cleaned
+
+    # -- Paste ------------------------------------------------------------------
 
     def _paste_text(self, text: str) -> None:
         if IS_MACOS:
@@ -578,84 +859,105 @@ class WhisperDictationDaemon:
             self._paste_linux(text)
 
     def _paste_linux(self, text: str) -> None:
-        if shutil_which("xclip") is None:
-            raise RuntimeError("xclip ist nicht installiert (sudo apt install xclip).")
+        if shutil_which("wl-copy") is None:
+            raise RuntimeError("wl-copy ist nicht installiert (sudo dnf install wl-clipboard).")
+
+        subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=True)
+        time.sleep(0.08)
 
         paste_mode = self._resolve_paste_mode()
         print(f"[whisper-dictation] paste mode={paste_mode}", flush=True)
-        subprocess.run(
-            ["xclip", "-selection", "clipboard"],
-            input=text.encode("utf-8"),
-            check=True,
+
+        if shutil_which("ydotool") is None:
+            notify(
+                "Text in der Zwischenablage",
+                "ydotool fehlt - bitte manuell mit Strg+V einfuegen.",
+            )
+            return
+
+        keys = _YDOTOOL_KEYS.get(paste_mode, _YDOTOOL_KEYS["ctrl_v"])
+        result = subprocess.run(
+            ["ydotool", "key", *keys], check=False, capture_output=True, text=True
         )
-        time.sleep(0.08)
-        self._send_paste_shortcut(paste_mode)
+        if result.returncode != 0:
+            notify(
+                "Text in der Zwischenablage",
+                "ydotool-Inject fehlgeschlagen - bitte manuell mit Strg+V einfuegen.",
+            )
+            print(
+                f"[whisper-dictation] ydotool failed rc={result.returncode}: {result.stderr.strip()}",
+                file=sys.stderr, flush=True,
+            )
 
     def _paste_macos(self, text: str) -> None:
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+        time.sleep(0.15)
+        print("[whisper-dictation] paste mode=osascript", flush=True)
         subprocess.run(
-            ["pbcopy"],
-            input=text.encode("utf-8"),
-            check=True,
+            ["osascript", "-e",
+             'tell application "System Events" to keystroke "v" using command down'],
+            check=False, capture_output=True,
         )
-        time.sleep(0.08)
-        paste_mode = self._resolve_paste_mode()
-        print(f"[whisper-dictation] paste mode={paste_mode}", flush=True)
-        self._send_paste_shortcut(paste_mode)
-
-    def _send_paste_shortcut(self, paste_mode: str) -> None:
-        time.sleep(0.02)
-        if paste_mode == "cmd_v":
-            with self.controller.pressed(keyboard.Key.cmd):
-                self.controller.tap("v")
-        elif paste_mode == "ctrl_shift_v":
-            with self.controller.pressed(keyboard.Key.ctrl):
-                with self.controller.pressed(keyboard.Key.shift):
-                    self.controller.tap("v")
-        elif paste_mode == "shift_insert":
-            with self.controller.pressed(keyboard.Key.shift):
-                self.controller.tap(keyboard.Key.insert)
-        else:
-            with self.controller.pressed(keyboard.Key.ctrl):
-                self.controller.tap("v")
 
     def _resolve_paste_mode(self) -> str:
         configured = str(self.config["paste_mode"]).lower()
         if configured != "auto":
             return configured
-
-        if IS_MACOS:
-            return "cmd_v"
-
-        window_class = self._get_active_window_class()
-        if not window_class:
-            return "ctrl_v"
-        if "xterm" in window_class or "uxterm" in window_class:
-            return "shift_insert"
-        if any(hint in window_class for hint in TERMINAL_HINTS):
-            return "ctrl_shift_v"
+        # On Wayland the focused window class is not exposed, so we cannot
+        # auto-switch to the terminal paste shortcut. Default to Ctrl+V.
         return "ctrl_v"
 
-    def _get_active_window_class(self) -> str | None:
-        if xdisplay is None or X is None:
-            return None
+    # -- Sound feedback ---------------------------------------------------------
 
-        display = xdisplay.Display()
+    def _play_sound(self, event: str) -> None:
+        """Best-effort freedesktop sound cue (tray-less status feedback)."""
+        if not self.config.get("sound_cue", True) or IS_MACOS:
+            return
+        player = shutil_which("canberra-gtk-play")
+        if player is None:
+            return
+        names = {"start": "audio-volume-change", "done": "complete"}
+        subprocess.Popen(
+            [player, "-i", names.get(event, "bell")],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    # -- Live config reload (SIGHUP) --------------------------------------------
+
+    def reload_config(self) -> None:
+        """Apply config changes without a full restart.
+
+        Mic, language, VAD, hotwords, paste and beam size are read per use, so
+        they take effect on the next dictation. Only a model/backend/device
+        change reloads the model; a hotkey change still needs a restart.
+        """
         try:
-            root = display.screen().root
-            active_window_atom = display.intern_atom("_NET_ACTIVE_WINDOW")
-            prop = root.get_full_property(active_window_atom, X.AnyPropertyType)
-            if prop is None or not prop.value:
-                return None
+            new = load_config()
+        except Exception as exc:
+            print(f"[whisper-dictation] reload: cannot read config: {exc}",
+                  file=sys.stderr, flush=True)
+            return
+        old = self.config
+        self.config = new
+        self.double_tap_window = max(150, int(new.get("double_tap_window_ms", 400))) / 1000.0
 
-            window = display.create_resource_object("window", int(prop.value[0]))
-            wm_class = window.get_wm_class()
-            if not wm_class:
-                return None
-            return " ".join(part.lower() for part in wm_class if part)
-        finally:
-            display.close()
+        model_keys = (new.get("model"), new.get("backend"), new.get("ov_device"))
+        old_keys = (old.get("model"), old.get("backend"), old.get("ov_device"))
+        if model_keys != old_keys:
+            print("[whisper-dictation] reloading model after config change", flush=True)
+            with self.lock:
+                self.backend = self._resolve_backend()
+                self.fw_model = None
+                self.model = None
+                self.ov_pipe = None
+            self._load_model()
+        elif new.get("double_tap_key") != old.get("double_tap_key"):
+            notify("Hotkey geaendert", "Bitte Daemon neu starten, damit die neue Taste greift.")
+        else:
+            notify("Einstellungen uebernommen", "Aenderungen sind aktiv.")
+        print("[whisper-dictation] config reloaded", flush=True)
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
+    # -- Shutdown ---------------------------------------------------------------
 
     def shutdown(self) -> None:
         with self.lock:
@@ -682,6 +984,19 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    # SIGHUP: live-reload config (no model reload unless model/device changed).
+    # SIGUSR1: toggle recording (bindable to a GNOME custom shortcut).
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(
+            signal.SIGHUP,
+            lambda *_a: threading.Thread(target=daemon.reload_config, daemon=True).start(),
+        )
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(
+            signal.SIGUSR1,
+            lambda *_a: threading.Thread(target=daemon.toggle_recording, daemon=True).start(),
+        )
 
     try:
         daemon.run()
