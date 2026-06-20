@@ -88,6 +88,40 @@ HOTKEY_SPECS: dict[str, tuple[str, str, list[str], str]] = {
     "pause": ("Pause", "pause", [], "KEY_PAUSE"),
 }
 
+
+def key_label(value: str) -> str:
+    """Human label for a stored key (logical name / KEY_xxx / 'code:N[:label]')."""
+    v = str(value or "")
+    if not v:
+        return ""
+    if v.startswith("code:"):
+        parts = v.split(":", 2)
+        return parts[2] if len(parts) > 2 and parts[2] else f"Taste {parts[1] if len(parts) > 1 else '?'}"
+    if v.lower() in HOTKEY_SPECS:
+        return HOTKEY_SPECS[v.lower()][0]
+    if v.startswith("KEY_"):
+        return v[4:]
+    return v
+
+
+def evdev_code_for(value: str, ecodes: Any) -> int | None:
+    """Map a stored key to its evdev code. Supports logical names from
+    HOTKEY_SPECS, raw 'KEY_xxx' ecode names, and 'code:N[:label]' (captured)."""
+    v = str(value or "")
+    if not v:
+        return None
+    if v.startswith("code:"):
+        try:
+            return int(v.split(":")[1])
+        except (IndexError, ValueError):
+            return None
+    if v.lower() in HOTKEY_SPECS:
+        return getattr(ecodes, HOTKEY_SPECS[v.lower()][3], None)
+    if v.startswith("KEY_"):
+        return getattr(ecodes, v, None)
+    return None
+
+
 # faster-whisper model id mapping (openai short names -> CTranslate2 ids).
 FASTER_MODEL_MAP = {
     "turbo": "large-v3-turbo",
@@ -293,24 +327,17 @@ def _cuda_available() -> bool:
 class WhisperDictationDaemon:
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        hotkey_name = str(config["double_tap_key"]).lower()
-        if hotkey_name not in HOTKEY_SPECS:
-            valid = ", ".join(sorted(HOTKEY_SPECS))
-            raise RuntimeError(
-                f"Unsupported hotkey '{hotkey_name}'. Valid values: {valid}"
-            )
-
-        self.hotkey_name = hotkey_name
-        self.hotkey_label = HOTKEY_SPECS[hotkey_name][0]
+        # The key value is stored as-is: a logical name (ctrl_r), a raw evdev
+        # name (KEY_F9), or a captured "code:N[:label]". Resolved per platform.
+        self.hotkey_name = str(config["double_tap_key"])
+        self.hotkey_label = key_label(self.hotkey_name) or "Right Ctrl"
         self.hotkey_mode = str(config.get("hotkey_mode", "double_tap")).lower()
         self.double_tap_window = max(150, int(config["double_tap_window_ms"])) / 1000.0
 
         # Optional second hotkey that toggles Ollama cleanup (must differ).
-        toggle_name = str(config.get("llm_toggle_key", "")).lower()
-        self.llm_toggle_name = (
-            toggle_name if toggle_name in HOTKEY_SPECS and toggle_name != hotkey_name else None
-        )
-        self.llm_toggle_label = HOTKEY_SPECS[self.llm_toggle_name][0] if self.llm_toggle_name else ""
+        toggle_value = str(config.get("llm_toggle_key", ""))
+        self.llm_toggle_name = toggle_value if (toggle_value and toggle_value != self.hotkey_name) else None
+        self.llm_toggle_label = key_label(self.llm_toggle_name)
         self.last_llm_toggle_release: float | None = None
 
         self.backend = self._resolve_backend()
@@ -515,7 +542,13 @@ class WhisperDictationDaemon:
     def _start_listener_macos(self) -> None:
         from pynput import keyboard
 
-        _, pynput_attr, fallback_attrs, _ = HOTKEY_SPECS[self.hotkey_name]
+        # macOS only supports the named keys; captured codes fall back.
+        name = self.hotkey_name.lower()
+        if name not in HOTKEY_SPECS:
+            print(f"[whisper-dictation] hotkey {self.hotkey_name!r} unsupported on "
+                  f"macOS; using Right Ctrl", file=sys.stderr, flush=True)
+            name = "ctrl_r"
+        _, pynput_attr, fallback_attrs, _ = HOTKEY_SPECS[name]
         self._mac_hotkey = getattr(keyboard.Key, pynput_attr)
         self._mac_fallbacks = frozenset(
             getattr(keyboard.Key, name) for name in fallback_attrs
@@ -555,11 +588,11 @@ class WhisperDictationDaemon:
                 "python-evdev fehlt. Bitte 'pip install evdev' im venv ausfuehren."
             )
 
-        target = getattr(ecodes, HOTKEY_SPECS[self.hotkey_name][3])
-        toggle_target = (
-            getattr(ecodes, HOTKEY_SPECS[self.llm_toggle_name][3])
-            if self.llm_toggle_name else None
-        )
+        target = evdev_code_for(self.hotkey_name, ecodes)
+        if target is None:
+            notify("Hotkey ungueltig", f"Taste '{self.hotkey_name}' nicht erkannt.")
+            raise RuntimeError(f"Unresolvable hotkey: {self.hotkey_name!r}")
+        toggle_target = evdev_code_for(self.llm_toggle_name, ecodes) if self.llm_toggle_name else None
         wanted = {target} | ({toggle_target} if toggle_target is not None else set())
 
         devices: list[Any] = []
@@ -600,6 +633,16 @@ class WhisperDictationDaemon:
     def _evdev_loop(self, target: int, toggle_target: int | None, ecodes: Any) -> None:
         import selectors
 
+        # Modifier keys don't reset the double-tap timer. Some keys (e.g. the
+        # Copilot/AI key = Meta+Shift+F23) emit modifiers alongside the trigger;
+        # without this they would cancel their own double-tap.
+        modifier_codes = {
+            getattr(ecodes, name) for name in (
+                "KEY_LEFTSHIFT", "KEY_RIGHTSHIFT", "KEY_LEFTCTRL", "KEY_RIGHTCTRL",
+                "KEY_LEFTALT", "KEY_RIGHTALT", "KEY_LEFTMETA", "KEY_RIGHTMETA",
+            ) if hasattr(ecodes, name)
+        }
+
         selector = selectors.DefaultSelector()
         for dev in self._evdev_devices:
             selector.register(dev, selectors.EVENT_READ)
@@ -611,27 +654,9 @@ class WhisperDictationDaemon:
                     for event in dev.read():
                         if event.type != ecodes.EV_KEY:
                             continue
-                        if event.code == target:
-                            if self.hotkey_mode == "push_to_talk":
-                                if event.value == 1:    # press -> start recording
-                                    self._ptt_start()
-                                elif event.value == 0:  # release -> stop + transcribe
-                                    self._ptt_stop()
-                            elif event.value == 0:  # double-tap: release counts
-                                self._register_release()
-                            elif event.value == 1:  # press resets the *other* timer
-                                with self.lock:
-                                    self.last_llm_toggle_release = None
-                        elif toggle_target is not None and event.code == toggle_target:
-                            if event.value == 0:
-                                self._register_llm_toggle()
-                            elif event.value == 1:
-                                with self.lock:
-                                    self.last_hotkey_release = None
-                        elif event.value == 1:  # any other key press resets both
-                            with self.lock:
-                                self.last_hotkey_release = None
-                                self.last_llm_toggle_release = None
+                        self._process_key_event(
+                            event.code, event.value, target, toggle_target, modifier_codes
+                        )
                 except BlockingIOError:
                     # No events ready right now; not an error.
                     continue
@@ -641,6 +666,31 @@ class WhisperDictationDaemon:
                         selector.unregister(dev)
                     except Exception:
                         pass
+
+    def _process_key_event(self, code: int, value: int, target: int,
+                           toggle_target: int | None, modifier_codes: set) -> None:
+        if code == target:
+            if self.hotkey_mode == "push_to_talk":
+                if value == 1:      # press -> start recording
+                    self._ptt_start()
+                elif value == 0:    # release -> stop + transcribe
+                    self._ptt_stop()
+            elif value == 0:        # double-tap: release counts
+                self._register_release()
+            elif value == 1:        # press resets the *other* timer
+                with self.lock:
+                    self.last_llm_toggle_release = None
+        elif toggle_target is not None and code == toggle_target:
+            if value == 0:
+                self._register_llm_toggle()
+            elif value == 1:
+                with self.lock:
+                    self.last_hotkey_release = None
+        elif value == 1 and code not in modifier_codes:
+            # a real other key press resets both double-tap timers
+            with self.lock:
+                self.last_hotkey_release = None
+                self.last_llm_toggle_release = None
 
     # -- Double-tap detection (shared) ------------------------------------------
 

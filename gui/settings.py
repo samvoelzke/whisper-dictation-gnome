@@ -162,6 +162,30 @@ LLM_MODEL_OPTIONS = [
 ]
 
 
+def key_label(value: str) -> str:
+    """Human label for a stored key (named / KEY_xxx / captured 'code:N[:label]')."""
+    v = str(value or "")
+    if not v:
+        return ""
+    if v.startswith("code:"):
+        parts = v.split(":", 2)
+        return parts[2] if len(parts) > 2 and parts[2] else f"Taste {parts[1] if len(parts) > 1 else '?'}"
+    for code, lbl in HOTKEY_OPTIONS:
+        if code == v.lower():
+            return lbl
+    if v.startswith("KEY_"):
+        return v[4:]
+    return v
+
+
+def key_options(base: list, current: str) -> list:
+    """Return base options, appending the current key if it's a captured one."""
+    opts = list(base)
+    if current and current not in [v for v, _ in opts]:
+        opts.append((current, key_label(current)))
+    return opts
+
+
 def load_config() -> dict:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
@@ -262,7 +286,9 @@ class SettingsWindow(Adw.ApplicationWindow):
             "Modus", HOTKEY_MODE_OPTIONS, str(self.config.get("hotkey_mode", "double_tap"))
         )
         inp.add(self.mode_row)
-        self.hotkey_row = self._combo("Aufnahme-Taste", HOTKEY_OPTIONS, str(self.config["double_tap_key"]))
+        hotkey_cur = str(self.config["double_tap_key"])
+        self._hotkey_opts = key_options(HOTKEY_OPTIONS, hotkey_cur)
+        self.hotkey_row = self._combo("Aufnahme-Taste", self._hotkey_opts, hotkey_cur)
         inp.add(self.hotkey_row)
         self.double_tap_row = Adw.SpinRow.new_with_range(150, 1200, 10)
         self.double_tap_row.set_title("Double-Tap-Fenster (ms)")
@@ -304,9 +330,10 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.ollama_model_row = self._combo("Modell", self._llm_model_opts, current_model)
         self.ollama_model_row.set_subtitle("Mehr Sterne = stärker, aber langsamer. Muss via 'ollama pull' installiert sein.")
         llm.add(self.ollama_model_row)
+        toggle_cur = str(self.config.get("llm_toggle_key", ""))
+        self._llm_toggle_opts = key_options(LLM_TOGGLE_OPTIONS, toggle_cur)
         self.llm_toggle_row = self._combo(
-            "Umschalt-Taste (Doppel-Tap)", LLM_TOGGLE_OPTIONS,
-            str(self.config.get("llm_toggle_key", "")).lower(),
+            "Umschalt-Taste (Doppel-Tap)", self._llm_toggle_opts, toggle_cur,
         )
         self.llm_toggle_row.set_subtitle("Schaltet Cleanup an/aus. Muss sich von der Aufnahme-Taste unterscheiden.")
         llm.add(self.llm_toggle_row)
@@ -367,7 +394,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             "vad_filter": bool(self.vad_row.get_active()),
             "sound_cue": bool(self.sound_row.get_active()),
             "hotkey_mode": self._combo_value(self.mode_row, HOTKEY_MODE_OPTIONS),
-            "double_tap_key": self._combo_value(self.hotkey_row, HOTKEY_OPTIONS),
+            "double_tap_key": self._combo_value(self.hotkey_row, self._hotkey_opts),
             "double_tap_window_ms": int(self.double_tap_row.get_value()),
             "paste_mode": self._combo_value(self.paste_row, PASTE_OPTIONS),
             "max_record_seconds": int(self.max_record_row.get_value()),
@@ -375,7 +402,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             "initial_prompt": self._prompt_text(),
             "ollama_postprocess": bool(self.ollama_row.get_active()),
             "ollama_model": self._combo_value(self.ollama_model_row, self._llm_model_opts),
-            "llm_toggle_key": self._combo_value(self.llm_toggle_row, LLM_TOGGLE_OPTIONS),
+            "llm_toggle_key": self._combo_value(self.llm_toggle_row, self._llm_toggle_opts),
         })
         return config
 
