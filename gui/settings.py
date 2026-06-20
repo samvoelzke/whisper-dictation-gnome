@@ -144,6 +144,17 @@ PASTE_OPTIONS = [
     ("shift_insert", "Shift+Insert"),
 ]
 
+# Ollama cleanup models. Stars = quality for the cleanup task; bigger models are
+# stronger but slower and need more RAM. Must be installed (ollama pull <name>).
+LLM_MODEL_OPTIONS = [
+    ("qwen2.5:7b", "qwen2.5:7b  ★★★★★  empfohlen (DE+EN)"),
+    ("qwen2.5:14b", "qwen2.5:14b  ★★★★★  stärker, langsamer"),
+    ("gemma3:4b", "gemma3:4b  ★★★★☆  schnell, multilingual"),
+    ("qwen3:4b", "qwen3:4b  ★★★★☆"),
+    ("qwen2.5:3b", "qwen2.5:3b  ★★★☆☆  schnell"),
+    ("llama3.2:3b", "llama3.2:3b  ★★☆☆☆  sehr schnell, schwächer"),
+]
+
 
 def load_config() -> dict:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -276,8 +287,12 @@ class SettingsWindow(Adw.ApplicationWindow):
         )
         self.ollama_row.set_active(bool(self.config.get("ollama_postprocess", False)))
         llm.add(self.ollama_row)
-        self.ollama_model_row = Adw.EntryRow(title="Ollama-Modell")
-        self.ollama_model_row.set_text(str(self.config.get("ollama_model", "qwen2.5:7b")))
+        current_model = str(self.config.get("ollama_model", "qwen2.5:7b"))
+        self._llm_model_opts = list(LLM_MODEL_OPTIONS)
+        if current_model not in [v for v, _ in self._llm_model_opts]:
+            self._llm_model_opts.append((current_model, f"{current_model}  (eigenes)"))
+        self.ollama_model_row = self._combo("Modell", self._llm_model_opts, current_model)
+        self.ollama_model_row.set_subtitle("Mehr Sterne = stärker, aber langsamer. Muss via 'ollama pull' installiert sein.")
         llm.add(self.ollama_model_row)
         self.llm_toggle_row = self._combo(
             "Umschalt-Taste (Doppel-Tap)", LLM_TOGGLE_OPTIONS,
@@ -348,7 +363,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             "record_device": self._combo_value(self.device_row, self.device_options),
             "initial_prompt": self._prompt_text(),
             "ollama_postprocess": bool(self.ollama_row.get_active()),
-            "ollama_model": self.ollama_model_row.get_text().strip() or "qwen2.5:7b",
+            "ollama_model": self._combo_value(self.ollama_model_row, self._llm_model_opts),
             "llm_toggle_key": self._combo_value(self.llm_toggle_row, LLM_TOGGLE_OPTIONS),
         })
         return config
@@ -358,6 +373,19 @@ class SettingsWindow(Adw.ApplicationWindow):
             [str(DAEMON_SCRIPT), arg], capture_output=True, text=True, check=False,
         )
         return result.returncode, (result.stdout + result.stderr).strip()
+
+    @staticmethod
+    def _ollama_model_installed(model: str) -> bool | None:
+        """True/False if known; None if it can't be checked (server down)."""
+        try:
+            out = subprocess.run(["ollama", "list"], capture_output=True,
+                                 text=True, timeout=3, check=False)
+            if out.returncode != 0:
+                return None
+            installed = {ln.split()[0] for ln in out.stdout.splitlines()[1:] if ln.split()}
+            return model in installed
+        except Exception:
+            return None
 
     # ── Actions ────────────────────────────────────────────────────────────────
 
@@ -376,6 +404,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         else:
             code, output = self._run_daemon("--reload")
             msg = "Gespeichert — Aenderungen sind aktiv." if code == 0 else f"Reload-Fehler: {output}"
+        if new.get("ollama_postprocess") and self._ollama_model_installed(new.get("ollama_model", "")) is False:
+            msg += f"  ⚠ Modell nicht installiert: ollama pull {new['ollama_model']}"
         self._toast(msg)
         self._refresh_status()
 
