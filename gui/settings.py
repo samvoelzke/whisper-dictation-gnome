@@ -59,7 +59,7 @@ DEFAULT_CONFIG = {
     "paste_mode": "auto",
     "record_device": "default",
     "max_record_seconds": 180,
-    "initial_prompt": "",
+    "initial_prompt": "",  # filled with DEFAULT_INITIAL_PROMPT in the UI when empty
     "ollama_postprocess": False,
     "ollama_model": "qwen2.5:7b",
 }
@@ -100,14 +100,27 @@ MODEL_HINTS = {
     "large-v2": "Aelteres grosses Modell (CPU). Meist nur fuer Vergleiche.",
 }
 
-BACKEND_OPTIONS = [
-    ("auto", "Auto (GPU wenn moeglich)"),
-    ("openvino", "OpenVINO (Intel GPU/NPU)"),
-    ("faster", "faster-whisper (CPU)"),
+# backend + ov_device stay in config (defaults: auto -> OpenVINO GPU, with
+# automatic fallback to faster-whisper CPU). They are not exposed in the GUI
+# because "auto" is right for virtually everyone; power users can edit the JSON.
+
+LANGUAGE_OPTIONS = [
+    ("de", "Deutsch"),
+    ("en", "English"),
+    ("", "Auto-Erkennung"),
+    ("fr", "Français"),
+    ("es", "Español"),
+    ("it", "Italiano"),
+    ("nl", "Nederlands"),
+    ("pt", "Português"),
 ]
 
-# ov_device stays in config (default AUTO -> GPU); the daemon auto-falls back
-# NPU->GPU->CPU, so it is not exposed in the GUI.
+# Pre-filled context that biases recognition toward DE + common English tech
+# terms (Whisper does not echo this into the output).
+DEFAULT_INITIAL_PROMPT = (
+    "Diktat auf Deutsch, teils mit englischen Fachbegriffen wie Pull Request, "
+    "Deployment, Bug, Backend, Repository, Meeting."
+)
 
 HOTKEY_OPTIONS = [
     ("ctrl_r", "Right Ctrl"),
@@ -210,10 +223,9 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.model_row = self._combo("Modell", MODEL_OPTIONS, str(self.config["model"]))
         self.model_row.connect("notify::selected", lambda *_: self._update_model_hint())
         rec.add(self.model_row)
-        self.backend_row = self._combo("Backend", BACKEND_OPTIONS, str(self.config.get("backend", "auto")))
-        rec.add(self.backend_row)
-        self.language_row = Adw.EntryRow(title="Sprache (de, en, leer=auto)")
-        self.language_row.set_text(str(self.config["language"]))
+        self.language_row = self._combo(
+            "Sprache", LANGUAGE_OPTIONS, str(self.config.get("language", "de")).lower()
+        )
         rec.add(self.language_row)
         self.hotwords_row = Adw.EntryRow(title="Hotwords (Komma-getrennt)")
         self.hotwords_row.set_text(str(self.config.get("hotwords", "")))
@@ -264,10 +276,16 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.ollama_model_row.set_text(str(self.config.get("ollama_model", "qwen2.5:7b")))
         llm.add(self.ollama_model_row)
 
-        adv = Adw.PreferencesGroup(title="Erweitert")
+        adv = Adw.PreferencesGroup(
+            title="Erweitert",
+            description="Kontext, der die Erkennung Richtung deiner Begriffe lenkt "
+                        "(wird nicht mitgeschrieben).",
+        )
         page.add(adv)
-        self.initial_prompt_row = Adw.EntryRow(title="Initial Prompt")
-        self.initial_prompt_row.set_text(str(self.config["initial_prompt"]))
+        self.initial_prompt_row = Adw.EntryRow(title="Kontext (Initial Prompt)")
+        self.initial_prompt_row.set_text(
+            str(self.config.get("initial_prompt") or "").strip() or DEFAULT_INITIAL_PROMPT
+        )
         adv.add(self.initial_prompt_row)
 
         self._update_model_hint()
@@ -292,10 +310,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _refresh_status(self) -> None:
         running = daemon_running()
-        self.status_row.set_subtitle(
-            ("● laeuft" if running else "○ gestoppt")
-            + f"  ·  Backend: {self._combo_value(self.backend_row, BACKEND_OPTIONS)}"
-        )
+        self.status_row.set_subtitle("● läuft" if running else "○ gestoppt")
 
     def _toast(self, text: str) -> None:
         self.toasts.add_toast(Adw.Toast.new(text))
@@ -304,8 +319,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         config = dict(self.config)
         config.update({
             "model": self._combo_value(self.model_row, MODEL_OPTIONS),
-            "backend": self._combo_value(self.backend_row, BACKEND_OPTIONS),
-            "language": self.language_row.get_text().strip(),
+            "language": self._combo_value(self.language_row, LANGUAGE_OPTIONS),
             "hotwords": self.hotwords_row.get_text().strip(),
             "vad_filter": bool(self.vad_row.get_active()),
             "sound_cue": bool(self.sound_row.get_active()),

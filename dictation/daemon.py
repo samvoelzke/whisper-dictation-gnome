@@ -60,7 +60,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "paste_mode": "auto",
     "record_device": "default",
     "max_record_seconds": 180,
-    "initial_prompt": "",
+    "initial_prompt": (
+        "Diktat auf Deutsch, teils mit englischen Fachbegriffen wie Pull Request, "
+        "Deployment, Bug, Backend, Repository, Meeting."
+    ),
     "ollama_postprocess": False,
     "ollama_model": "qwen2.5:7b",
     "ollama_host": "http://localhost:11434",
