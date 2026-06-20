@@ -1,5 +1,6 @@
 {
   "double_tap_key": "ctrl_r",
+  "hotkey_mode": "double_tap",
   "double_tap_window_ms": 400,
   "language": "de",
   "model": "turbo",

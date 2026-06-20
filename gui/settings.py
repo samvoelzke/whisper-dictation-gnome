@@ -47,6 +47,7 @@ DAEMON_SCRIPT = PROJECT_ROOT / "bin" / "whisper-dictation.sh"
 
 DEFAULT_CONFIG = {
     "double_tap_key": "ctrl_r",
+    "hotkey_mode": "double_tap",
     "double_tap_window_ms": 400,
     "language": "de",
     "model": "turbo",
@@ -122,6 +123,11 @@ DEFAULT_INITIAL_PROMPT = (
     "Diktat auf Deutsch, teils mit englischen Fachbegriffen wie Pull Request, "
     "Deployment, Bug, Backend, Repository, Meeting."
 )
+
+HOTKEY_MODE_OPTIONS = [
+    ("double_tap", "Doppel-Tap (start/stopp)"),
+    ("push_to_talk", "Push-to-Talk (halten)"),
+]
 
 HOTKEY_OPTIONS = [
     ("ctrl_r", "Right Ctrl"),
@@ -252,7 +258,11 @@ class SettingsWindow(Adw.ApplicationWindow):
         # ── Eingabe ──────────────────────────────────────────────────────────
         inp = Adw.PreferencesGroup(title="Eingabe")
         page.add(inp)
-        self.hotkey_row = self._combo("Doppeltaste", HOTKEY_OPTIONS, str(self.config["double_tap_key"]))
+        self.mode_row = self._combo(
+            "Modus", HOTKEY_MODE_OPTIONS, str(self.config.get("hotkey_mode", "double_tap"))
+        )
+        inp.add(self.mode_row)
+        self.hotkey_row = self._combo("Aufnahme-Taste", HOTKEY_OPTIONS, str(self.config["double_tap_key"]))
         inp.add(self.hotkey_row)
         self.double_tap_row = Adw.SpinRow.new_with_range(150, 1200, 10)
         self.double_tap_row.set_title("Double-Tap-Fenster (ms)")
@@ -356,6 +366,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             "hotwords": self.hotwords_row.get_text().strip(),
             "vad_filter": bool(self.vad_row.get_active()),
             "sound_cue": bool(self.sound_row.get_active()),
+            "hotkey_mode": self._combo_value(self.mode_row, HOTKEY_MODE_OPTIONS),
             "double_tap_key": self._combo_value(self.hotkey_row, HOTKEY_OPTIONS),
             "double_tap_window_ms": int(self.double_tap_row.get_value()),
             "paste_mode": self._combo_value(self.paste_row, PASTE_OPTIONS),

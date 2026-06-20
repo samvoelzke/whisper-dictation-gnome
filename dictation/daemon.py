@@ -41,6 +41,8 @@ CACHE_DIR = Path.home() / ".cache" / "whisper-dictation"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "double_tap_key": "ctrl_r",
+    # "double_tap": double-tap to start/stop. "push_to_talk": hold to record.
+    "hotkey_mode": "double_tap",
     "double_tap_window_ms": 400,
     "language": "de",
     "model": "turbo",
@@ -300,6 +302,7 @@ class WhisperDictationDaemon:
 
         self.hotkey_name = hotkey_name
         self.hotkey_label = HOTKEY_SPECS[hotkey_name][0]
+        self.hotkey_mode = str(config.get("hotkey_mode", "double_tap")).lower()
         self.double_tap_window = max(150, int(config["double_tap_window_ms"])) / 1000.0
 
         # Optional second hotkey that toggles Ollama cleanup (must differ).
@@ -522,13 +525,19 @@ class WhisperDictationDaemon:
             return key == self._mac_hotkey or key in self._mac_fallbacks
 
         def on_press(key: Any) -> None:
-            if not is_hotkey(key):
+            if is_hotkey(key):
+                if self.hotkey_mode == "push_to_talk":
+                    self._ptt_start()
+            else:
                 with self.lock:
                     self.last_hotkey_release = None
 
         def on_release(key: Any) -> None:
             if is_hotkey(key):
-                self._register_release()
+                if self.hotkey_mode == "push_to_talk":
+                    self._ptt_stop()
+                else:
+                    self._register_release()
 
         self.listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         print("[whisper-dictation] pynput listener started", flush=True)
@@ -603,7 +612,12 @@ class WhisperDictationDaemon:
                         if event.type != ecodes.EV_KEY:
                             continue
                         if event.code == target:
-                            if event.value == 0:  # release -> count toward double-tap
+                            if self.hotkey_mode == "push_to_talk":
+                                if event.value == 1:    # press -> start recording
+                                    self._ptt_start()
+                                elif event.value == 0:  # release -> stop + transcribe
+                                    self._ptt_stop()
+                            elif event.value == 0:  # double-tap: release counts
                                 self._register_release()
                             elif event.value == 1:  # press resets the *other* timer
                                 with self.lock:
@@ -686,6 +700,23 @@ class WhisperDictationDaemon:
             self.start_recording()
         else:
             self.stop_recording()
+
+    def _is_recording(self) -> bool:
+        return self.recording_process is not None or self.recording_sd_thread is not None
+
+    def _ptt_start(self) -> None:
+        """Push-to-talk: key pressed -> start recording."""
+        with self.lock:
+            if self.busy or self._is_recording():
+                return
+        self.start_recording()
+
+    def _ptt_stop(self) -> None:
+        """Push-to-talk: key released -> stop + transcribe."""
+        with self.lock:
+            if not self._is_recording():
+                return
+        self.stop_recording()
 
     # -- Recording: Linux (arecord) ---------------------------------------------
 
@@ -784,11 +815,12 @@ class WhisperDictationDaemon:
         )
         self.recording_timer.daemon = True
         self.recording_timer.start()
-        self._status(
-            "🔴 Aufnahme läuft",
-            f"Doppelt {self.hotkey_label} zum Stoppen",
-            urgency="critical", timeout_ms=0,
+        stop_hint = (
+            f"{self.hotkey_label} loslassen zum Stoppen"
+            if self.hotkey_mode == "push_to_talk"
+            else f"Doppelt {self.hotkey_label} zum Stoppen"
         )
+        self._status("🔴 Aufnahme läuft", stop_hint, urgency="critical", timeout_ms=0)
         self._play_sound("start")
 
     def auto_stop_recording(self) -> None:
@@ -1081,6 +1113,8 @@ class WhisperDictationDaemon:
         old = self.config
         self.config = new
         self.double_tap_window = max(150, int(new.get("double_tap_window_ms", 400))) / 1000.0
+        # Mode (double-tap vs push-to-talk) is read live by the evdev loop.
+        self.hotkey_mode = str(new.get("hotkey_mode", "double_tap")).lower()
 
         model_keys = (new.get("model"), new.get("backend"), new.get("ov_device"))
         old_keys = (old.get("model"), old.get("backend"), old.get("ov_device"))
