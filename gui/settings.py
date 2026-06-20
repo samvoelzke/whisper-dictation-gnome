@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "initial_prompt": "",  # filled with DEFAULT_INITIAL_PROMPT in the UI when empty
     "ollama_postprocess": False,
     "ollama_model": "qwen2.5:7b",
+    "llm_toggle_key": "",
 }
 
 # turbo/large-v3/distil-large-v3 run on the OpenVINO backend (Intel GPU/NPU)
@@ -132,6 +133,9 @@ HOTKEY_OPTIONS = [
     ("f10", "F10"),
     ("pause", "Pause"),
 ]
+
+# Key whose double-tap toggles Ollama cleanup on/off ("" = disabled).
+LLM_TOGGLE_OPTIONS = [("", "Aus")] + HOTKEY_OPTIONS
 
 PASTE_OPTIONS = [
     ("auto", "Auto (Ctrl+V)"),
@@ -275,6 +279,12 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.ollama_model_row = Adw.EntryRow(title="Ollama-Modell")
         self.ollama_model_row.set_text(str(self.config.get("ollama_model", "qwen2.5:7b")))
         llm.add(self.ollama_model_row)
+        self.llm_toggle_row = self._combo(
+            "Umschalt-Taste (Doppel-Tap)", LLM_TOGGLE_OPTIONS,
+            str(self.config.get("llm_toggle_key", "")).lower(),
+        )
+        self.llm_toggle_row.set_subtitle("Schaltet Cleanup an/aus. Muss sich von der Aufnahme-Taste unterscheiden.")
+        llm.add(self.llm_toggle_row)
 
         adv = Adw.PreferencesGroup(
             title="Kontext (Initial Prompt)",
@@ -339,6 +349,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             "initial_prompt": self._prompt_text(),
             "ollama_postprocess": bool(self.ollama_row.get_active()),
             "ollama_model": self.ollama_model_row.get_text().strip() or "qwen2.5:7b",
+            "llm_toggle_key": self._combo_value(self.llm_toggle_row, LLM_TOGGLE_OPTIONS),
         })
         return config
 

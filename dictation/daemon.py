@@ -67,6 +67,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ollama_postprocess": False,
     "ollama_model": "qwen2.5:7b",
     "ollama_host": "http://localhost:11434",
+    # Double-tap this key to toggle Ollama cleanup on/off ("" = disabled).
+    # Must differ from double_tap_key. Same value set as double_tap_key.
+    "llm_toggle_key": "",
 }
 
 # Hotkey spec per logical name:
@@ -298,6 +301,15 @@ class WhisperDictationDaemon:
         self.hotkey_name = hotkey_name
         self.hotkey_label = HOTKEY_SPECS[hotkey_name][0]
         self.double_tap_window = max(150, int(config["double_tap_window_ms"])) / 1000.0
+
+        # Optional second hotkey that toggles Ollama cleanup (must differ).
+        toggle_name = str(config.get("llm_toggle_key", "")).lower()
+        self.llm_toggle_name = (
+            toggle_name if toggle_name in HOTKEY_SPECS and toggle_name != hotkey_name else None
+        )
+        self.llm_toggle_label = HOTKEY_SPECS[self.llm_toggle_name][0] if self.llm_toggle_name else ""
+        self.last_llm_toggle_release: float | None = None
+
         self.backend = self._resolve_backend()
 
         # Transcription models (only one is populated, depending on backend).
@@ -535,6 +547,11 @@ class WhisperDictationDaemon:
             )
 
         target = getattr(ecodes, HOTKEY_SPECS[self.hotkey_name][3])
+        toggle_target = (
+            getattr(ecodes, HOTKEY_SPECS[self.llm_toggle_name][3])
+            if self.llm_toggle_name else None
+        )
+        wanted = {target} | ({toggle_target} if toggle_target is not None else set())
 
         devices: list[Any] = []
         for path in evdev.list_devices():
@@ -543,7 +560,8 @@ class WhisperDictationDaemon:
             except Exception:
                 continue
             caps = dev.capabilities()
-            if ecodes.EV_KEY in caps and target in caps[ecodes.EV_KEY]:
+            keys = caps.get(ecodes.EV_KEY, [])
+            if any(code in keys for code in wanted):
                 devices.append(dev)
 
         if not devices:
@@ -558,18 +576,19 @@ class WhisperDictationDaemon:
 
         self._evdev_devices = devices
         labels = ", ".join(d.name for d in devices)
+        toggle_info = f" + LLM-Switch={self.llm_toggle_label}" if toggle_target else ""
         print(
-            f"[whisper-dictation] evdev listener on {len(devices)} device(s): {labels}",
+            f"[whisper-dictation] evdev listener on {len(devices)} device(s): {labels}{toggle_info}",
             flush=True,
         )
 
         self.listener_thread = threading.Thread(
-            target=self._evdev_loop, args=(target, ecodes), daemon=True
+            target=self._evdev_loop, args=(target, toggle_target, ecodes), daemon=True
         )
         self.listener_thread.start()
         self.listener_thread.join()
 
-    def _evdev_loop(self, target: int, ecodes: Any) -> None:
+    def _evdev_loop(self, target: int, toggle_target: int | None, ecodes: Any) -> None:
         import selectors
 
         selector = selectors.DefaultSelector()
@@ -584,11 +603,21 @@ class WhisperDictationDaemon:
                         if event.type != ecodes.EV_KEY:
                             continue
                         if event.code == target:
-                            if event.value == 0:  # release
+                            if event.value == 0:  # release -> count toward double-tap
                                 self._register_release()
-                        elif event.value == 1:  # other key pressed -> reset
+                            elif event.value == 1:  # press resets the *other* timer
+                                with self.lock:
+                                    self.last_llm_toggle_release = None
+                        elif toggle_target is not None and event.code == toggle_target:
+                            if event.value == 0:
+                                self._register_llm_toggle()
+                            elif event.value == 1:
+                                with self.lock:
+                                    self.last_hotkey_release = None
+                        elif event.value == 1:  # any other key press resets both
                             with self.lock:
                                 self.last_hotkey_release = None
+                                self.last_llm_toggle_release = None
                 except BlockingIOError:
                     # No events ready right now; not an error.
                     continue
@@ -611,6 +640,40 @@ class WhisperDictationDaemon:
                     self.toggle_recording()
                     return
             self.last_hotkey_release = now
+
+    def _register_llm_toggle(self) -> None:
+        now = time.monotonic()
+        with self.lock:
+            if self.last_llm_toggle_release is not None:
+                delta = now - self.last_llm_toggle_release
+                self.last_llm_toggle_release = None
+                if delta <= self.double_tap_window:
+                    self.toggle_llm_cleanup()
+                    return
+            self.last_llm_toggle_release = now
+
+    def toggle_llm_cleanup(self) -> None:
+        """Flip Ollama post-processing on/off and persist it."""
+        with self.lock:
+            enabled = not bool(self.config.get("ollama_postprocess", False))
+            self.config["ollama_postprocess"] = enabled
+            self._save_config()
+        print(f"[whisper-dictation] llm cleanup toggled -> {enabled}", flush=True)
+        self._status(
+            "🤖 LLM-Cleanup AN" if enabled else "✏️ LLM-Cleanup AUS",
+            "Textverbesserung aktiviert" if enabled else "Roher Whisper-Text",
+            timeout_ms=2500,
+        )
+        self._play_sound("done")
+
+    def _save_config(self) -> None:
+        try:
+            CONFIG_FILE.write_text(
+                json.dumps(self.config, indent=2, ensure_ascii=True) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            print(f"[whisper-dictation] could not save config: {exc}", file=sys.stderr, flush=True)
 
     def toggle_recording(self) -> None:
         if self.busy:
@@ -1029,8 +1092,9 @@ class WhisperDictationDaemon:
                 self.model = None
                 self.ov_pipe = None
             self._load_model()
-        elif new.get("double_tap_key") != old.get("double_tap_key"):
-            notify("Hotkey geaendert", "Bitte Daemon neu starten, damit die neue Taste greift.")
+        elif (new.get("double_tap_key") != old.get("double_tap_key")
+              or new.get("llm_toggle_key") != old.get("llm_toggle_key")):
+            notify("Taste geaendert", "Bitte Daemon neu starten, damit die neue Taste greift.")
         else:
             notify("Einstellungen uebernommen", "Aenderungen sind aktiv.")
         print("[whisper-dictation] config reloaded", flush=True)
