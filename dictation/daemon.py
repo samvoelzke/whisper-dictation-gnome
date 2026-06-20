@@ -528,6 +528,9 @@ class WhisperDictationDaemon:
                         elif event.value == 1:  # other key pressed -> reset
                             with self.lock:
                                 self.last_hotkey_release = None
+                except BlockingIOError:
+                    # No events ready right now; not an error.
+                    continue
                 except OSError:
                     # Device went away (unplugged); stop watching it.
                     try:
