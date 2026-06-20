@@ -8,7 +8,9 @@ APPLICATIONS_DIR="${HOME}/.local/share/applications"
 CONFIG_DIR="${HOME}/.config/whisper-dictation"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 DESKTOP_FILE="${AUTOSTART_DIR}/whisper-dictation.desktop"
-SETTINGS_DESKTOP_FILE="${APPLICATIONS_DIR}/whisper-dictation-settings.desktop"
+APP_ID="io.voelzke.WhisperDictation"
+SETTINGS_DESKTOP_FILE="${APPLICATIONS_DIR}/${APP_ID}.desktop"
+ICON_DIR="${HOME}/.local/share/icons/hicolor/scalable/apps"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 SERVICE_FILE="${SYSTEMD_USER_DIR}/whisper-dictation.service"
 VENV="${ROOT}/.venv"
@@ -94,18 +96,32 @@ StandardError=append:%h/.cache/whisper-dictation/daemon.log
 WantedBy=default.target
 EOF
 
+# App icon (shown in the GNOME dash / app grid and on the window).
+mkdir -p "${ICON_DIR}"
+cp "${ROOT}/assets/${APP_ID}.svg" "${ICON_DIR}/${APP_ID}.svg"
+# Remove the pre-rename launcher if it lingers from an older install.
+rm -f "${APPLICATIONS_DIR}/whisper-dictation-settings.desktop"
+
+# Desktop entry — basename matches the GTK application_id so GNOME links the
+# running window to this icon.
 cat > "${SETTINGS_DESKTOP_FILE}" <<EOF
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Whisper Dictation Settings
-Comment=Configure local Whisper dictation
+Name=Whisper Dictation
+GenericName=Diktat
+Comment=Lokale Sprache-zu-Text per Doppel-Tastendruck
 Exec=${ROOT}/bin/open-whisper-dictation-settings.sh
-Icon=audio-input-microphone
+Icon=${APP_ID}
 Terminal=false
-Categories=Utility;AudioVideo;
+Categories=AudioVideo;Accessibility;
+Keywords=dictation;speech;whisper;voice;diktat;sprache;
 StartupNotify=true
+StartupWMClass=${APP_ID}
 EOF
+
+gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" 2>/dev/null || true
+update-desktop-database "${APPLICATIONS_DIR}" 2>/dev/null || true
 
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user daemon-reload

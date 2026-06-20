@@ -117,7 +117,10 @@ def notify(summary: str, body: str = "") -> None:
         return
     if shutil_which("notify-send") is None:
         return
-    command = ["notify-send", "-a", "Whisper Dictation", summary]
+    command = [
+        "notify-send", "-a", "Whisper Dictation",
+        "-i", "io.voelzke.WhisperDictation", summary,
+    ]
     if body:
         command.append(body)
     subprocess.run(command, check=False)
