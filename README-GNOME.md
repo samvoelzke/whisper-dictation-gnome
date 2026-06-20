@@ -43,13 +43,15 @@ schneller und akkuschonender als CPU. Gemessen (large-v3-turbo, 11 s Audio):
 
 Es werden die **offiziellen vorkonvertierten `OpenVINO/*`-Modelle** von Hugging
 Face genutzt (kein PyTorch/optimum nötig). Geräteauswahl via `ov_device`
-(`AUTO` bevorzugt NPU > GPU > CPU).
+(`AUTO` bevorzugt **GPU** > NPU > CPU — die iGPU ist am schnellsten und
+kompiliert zuverlässig).
 
-**NPU aktivieren (optional):** Der Kernel-Treiber `intel_vpu` reicht nicht — für
-OpenVINO braucht die NPU zusätzlich das Intel-NPU-Userspace (Level-Zero/UMD).
-Auf Fedora via Snap `intel-npu-driver` oder Intels
-[linux-npu-driver](https://github.com/intel/linux-npu-driver). Ohne das nutzt
-`AUTO` automatisch die GPU.
+**NPU (experimentell):** Die Panther-Lake-NPU lässt sich via
+`sudo dnf install intel-npu-driver` aktivieren (OpenVINO listet danach `NPU`).
+Stand 2026-06 kann der NPU-Compiler den Whisper-Graph aber **nicht übersetzen**
+(`ZE_RESULT_ERROR_UNSUPPORTED_FEATURE`) — weder fp16 noch int8. Bei
+`ov_device: "NPU"` fällt der Daemon daher automatisch auf die GPU zurück. Die
+NPU wäre ohnehin nur stromsparender, nicht schneller als die GPU.
 
 ## Installation
 
@@ -107,7 +109,7 @@ journalctl --user -u whisper-dictation -f      # Live-Log
 | `double_tap_key` | `ctrl_r` (Standard), `ctrl_l`, `alt_r`, `alt_l`, `f8`–`f10`, `pause` |
 | `model` | `turbo` (= large-v3-turbo, Standard), `large-v3`, `distil-large-v3` (GPU); `tiny`…`medium`, `*.en` (CPU); HF-CTranslate2-Repo (z. B. Deutsch-Finetune) |
 | `backend` | `auto` (Linux→OpenVINO wenn möglich, sonst faster-whisper), `openvino`, `faster`, `openai` |
-| `ov_device` | `AUTO` (NPU > GPU > CPU), `GPU`, `NPU`, `CPU` |
+| `ov_device` | `AUTO` (GPU > NPU > CPU), `GPU`, `NPU` (experimentell), `CPU` |
 | `vad_filter` | `true` (Stille filtern: weniger Halluzinationen + weniger Rechenzeit) |
 | `hotwords` | Fachbegriffe/Namen, die bevorzugt erkannt werden (faster-whisper) |
 | `beam_size` | `5` (kleiner = schneller) |

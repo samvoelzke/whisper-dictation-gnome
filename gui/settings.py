@@ -105,9 +105,9 @@ BACKEND_OPTIONS = [
 ]
 
 OV_DEVICE_OPTIONS = [
-    ("AUTO", "Auto (NPU > GPU > CPU)"),
+    ("AUTO", "Auto (GPU > NPU > CPU)"),
     ("GPU", "GPU (Intel Arc)"),
-    ("NPU", "NPU"),
+    ("NPU", "NPU (experimentell)"),
     ("CPU", "CPU"),
 ]
 

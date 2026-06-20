@@ -46,7 +46,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model": "turbo",
     # "auto": openvino on Linux when available, else faster-whisper; openai on macOS.
     "backend": "auto",
-    # OpenVINO device preference: AUTO picks NPU > GPU > CPU.
+    # OpenVINO device: AUTO prefers GPU > NPU > CPU (GPU is fastest + reliable
+    # for dictation; NPU is opt-in via "NPU" and falls back to GPU if it can't
+    # compile the Whisper graph).
     "ov_device": "AUTO",
     "beam_size": 5,
     # VAD trims silence before transcription: fewer hallucinations + less compute.
@@ -381,35 +383,45 @@ class WhisperDictationDaemon:
         notify("Bereit", f"Doppelt {self.hotkey_label} startet oder stoppt die Aufnahme")
 
     def _load_openvino(self, model_name: str) -> None:
+        import openvino as ov
         import openvino_genai as ov_genai
         from huggingface_hub import snapshot_download
 
         repo = OV_MODEL_REPOS[model_name]
-        device = self._resolve_ov_device()
-        print(f"[whisper-dictation] OpenVINO model={repo} device={device}", flush=True)
-        notify("Lade Modell", f"OpenVINO {device}: {model_name}")
         model_dir = snapshot_download(
             repo,
             local_dir=str(CACHE_DIR / "ov-models" / repo.replace("/", "__")),
         )
-        kwargs: dict[str, Any] = {}
-        if device == "NPU":
-            # NPU needs a static-shape pipeline for Whisper.
-            kwargs["STATIC_PIPELINE"] = True
-        self.ov_pipe = ov_genai.WhisperPipeline(model_dir, device, **kwargs)
-        self._ov_device = device
 
-    def _resolve_ov_device(self) -> str:
-        import openvino as ov
-
+        # Build the device try-order. AUTO prefers the iGPU: it is the fastest
+        # for short dictation and compiles reliably. The NPU is more power
+        # efficient but its compiler may reject the Whisper graph on some
+        # drivers, so we fall back to GPU/CPU rather than to slow CPU whisper.
         available = ov.Core().available_devices
         want = str(self.config.get("ov_device", "AUTO")).upper()
-        if want != "AUTO" and want in available:
-            return want
-        for preferred in ("NPU", "GPU", "CPU"):
-            if preferred in available:
-                return preferred
-        return "CPU"
+        order = [want] if want != "AUTO" else []
+        for d in ("GPU", "NPU", "CPU"):
+            if d not in order:
+                order.append(d)
+        order = [d for d in order if d in available]
+
+        last_err: Exception | None = None
+        for device in order:
+            kwargs: dict[str, Any] = {"STATIC_PIPELINE": True} if device == "NPU" else {}
+            try:
+                print(f"[whisper-dictation] OpenVINO try device={device} model={repo}", flush=True)
+                notify("Lade Modell", f"OpenVINO {device}: {model_name}")
+                self.ov_pipe = ov_genai.WhisperPipeline(model_dir, device, **kwargs)
+                self._ov_device = device
+                print(f"[whisper-dictation] OpenVINO using device={device}", flush=True)
+                return
+            except Exception as exc:
+                last_err = exc
+                print(
+                    f"[whisper-dictation] OpenVINO device={device} failed: {str(exc)[:160]}",
+                    file=sys.stderr, flush=True,
+                )
+        raise RuntimeError(f"No usable OpenVINO device (tried {order}): {last_err}")
 
     @staticmethod
     def _mps_available() -> bool:
