@@ -241,29 +241,29 @@ def daemon_running() -> bool:
     return result.stdout.strip() == "running"
 
 
-class WorkbenchWindow(Adw.Window):
+class WorkbenchView(Gtk.Box):
     """Dictate into a scratchpad, then give the AI free-form instructions."""
 
-    def __init__(self, parent: Adw.ApplicationWindow):
-        super().__init__(title="Werkbank", transient_for=parent)
-        self.set_default_size(600, 620)
+    def __init__(self, toast_cb=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                         margin_top=18, margin_bottom=18, margin_start=24, margin_end=24)
         self.rec_proc: subprocess.Popen | None = None
         self.rec_wav: str | None = None
+        self._toast_cb = toast_cb
 
-        toolbar = Adw.ToolbarView()
-        self.set_content(toolbar)
-        toolbar.add_top_bar(Adw.HeaderBar())
+        clamp = Adw.Clamp(maximum_size=1100, tightening_threshold=900)
+        clamp.set_vexpand(True)
+        self.append(clamp)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        clamp.set_child(box)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
-                      margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
-        toolbar.set_content(box)
-
-        rec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        rec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self.rec_btn = Gtk.Button(label="🔴 Aufnehmen")
         self.rec_btn.add_css_class("pill")
+        self.rec_btn.add_css_class("suggested-action")
         self.rec_btn.connect("clicked", self._toggle_record)
         rec_row.append(self.rec_btn)
-        self.status = Gtk.Label(label="Bereit", xalign=0)
+        self.status = Gtk.Label(label="Bereit", xalign=0, hexpand=True)
         self.status.add_css_class("dim-label")
         rec_row.append(self.status)
         box.append(rec_row)
@@ -272,7 +272,7 @@ class WorkbenchWindow(Adw.Window):
         scroller.add_css_class("card")
         self.text_view = Gtk.TextView(
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
-            top_margin=8, bottom_margin=8, left_margin=8, right_margin=8,
+            top_margin=12, bottom_margin=12, left_margin=12, right_margin=12,
         )
         scroller.set_child(self.text_view)
         box.append(scroller)
@@ -289,7 +289,11 @@ class WorkbenchWindow(Adw.Window):
         box.append(instr_row)
 
         bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.END)
+        clear_btn = Gtk.Button(label="Leeren")
+        clear_btn.connect("clicked", lambda *_: self._set_text(""))
+        bottom.append(clear_btn)
         copy_btn = Gtk.Button(label="Kopieren")
+        copy_btn.add_css_class("suggested-action")
         copy_btn.connect("clicked", self._copy)
         bottom.append(copy_btn)
         box.append(bottom)
@@ -380,7 +384,8 @@ class WorkbenchWindow(Adw.Window):
 class SettingsWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application):
         super().__init__(application=app, title="Whisper Dictation")
-        self.set_default_size(560, 720)
+        self.set_default_size(940, 720)
+        self.set_size_request(420, 480)
         self.config = load_config()
         self.device_options = detect_alsa_capture_devices()
         self._capturing = None          # (combo, opts_attr, button) while learning a key
@@ -395,13 +400,18 @@ class SettingsWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         toolbar.add_top_bar(header)
 
-        save_button = Gtk.Button(label="Speichern")
-        save_button.add_css_class("suggested-action")
-        save_button.connect("clicked", self._on_save)
-        header.pack_start(save_button)
+        self.stack = Adw.ViewStack()
+        switcher = Adw.ViewSwitcher(policy=Adw.ViewSwitcherPolicy.WIDE)
+        switcher.set_stack(self.stack)
+        header.set_title_widget(switcher)
+        toolbar.set_content(self.stack)
+
+        self.save_button = Gtk.Button(label="Speichern")
+        self.save_button.add_css_class("suggested-action")
+        self.save_button.connect("clicked", self._on_save)
+        header.pack_start(self.save_button)
 
         menu = Gio.Menu()
-        menu.append("Werkbank (Diktat + KI)", "win.werkbank")
         menu.append("Diagnose", "win.diagnose")
         menu.append("Daemon starten", "win.start")
         menu.append("Daemon neu starten", "win.restart")
@@ -414,14 +424,20 @@ class SettingsWindow(Adw.ApplicationWindow):
             ("start", self._on_start), ("restart", self._on_restart),
             ("stop", self._on_stop), ("log", self._on_log),
             ("diagnose", self._on_diagnose), ("about", self._on_about),
-            ("werkbank", self._on_werkbank),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
 
+        # ── Werkbank (Hauptansicht) ──────────────────────────────────────────
+        self.workbench = WorkbenchView(toast_cb=self._toast)
+        self.stack.add_titled_with_icon(
+            self.workbench, "werkbank", "Werkbank", "audio-input-microphone-symbolic")
+
+        # ── Einstellungen (zweite Ansicht) ───────────────────────────────────
         page = Adw.PreferencesPage()
-        toolbar.set_content(page)
+        self.stack.add_titled_with_icon(
+            page, "settings", "Einstellungen", "applications-system-symbolic")
 
         # ── Status ───────────────────────────────────────────────────────────
         status_group = Adw.PreferencesGroup()
@@ -542,6 +558,14 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         self._update_model_hint()
         self._refresh_status()
+
+        # Open on the Werkbank; the Speichern button only matters in settings.
+        self.stack.set_visible_child_name("werkbank")
+        self.stack.connect("notify::visible-child-name", self._on_view_changed)
+        self._on_view_changed()
+
+    def _on_view_changed(self, *_a) -> None:
+        self.save_button.set_visible(self.stack.get_visible_child_name() == "settings")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -712,12 +736,6 @@ class SettingsWindow(Adw.ApplicationWindow):
             Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(str(LOG_FILE), None), None)
         else:
             self._toast("Noch keine Logdatei vorhanden.")
-
-    def _on_werkbank(self, *_a) -> None:
-        if not IPC_SOCKET.exists():
-            self._toast("Daemon läuft nicht — Werkbank braucht den laufenden Dienst.")
-            return
-        WorkbenchWindow(self).present()
 
     def _on_diagnose(self, *_a) -> None:
         import re
