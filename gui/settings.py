@@ -56,7 +56,9 @@ DEFAULT_CONFIG = {
     "beam_size": 5,
     "vad_filter": True,
     "hotwords": "",
+    "voice_commands": False,
     "sound_cue": True,
+    "restore_clipboard": True,
     "paste_mode": "auto",
     "record_device": "default",
     "max_record_seconds": 180,
@@ -278,6 +280,12 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.vad_row = Adw.SwitchRow(title="VAD", subtitle="Stille filtern (weniger Halluzinationen)")
         self.vad_row.set_active(bool(self.config.get("vad_filter", True)))
         rec.add(self.vad_row)
+        self.voice_row = Adw.SwitchRow(
+            title="Sprachbefehle",
+            subtitle="neue Zeile, neuer Absatz, Doppelpunkt, Fragezeichen …",
+        )
+        self.voice_row.set_active(bool(self.config.get("voice_commands", False)))
+        rec.add(self.voice_row)
 
         # ── Eingabe ──────────────────────────────────────────────────────────
         inp = Adw.PreferencesGroup(title="Eingabe")
@@ -303,6 +311,12 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.sound_row = Adw.SwitchRow(title="Sound-Feedback", subtitle="Ton bei Start/Fertig")
         self.sound_row.set_active(bool(self.config.get("sound_cue", True)))
         inp.add(self.sound_row)
+        self.clipboard_row = Adw.SwitchRow(
+            title="Zwischenablage schonen",
+            subtitle="Inhalt nach dem Einfügen wiederherstellen",
+        )
+        self.clipboard_row.set_active(bool(self.config.get("restore_clipboard", True)))
+        inp.add(self.clipboard_row)
 
         # ── Audio + Erweitert ────────────────────────────────────────────────
         audio = Adw.PreferencesGroup(title="Audio")
@@ -392,7 +406,9 @@ class SettingsWindow(Adw.ApplicationWindow):
             "language": self._combo_value(self.language_row, LANGUAGE_OPTIONS),
             "hotwords": self.hotwords_row.get_text().strip(),
             "vad_filter": bool(self.vad_row.get_active()),
+            "voice_commands": bool(self.voice_row.get_active()),
             "sound_cue": bool(self.sound_row.get_active()),
+            "restore_clipboard": bool(self.clipboard_row.get_active()),
             "hotkey_mode": self._combo_value(self.mode_row, HOTKEY_MODE_OPTIONS),
             "double_tap_key": self._combo_value(self.hotkey_row, self._hotkey_opts),
             "double_tap_window_ms": int(self.double_tap_row.get_value()),

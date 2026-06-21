@@ -9,6 +9,8 @@
   "beam_size": 5,
   "vad_filter": true,
   "hotwords": "",
+  "voice_commands": false,
+  "restore_clipboard": true,
   "paste_mode": "auto",
   "record_device": "default",
   "max_record_seconds": 180,

@@ -59,6 +59,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hotwords": "",
     # Audible feedback on record start / text inserted (no tray on GNOME).
     "sound_cue": True,
+    # Replace spoken formatting commands ("neue Zeile" -> newline). Off by default.
+    "voice_commands": False,
+    # Save & restore the clipboard around paste so dictation doesn't clobber it.
+    "restore_clipboard": True,
     "paste_mode": "auto",
     "record_device": "default",
     "max_record_seconds": 180,
@@ -164,11 +168,35 @@ OLLAMA_CLEANUP_SHOTS = [
      "Ich brauche - nein, warte - ich brauche zwei Tickets."),
 ]
 
+# Spoken formatting commands (opt-in). Kept small + unambiguous on purpose:
+# punctuation words like "Punkt"/"Komma" are everyday words and would misfire,
+# so only formatting/symbol phrases that are rarely said literally are mapped.
+VOICE_COMMANDS = {
+    "neuer absatz": "\n\n",
+    "neue zeile": "\n",
+    "neuezeile": "\n",
+    "doppelpunkt": ":",
+    "bindestrich": "-",
+    "fragezeichen": "?",
+    "ausrufezeichen": "!",
+}
+
 TERMINAL_HINTS = (
     "gnome-terminal", "kgx", "console", "tilix", "terminator", "kitty",
     "alacritty", "wezterm", "konsole", "xfce4-terminal",
     "mate-terminal", "lxterminal", "iterm2", "terminal",
 )
+
+
+def apply_voice_commands(text: str) -> str:
+    """Replace spoken formatting commands and tidy whitespace around them."""
+    import re as _re
+    out = text
+    for phrase, repl in VOICE_COMMANDS.items():
+        out = _re.sub(rf"\b{_re.escape(phrase)}\b", repl, out, flags=_re.IGNORECASE)
+    out = _re.sub(r"[ \t]+([:?!-])", r"\1", out)   # no space before inserted symbol
+    out = _re.sub(r"[ \t]*\n[ \t]*", "\n", out)      # trim spaces around newlines
+    return out.strip()
 
 # Linux input event codes for ydotool paste injection.
 _YDOTOOL_KEYS = {
@@ -642,6 +670,7 @@ class WhisperDictationDaemon:
                 "KEY_LEFTALT", "KEY_RIGHTALT", "KEY_LEFTMETA", "KEY_RIGHTMETA",
             ) if hasattr(ecodes, name)
         }
+        self._esc_code = getattr(ecodes, "KEY_ESC", None)
 
         selector = selectors.DefaultSelector()
         for dev in self._evdev_devices:
@@ -669,6 +698,10 @@ class WhisperDictationDaemon:
 
     def _process_key_event(self, code: int, value: int, target: int,
                            toggle_target: int | None, modifier_codes: set) -> None:
+        # Esc while recording -> cancel without transcribing.
+        if value == 1 and code == getattr(self, "_esc_code", None) and self._is_recording():
+            self.cancel_recording()
+            return
         if code == target:
             if self.hotkey_mode == "push_to_talk":
                 if value == 1:      # press -> start recording
@@ -767,6 +800,31 @@ class WhisperDictationDaemon:
             if not self._is_recording():
                 return
         self.stop_recording()
+
+    def cancel_recording(self) -> None:
+        """Abort an in-progress recording without transcribing (Esc)."""
+        with self.lock:
+            if not self._is_recording() or self.busy:
+                return
+            if self.recording_timer is not None:
+                self.recording_timer.cancel()
+                self.recording_timer = None
+            output_path = self.recording_file
+            self.recording_file = None
+            if self.recording_process is not None:
+                try:
+                    self.recording_process.send_signal(signal.SIGINT)
+                except Exception:
+                    pass
+                self.recording_process = None
+            if self.recording_sd_stop is not None:
+                self.recording_sd_stop.set()
+            self.recording_sd_thread = None
+            self.recording_sd_stop = None
+        if output_path:
+            output_path.unlink(missing_ok=True)
+        print("[whisper-dictation] recording cancelled", flush=True)
+        self._status("✖ Abgebrochen", "Aufnahme verworfen.", timeout_ms=2500)
 
     # -- Recording: Linux (arecord) ---------------------------------------------
 
@@ -952,6 +1010,12 @@ class WhisperDictationDaemon:
                 except Exception as exc:
                     print(f"[whisper-dictation] ollama failed, using raw: {exc}", file=sys.stderr, flush=True)
 
+            if self.config.get("voice_commands"):
+                text = apply_voice_commands(text)
+                if not text:
+                    self._status("Kein Text erkannt", "Nichts uebrig nach Befehlen.", timeout_ms=4000)
+                    return
+
             pasted = self._paste_text(text)
             if pasted:
                 self._status("✓ Eingefügt", text[:120], timeout_ms=4000)
@@ -1073,6 +1137,17 @@ class WhisperDictationDaemon:
         if shutil_which("wl-copy") is None:
             raise RuntimeError("wl-copy ist nicht installiert (sudo dnf install wl-clipboard).")
 
+        # Remember the current clipboard (best effort, text only) to restore it
+        # after pasting, so dictation doesn't clobber what the user had copied.
+        saved: bytes | None = None
+        if self.config.get("restore_clipboard", True) and shutil_which("wl-paste"):
+            try:
+                saved = subprocess.run(
+                    ["wl-paste", "-n"], capture_output=True, timeout=2
+                ).stdout
+            except Exception:
+                saved = None
+
         subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=True)
         time.sleep(0.08)
 
@@ -1092,6 +1167,13 @@ class WhisperDictationDaemon:
                 file=sys.stderr, flush=True,
             )
             return False
+
+        if saved is not None:
+            # Restore after the paste keystroke has been consumed by the app.
+            def _restore(data: bytes) -> None:
+                time.sleep(0.4)
+                subprocess.run(["wl-copy"], input=data, check=False)
+            threading.Thread(target=_restore, args=(saved,), daemon=True).start()
         return True
 
     def _paste_macos(self, text: str) -> bool:
