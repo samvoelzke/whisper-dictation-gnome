@@ -66,8 +66,36 @@ def ipc_call(req: dict, timeout: float = 200) -> dict:
         return json.loads(buf.decode("utf-8") or "{}")
     finally:
         s.close()
+
+
 LOG_FILE = Path.home() / ".cache" / "whisper-dictation" / "daemon.log"
+HISTORY_FILE = Path.home() / ".cache" / "whisper-dictation" / "history.jsonl"
 DAEMON_SCRIPT = PROJECT_ROOT / "bin" / "whisper-dictation.sh"
+
+
+def read_history(limit: int = 100) -> list:
+    if not HISTORY_FILE.exists():
+        return []
+    out = []
+    try:
+        for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines()[-limit:]:
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+
+def format_ts(ts) -> str:
+    try:
+        import datetime
+        return datetime.datetime.fromtimestamp(float(ts)).strftime("%d.%m. %H:%M")
+    except Exception:
+        return ""
 
 DEFAULT_CONFIG = {
     "double_tap_key": "ctrl_r",
@@ -83,6 +111,7 @@ DEFAULT_CONFIG = {
     "voice_commands": False,
     "sound_cue": True,
     "restore_clipboard": True,
+    "save_history": True,
     "paste_mode": "auto",
     "record_device": "default",
     "max_record_seconds": 180,
@@ -434,6 +463,11 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.stack.add_titled_with_icon(
             self.workbench, "werkbank", "Werkbank", "audio-input-microphone-symbolic")
 
+        # ── Verlauf ──────────────────────────────────────────────────────────
+        self._history_rows = []
+        self.stack.add_titled_with_icon(
+            self._build_history_page(), "verlauf", "Verlauf", "document-open-recent-symbolic")
+
         # ── Einstellungen (zweite Ansicht) ───────────────────────────────────
         page = Adw.PreferencesPage()
         self.stack.add_titled_with_icon(
@@ -501,6 +535,12 @@ class SettingsWindow(Adw.ApplicationWindow):
         )
         self.clipboard_row.set_active(bool(self.config.get("restore_clipboard", True)))
         inp.add(self.clipboard_row)
+        self.history_row = Adw.SwitchRow(
+            title="Verlauf speichern",
+            subtitle="Diktate im Verlauf-Tab merken",
+        )
+        self.history_row.set_active(bool(self.config.get("save_history", True)))
+        inp.add(self.history_row)
 
         # ── Audio + Erweitert ────────────────────────────────────────────────
         audio = Adw.PreferencesGroup(title="Audio")
@@ -565,7 +605,68 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._on_view_changed()
 
     def _on_view_changed(self, *_a) -> None:
-        self.save_button.set_visible(self.stack.get_visible_child_name() == "settings")
+        name = self.stack.get_visible_child_name()
+        self.save_button.set_visible(name == "settings")
+        if name == "verlauf":
+            self._refresh_history()
+
+    # ── Verlauf (history) ───────────────────────────────────────────────────────
+
+    def _build_history_page(self) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage()
+        self._history_group = Adw.PreferencesGroup(
+            title="Verlauf der Diktate",
+            description="Zuletzt eingesprochene Texte — kopieren oder in der Werkbank weiterbearbeiten.",
+        )
+        clear = Gtk.Button(label="Leeren", valign=Gtk.Align.CENTER)
+        clear.add_css_class("flat")
+        clear.connect("clicked", self._clear_history)
+        self._history_group.set_header_suffix(clear)
+        page.add(self._history_group)
+        return page
+
+    def _refresh_history(self) -> None:
+        for row in self._history_rows:
+            self._history_group.remove(row)
+        self._history_rows = []
+        entries = read_history(100)
+        if not entries:
+            row = Adw.ActionRow(title="Noch keine Diktate")
+            self._history_group.add(row)
+            self._history_rows.append(row)
+            return
+        for entry in reversed(entries):
+            text = str(entry.get("text", "")).strip()
+            row = Adw.ActionRow(
+                title=(text[:90] + "…") if len(text) > 90 else (text or "(leer)"),
+                subtitle=format_ts(entry.get("ts")),
+            )
+            copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
+            copy.add_css_class("flat")
+            copy.set_tooltip_text("Kopieren")
+            copy.connect("clicked", lambda _b, t=text: self._copy_text(t))
+            load = Gtk.Button(label="In Werkbank", valign=Gtk.Align.CENTER)
+            load.add_css_class("flat")
+            load.connect("clicked", lambda _b, t=text: self._load_to_workbench(t))
+            row.add_suffix(copy)
+            row.add_suffix(load)
+            self._history_group.add(row)
+            self._history_rows.append(row)
+
+    def _copy_text(self, text: str) -> None:
+        subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=False)
+        self._toast("In Zwischenablage kopiert ✓")
+
+    def _load_to_workbench(self, text: str) -> None:
+        self.workbench._set_text(text)
+        self.stack.set_visible_child_name("werkbank")
+
+    def _clear_history(self, *_a) -> None:
+        try:
+            HISTORY_FILE.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+        self._refresh_history()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -656,6 +757,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             "voice_commands": bool(self.voice_row.get_active()),
             "sound_cue": bool(self.sound_row.get_active()),
             "restore_clipboard": bool(self.clipboard_row.get_active()),
+            "save_history": bool(self.history_row.get_active()),
             "hotkey_mode": self._combo_value(self.mode_row, HOTKEY_MODE_OPTIONS),
             "double_tap_key": self._combo_value(self.hotkey_row, self._hotkey_opts),
             "double_tap_window_ms": int(self.double_tap_row.get_value()),

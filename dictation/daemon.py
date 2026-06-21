@@ -41,6 +41,8 @@ CACHE_DIR = Path.home() / ".cache" / "whisper-dictation"
 # Unix socket for the GUI "workbench" to drive transcription + LLM on the
 # already-loaded model in the running daemon.
 IPC_SOCKET = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "whisper-dictation.sock"
+# Append-only history of dictations (JSON lines), read by the GUI "Verlauf" tab.
+HISTORY_FILE = CACHE_DIR / "history.jsonl"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "double_tap_key": "ctrl_r",
@@ -66,6 +68,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "voice_commands": False,
     # Save & restore the clipboard around paste so dictation doesn't clobber it.
     "restore_clipboard": True,
+    # Keep a history of dictations (for the GUI "Verlauf" tab).
+    "save_history": True,
     "paste_mode": "auto",
     "record_device": "default",
     "max_record_seconds": 180,
@@ -777,6 +781,18 @@ class WhisperDictationDaemon:
         except Exception as exc:
             print(f"[whisper-dictation] could not save config: {exc}", file=sys.stderr, flush=True)
 
+    def _append_history(self, text: str) -> None:
+        if not self.config.get("save_history", True) or not text.strip():
+            return
+        try:
+            with HISTORY_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False) + "\n")
+            lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+            if len(lines) > 500:  # keep the file bounded
+                HISTORY_FILE.write_text("\n".join(lines[-500:]) + "\n", encoding="utf-8")
+        except Exception as exc:
+            print(f"[whisper-dictation] history write failed: {exc}", file=sys.stderr, flush=True)
+
     def toggle_recording(self) -> None:
         if self.busy:
             self._status("Noch beschäftigt", "Letzte Aufnahme wird verarbeitet.", timeout_ms=3000)
@@ -1022,6 +1038,7 @@ class WhisperDictationDaemon:
                     self._status("Kein Text erkannt", "Nichts uebrig nach Befehlen.", timeout_ms=4000)
                     return
 
+            self._append_history(text)
             pasted = self._paste_text(text)
             if pasted:
                 self._status("✓ Eingefügt", text[:120], timeout_ms=4000)

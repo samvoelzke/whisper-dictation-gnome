@@ -11,6 +11,7 @@
   "hotwords": "",
   "voice_commands": false,
   "restore_clipboard": true,
+  "save_history": true,
   "paste_mode": "auto",
   "record_device": "default",
   "max_record_seconds": 180,
