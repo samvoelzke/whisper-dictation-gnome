@@ -270,6 +270,20 @@ def daemon_running() -> bool:
     return result.stdout.strip() == "running"
 
 
+# One-click instructions for the workbench (the free-text field stays for custom).
+WB_PRESETS = [
+    ("Strukturieren", "Strukturiere den Text übersichtlich, mit Absätzen oder Stichpunkten wo sinnvoll."),
+    ("Formeller", "Schreibe den Text formeller."),
+    ("Freundlicher", "Schreibe den Text freundlicher."),
+    ("Menschlicher", "Schreibe den Text natürlicher und menschlicher, weniger steif."),
+    ("Kürzer", "Fasse den Text kürzer, ohne Wichtiges zu verlieren."),
+    ("Zusammenfassen", "Fasse den Text in wenigen Sätzen zusammen."),
+    ("Korrigieren", "Korrigiere nur Rechtschreibung, Grammatik und Zeichensetzung."),
+    ("Stichpunkte", "Formuliere den Text als Stichpunkt-Liste."),
+    ("Englisch", "Übersetze den Text ins Englische."),
+]
+
+
 class WorkbenchView(Gtk.Box):
     """Dictate into a scratchpad, then give the AI free-form instructions."""
 
@@ -305,6 +319,17 @@ class WorkbenchView(Gtk.Box):
         )
         scroller.set_child(self.text_view)
         box.append(scroller)
+
+        presets = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            column_spacing=6, row_spacing=6, max_children_per_line=12,
+        )
+        for label, instruction in WB_PRESETS:
+            chip = Gtk.Button(label=label)
+            chip.add_css_class("pill")
+            chip.connect("clicked", lambda _b, i=instruction: self._do_instruct(i))
+            presets.append(chip)
+        box.append(presets)
 
         instr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.instr = Gtk.Entry(hexpand=True)
@@ -380,9 +405,14 @@ class WorkbenchView(Gtk.Box):
         return False
 
     def _run_instruction(self, *_a) -> None:
-        instruction = self.instr.get_text().strip()
+        self._do_instruct(self.instr.get_text().strip())
+
+    def _do_instruct(self, instruction: str) -> None:
         text = self._text()
-        if not instruction or not text:
+        if not text:
+            self.status.set_text("Erst etwas aufnehmen oder eingeben.")
+            return
+        if not instruction:
             return
         self.send_btn.set_sensitive(False)
         self.status.set_text("🤖 KI arbeitet …")
