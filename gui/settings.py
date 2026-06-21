@@ -119,6 +119,7 @@ DEFAULT_CONFIG = {
     "ollama_postprocess": False,
     "ollama_model": "qwen2.5:7b",
     "llm_toggle_key": "",
+    "command_key": "",
 }
 
 # turbo/large-v3/distil-large-v3 run on the OpenVINO backend (Intel GPU/NPU)
@@ -611,6 +612,13 @@ class SettingsWindow(Adw.ApplicationWindow):
         llm.add(self.llm_toggle_row)
         llm.add(self._make_capture_row("llm_toggle_row", "_llm_toggle_opts"))
 
+        command_cur = str(self.config.get("command_key", ""))
+        self._command_opts = key_options(LLM_TOGGLE_OPTIONS, command_cur)
+        self.command_row = self._combo("Befehl-Taste (markierten Text bearbeiten)", self._command_opts, command_cur)
+        self.command_row.set_subtitle("Doppel-Tap, dann Anweisung sprechen → ersetzt die Markierung. Funktioniert in Textfeldern, nicht im Terminal.")
+        llm.add(self.command_row)
+        llm.add(self._make_capture_row("command_row", "_command_opts"))
+
         adv = Adw.PreferencesGroup(
             title="Kontext (Initial Prompt)",
             description="Lenkt die Erkennung Richtung deiner Begriffe — wird nicht "
@@ -799,6 +807,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             "ollama_postprocess": bool(self.ollama_row.get_active()),
             "ollama_model": self._combo_value(self.ollama_model_row, self._llm_model_opts),
             "llm_toggle_key": self._combo_value(self.llm_toggle_row, self._llm_toggle_opts),
+            "command_key": self._combo_value(self.command_row, self._command_opts),
         })
         return config
 
@@ -831,7 +840,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     # Changing these keys re-grabs the evdev listener, which only happens at
     # startup -> a full restart is needed. Everything else applies live.
-    RESTART_KEYS = ("double_tap_key", "llm_toggle_key")
+    RESTART_KEYS = ("double_tap_key", "llm_toggle_key", "command_key")
 
     def _on_save(self, _button: Gtk.Button) -> None:
         old, new = self.config, self._config_from_form()

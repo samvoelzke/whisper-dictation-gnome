@@ -18,5 +18,6 @@
   "initial_prompt": "Diktat auf Deutsch, teils mit englischen Fachbegriffen wie Pull Request, Deployment, Bug, Backend, Repository, Meeting.",
   "ollama_postprocess": false,
   "ollama_model": "qwen2.5:7b",
-  "llm_toggle_key": ""
+  "llm_toggle_key": "",
+  "command_key": ""
 }

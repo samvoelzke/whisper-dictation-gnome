@@ -83,6 +83,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Double-tap this key to toggle Ollama cleanup on/off ("" = disabled).
     # Must differ from double_tap_key. Same value set as double_tap_key.
     "llm_toggle_key": "",
+    # Command mode: double-tap this key, speak an instruction, and the AI
+    # rewrites the currently selected text in place ("" = disabled).
+    "command_key": "",
 }
 
 # Hotkey spec per logical name:
@@ -375,6 +378,14 @@ class WhisperDictationDaemon:
         self.llm_toggle_label = key_label(self.llm_toggle_name)
         self.last_llm_toggle_release: float | None = None
 
+        # Command mode (rewrite the selection by voice).
+        command_value = str(config.get("command_key", ""))
+        self.command_name = command_value if (command_value and command_value != self.hotkey_name) else None
+        self.command_label = key_label(self.command_name)
+        self.last_command_release: float | None = None
+        self._command_active = False
+        self._command_selection = ""
+
         self.backend = self._resolve_backend()
 
         # Transcription models (only one is populated, depending on backend).
@@ -630,7 +641,11 @@ class WhisperDictationDaemon:
             notify("Hotkey ungueltig", f"Taste '{self.hotkey_name}' nicht erkannt.")
             raise RuntimeError(f"Unresolvable hotkey: {self.hotkey_name!r}")
         toggle_target = evdev_code_for(self.llm_toggle_name, ecodes) if self.llm_toggle_name else None
-        wanted = {target} | ({toggle_target} if toggle_target is not None else set())
+        command_target = evdev_code_for(self.command_name, ecodes) if self.command_name else None
+        wanted = {target}
+        for extra in (toggle_target, command_target):
+            if extra is not None:
+                wanted.add(extra)
 
         devices: list[Any] = []
         for path in evdev.list_devices():
@@ -655,19 +670,25 @@ class WhisperDictationDaemon:
 
         self._evdev_devices = devices
         labels = ", ".join(d.name for d in devices)
-        toggle_info = f" + LLM-Switch={self.llm_toggle_label}" if toggle_target else ""
+        extra_info = ""
+        if toggle_target:
+            extra_info += f" + LLM-Switch={self.llm_toggle_label}"
+        if command_target:
+            extra_info += f" + Befehl={self.command_label}"
         print(
-            f"[whisper-dictation] evdev listener on {len(devices)} device(s): {labels}{toggle_info}",
+            f"[whisper-dictation] evdev listener on {len(devices)} device(s): {labels}{extra_info}",
             flush=True,
         )
 
         self.listener_thread = threading.Thread(
-            target=self._evdev_loop, args=(target, toggle_target, ecodes), daemon=True
+            target=self._evdev_loop, args=(target, toggle_target, command_target, ecodes),
+            daemon=True,
         )
         self.listener_thread.start()
         self.listener_thread.join()
 
-    def _evdev_loop(self, target: int, toggle_target: int | None, ecodes: Any) -> None:
+    def _evdev_loop(self, target: int, toggle_target: int | None,
+                    command_target: int | None, ecodes: Any) -> None:
         import selectors
 
         # Modifier keys don't reset the double-tap timer. Some keys (e.g. the
@@ -693,7 +714,8 @@ class WhisperDictationDaemon:
                         if event.type != ecodes.EV_KEY:
                             continue
                         self._process_key_event(
-                            event.code, event.value, target, toggle_target, modifier_codes
+                            event.code, event.value, target, toggle_target,
+                            command_target, modifier_codes,
                         )
                 except BlockingIOError:
                     # No events ready right now; not an error.
@@ -706,7 +728,8 @@ class WhisperDictationDaemon:
                         pass
 
     def _process_key_event(self, code: int, value: int, target: int,
-                           toggle_target: int | None, modifier_codes: set) -> None:
+                           toggle_target: int | None, command_target: int | None,
+                           modifier_codes: set) -> None:
         # Esc while recording -> cancel without transcribing.
         if value == 1 and code == getattr(self, "_esc_code", None) and self._is_recording():
             self.cancel_recording()
@@ -719,20 +742,30 @@ class WhisperDictationDaemon:
                     self._ptt_stop()
             elif value == 0:        # double-tap: release counts
                 self._register_release()
-            elif value == 1:        # press resets the *other* timer
+            elif value == 1:        # press resets the *other* timers
                 with self.lock:
                     self.last_llm_toggle_release = None
+                    self.last_command_release = None
         elif toggle_target is not None and code == toggle_target:
             if value == 0:
                 self._register_llm_toggle()
             elif value == 1:
                 with self.lock:
                     self.last_hotkey_release = None
+                    self.last_command_release = None
+        elif command_target is not None and code == command_target:
+            if value == 0:
+                self._register_command()
+            elif value == 1:
+                with self.lock:
+                    self.last_hotkey_release = None
+                    self.last_llm_toggle_release = None
         elif value == 1 and code not in modifier_codes:
-            # a real other key press resets both double-tap timers
+            # a real other key press resets the double-tap timers
             with self.lock:
                 self.last_hotkey_release = None
                 self.last_llm_toggle_release = None
+                self.last_command_release = None
 
     # -- Double-tap detection (shared) ------------------------------------------
 
@@ -757,6 +790,42 @@ class WhisperDictationDaemon:
                     self.toggle_llm_cleanup()
                     return
             self.last_llm_toggle_release = now
+
+    def _register_command(self) -> None:
+        now = time.monotonic()
+        with self.lock:
+            if self.last_command_release is not None:
+                delta = now - self.last_command_release
+                self.last_command_release = None
+                if delta <= self.double_tap_window:
+                    self._toggle_command_mode()
+                    return
+            self.last_command_release = now
+
+    def _toggle_command_mode(self) -> None:
+        if self._command_active and self._is_recording():
+            self.stop_recording()           # completion applies the instruction
+        elif not self.busy and not self._is_recording():
+            self._start_command_mode()
+
+    def _start_command_mode(self) -> None:
+        """Grab the current selection (Wayland PRIMARY) and record an instruction."""
+        if shutil_which("wl-paste") is None:
+            self._status("Befehlsmodus nicht moeglich", "wl-paste fehlt.", timeout_ms=4000)
+            return
+        try:
+            sel = subprocess.run(
+                ["wl-paste", "--primary", "--no-newline"],
+                capture_output=True, timeout=2,
+            ).stdout.decode("utf-8", "replace").strip()
+        except Exception:
+            sel = ""
+        if not sel:
+            self._status("Nichts markiert", "Markiere zuerst Text, dann doppelt druecken.", timeout_ms=4000)
+            return
+        self._command_selection = sel
+        self._command_active = True
+        self.start_recording()
 
     def toggle_llm_cleanup(self) -> None:
         """Flip Ollama post-processing on/off and persist it."""
@@ -844,6 +913,8 @@ class WhisperDictationDaemon:
             self.recording_sd_stop = None
         if output_path:
             output_path.unlink(missing_ok=True)
+        self._command_active = False
+        self._command_selection = ""
         print("[whisper-dictation] recording cancelled", flush=True)
         self._status("✖ Abgebrochen", "Aufnahme verworfen.", timeout_ms=2500)
 
@@ -944,12 +1015,17 @@ class WhisperDictationDaemon:
         )
         self.recording_timer.daemon = True
         self.recording_timer.start()
-        stop_hint = (
-            f"{self.hotkey_label} loslassen zum Stoppen"
-            if self.hotkey_mode == "push_to_talk"
-            else f"Doppelt {self.hotkey_label} zum Stoppen"
-        )
-        self._status("🔴 Aufnahme läuft", stop_hint, urgency="critical", timeout_ms=0)
+        if self._command_active:
+            self._status("🎙 Befehl sprechen…",
+                         f"Doppelt {self.command_label} = auf Auswahl anwenden",
+                         urgency="critical", timeout_ms=0)
+        else:
+            stop_hint = (
+                f"{self.hotkey_label} loslassen zum Stoppen"
+                if self.hotkey_mode == "push_to_talk"
+                else f"Doppelt {self.hotkey_label} zum Stoppen"
+            )
+            self._status("🔴 Aufnahme läuft", stop_hint, urgency="critical", timeout_ms=0)
         self._play_sound("start")
 
     def auto_stop_recording(self) -> None:
@@ -1024,6 +1100,32 @@ class WhisperDictationDaemon:
                 return
 
             print(f"[whisper-dictation] transcription ready chars={len(text)}", flush=True)
+
+            # Command mode: the transcription is an INSTRUCTION; apply it to the
+            # selection we grabbed and replace the selection in place.
+            if self._command_active:
+                self._command_active = False
+                selection = self._command_selection
+                self._command_selection = ""
+                if not selection:
+                    self._status("Befehl abgebrochen", "Keine Auswahl.", timeout_ms=4000)
+                    return
+                self._status("🤖 Wende Befehl an…", text[:80], urgency="critical", timeout_ms=0)
+                try:
+                    result = self._ollama_instruct(selection, text).strip()
+                except Exception as exc:
+                    self._status("Befehl fehlgeschlagen", f"Ollama: {exc}", urgency="critical", timeout_ms=6000)
+                    return
+                if not result:
+                    self._status("Befehl fehlgeschlagen", "Leeres Ergebnis.", timeout_ms=4000)
+                    return
+                pasted = self._paste_text(result)
+                if pasted:
+                    self._status("✓ Ersetzt", result[:120], timeout_ms=4000)
+                else:
+                    self._status("📋 In Zwischenablage", "Manuell mit Strg+V: " + result[:90], timeout_ms=6000)
+                self._play_sound("done")
+                return
 
             if self.config.get("ollama_postprocess"):
                 self._status("🤖 Verfeinere Text…", "Ollama läuft…", urgency="critical", timeout_ms=0)
@@ -1383,7 +1485,8 @@ class WhisperDictationDaemon:
                 self.ov_pipe = None
             self._load_model()
         elif (new.get("double_tap_key") != old.get("double_tap_key")
-              or new.get("llm_toggle_key") != old.get("llm_toggle_key")):
+              or new.get("llm_toggle_key") != old.get("llm_toggle_key")
+              or new.get("command_key") != old.get("command_key")):
             notify("Taste geaendert", "Bitte Daemon neu starten, damit die neue Taste greift.")
         else:
             notify("Einstellungen uebernommen", "Aenderungen sind aktiv.")
