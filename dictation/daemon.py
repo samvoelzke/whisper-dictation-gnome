@@ -38,6 +38,9 @@ else:
 CONFIG_DIR = Path.home() / ".config" / "whisper-dictation"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CACHE_DIR = Path.home() / ".cache" / "whisper-dictation"
+# Unix socket for the GUI "workbench" to drive transcription + LLM on the
+# already-loaded model in the running daemon.
+IPC_SOCKET = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "whisper-dictation.sock"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "double_tap_key": "ctrl_r",
@@ -376,6 +379,7 @@ class WhisperDictationDaemon:
         self.ov_pipe: Any = None
 
         self.lock = threading.RLock()
+        self._infer_lock = threading.Lock()  # serialize model inference (dictation + IPC)
 
         # Linux: arecord subprocess; macOS: sounddevice thread.
         self.recording_process: subprocess.Popen[bytes] | None = None
@@ -450,6 +454,7 @@ class WhisperDictationDaemon:
             check_macos_accessibility()
         self._init_mic_volume()
         self._load_model()
+        self._start_ipc_server()
 
         if IS_MACOS:
             self._start_listener_macos()
@@ -996,7 +1001,8 @@ class WhisperDictationDaemon:
                 self._status("Kein Text erkannt", "Die Aufnahme war leer oder zu leise.", timeout_ms=4000)
                 return
 
-            text = self._transcribe_audio(audio).strip()
+            with self._infer_lock:
+                text = self._transcribe_audio(audio).strip()
             if not text:
                 self._status("Kein Text erkannt", "Nichts verstanden.", timeout_ms=4000)
                 return
@@ -1124,6 +1130,107 @@ class WhisperDictationDaemon:
 
         print(f"[whisper-dictation] ollama cleanup done chars={len(cleaned)}", flush=True)
         return cleaned
+
+    def _ollama_instruct(self, text: str, instruction: str) -> str:
+        """Run a free-form user instruction over the text via Ollama."""
+        import urllib.request, json as _json, re as _re
+        host = str(self.config.get("ollama_host", "http://localhost:11434")).rstrip("/")
+        model = str(self.config.get("ollama_model", "qwen2.5:7b"))
+        system = (
+            "Du bist ein Schreibassistent. Fuehre die Anweisung des Nutzers auf dem "
+            "gegebenen Text aus und gib AUSSCHLIESSLICH den ueberarbeiteten Text zurueck "
+            "- keine Erklaerungen, keine Vorrede. Behalte englische Fachbegriffe bei."
+        )
+        user = f"Anweisung: {instruction}\n\nText:\n{text}"
+        payload = {
+            "model": model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+            "stream": False, "think": False, "keep_alive": "10m",
+            "options": {"temperature": 0.3},
+        }
+        req = urllib.request.Request(
+            f"{host}/api/chat", data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            parsed = _json.loads(resp.read())
+        raw = str(parsed.get("message", {}).get("content", ""))
+        return _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+
+    # -- IPC server (GUI workbench) ---------------------------------------------
+
+    def _start_ipc_server(self) -> None:
+        if IS_MACOS:
+            return  # Linux first; macOS could be added later
+        import socket as _socket
+        try:
+            if IPC_SOCKET.exists():
+                IPC_SOCKET.unlink()
+        except Exception:
+            pass
+        try:
+            srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            srv.bind(str(IPC_SOCKET))
+            srv.listen(4)
+        except Exception as exc:
+            print(f"[whisper-dictation] IPC server failed: {exc}", file=sys.stderr, flush=True)
+            return
+        self._ipc_srv = srv
+        print(f"[whisper-dictation] IPC socket at {IPC_SOCKET}", flush=True)
+        threading.Thread(target=self._ipc_accept_loop, args=(srv,), daemon=True).start()
+
+    def _ipc_accept_loop(self, srv: Any) -> None:
+        while not self.stopping:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._ipc_handle, args=(conn,), daemon=True).start()
+
+    def _ipc_handle(self, conn: Any) -> None:
+        import json as _json
+        try:
+            conn.settimeout(300)
+            data = b""
+            while b"\n" not in data:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            req = _json.loads(data.decode("utf-8") or "{}")
+            resp = self._ipc_dispatch(req)
+        except Exception as exc:
+            resp = {"error": str(exc)}
+        try:
+            conn.sendall((_json.dumps(resp) + "\n").encode("utf-8"))
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _ipc_dispatch(self, req: dict) -> dict:
+        cmd = str(req.get("cmd", ""))
+        if cmd == "ping":
+            return {"ok": True, "backend": self.backend}
+        if cmd == "transcribe":
+            wav = req.get("wav")
+            if not wav or not Path(wav).exists():
+                return {"error": "wav fehlt"}
+            audio = read_wav_mono(Path(wav))
+            with self._infer_lock:
+                text = self._transcribe_audio(audio).strip()
+            return {"text": text}
+        if cmd == "instruct":
+            try:
+                out = self._ollama_instruct(str(req.get("text", "")), str(req.get("instruction", "")))
+                return {"text": out}
+            except Exception as exc:
+                return {"error": f"Ollama: {exc}"}
+        return {"error": f"unbekannter Befehl {cmd!r}"}
 
     # -- Paste ------------------------------------------------------------------
 
@@ -1280,6 +1387,16 @@ class WhisperDictationDaemon:
                 self.recording_sd_stop.set()
             if self.listener is not None:
                 self.listener.stop()
+        srv = getattr(self, "_ipc_srv", None)
+        if srv is not None:
+            try:
+                srv.close()
+            except Exception:
+                pass
+        try:
+            IPC_SOCKET.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def main() -> int:

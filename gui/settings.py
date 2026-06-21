@@ -8,8 +8,13 @@ Writes ~/.config/whisper-dictation/config.json and applies changes live via
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
+import socket
 import subprocess
+import tempfile
+import threading
 from pathlib import Path
 
 import gi
@@ -42,6 +47,25 @@ def detect_alsa_capture_devices() -> list[tuple[str, str]]:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = Path.home() / ".config" / "whisper-dictation"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+IPC_SOCKET = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "whisper-dictation.sock"
+
+
+def ipc_call(req: dict, timeout: float = 200) -> dict:
+    """Send one JSON request to the running daemon and return its reply."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(str(IPC_SOCKET))
+        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf.decode("utf-8") or "{}")
+    finally:
+        s.close()
 LOG_FILE = Path.home() / ".cache" / "whisper-dictation" / "daemon.log"
 DAEMON_SCRIPT = PROJECT_ROOT / "bin" / "whisper-dictation.sh"
 
@@ -217,6 +241,142 @@ def daemon_running() -> bool:
     return result.stdout.strip() == "running"
 
 
+class WorkbenchWindow(Adw.Window):
+    """Dictate into a scratchpad, then give the AI free-form instructions."""
+
+    def __init__(self, parent: Adw.ApplicationWindow):
+        super().__init__(title="Werkbank", transient_for=parent)
+        self.set_default_size(600, 620)
+        self.rec_proc: subprocess.Popen | None = None
+        self.rec_wav: str | None = None
+
+        toolbar = Adw.ToolbarView()
+        self.set_content(toolbar)
+        toolbar.add_top_bar(Adw.HeaderBar())
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                      margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        toolbar.set_content(box)
+
+        rec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.rec_btn = Gtk.Button(label="🔴 Aufnehmen")
+        self.rec_btn.add_css_class("pill")
+        self.rec_btn.connect("clicked", self._toggle_record)
+        rec_row.append(self.rec_btn)
+        self.status = Gtk.Label(label="Bereit", xalign=0)
+        self.status.add_css_class("dim-label")
+        rec_row.append(self.status)
+        box.append(rec_row)
+
+        scroller = Gtk.ScrolledWindow(vexpand=True)
+        scroller.add_css_class("card")
+        self.text_view = Gtk.TextView(
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            top_margin=8, bottom_margin=8, left_margin=8, right_margin=8,
+        )
+        scroller.set_child(self.text_view)
+        box.append(scroller)
+
+        instr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.instr = Gtk.Entry(hexpand=True)
+        self.instr.set_placeholder_text("Anweisung an die KI … (formaler · zusammenfassen · auf Englisch)")
+        self.instr.connect("activate", self._run_instruction)
+        instr_row.append(self.instr)
+        self.send_btn = Gtk.Button(label="Ausführen")
+        self.send_btn.add_css_class("suggested-action")
+        self.send_btn.connect("clicked", self._run_instruction)
+        instr_row.append(self.send_btn)
+        box.append(instr_row)
+
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.END)
+        copy_btn = Gtk.Button(label="Kopieren")
+        copy_btn.connect("clicked", self._copy)
+        bottom.append(copy_btn)
+        box.append(bottom)
+
+    def _text(self) -> str:
+        buf = self.text_view.get_buffer()
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+
+    def _set_text(self, text: str) -> None:
+        self.text_view.get_buffer().set_text(text)
+
+    def _toggle_record(self, *_a) -> None:
+        if self.rec_proc is None:
+            self.rec_wav = tempfile.mktemp(suffix=".wav")
+            device = str(load_config().get("record_device", "default"))
+            try:
+                self.rec_proc = subprocess.Popen([
+                    "arecord", "-q", "-D", device, "-f", "S16_LE",
+                    "-r", "16000", "-c", "1", "-t", "wav", self.rec_wav,
+                ])
+            except Exception as exc:
+                self.status.set_text(f"arecord-Fehler: {exc}")
+                return
+            self.rec_btn.set_label("⏹ Stopp")
+            self.status.set_text("● Aufnahme läuft …")
+            return
+
+        try:
+            self.rec_proc.send_signal(signal.SIGINT)
+            self.rec_proc.wait(timeout=3)
+        except Exception:
+            pass
+        self.rec_proc = None
+        self.rec_btn.set_label("🔴 Aufnehmen")
+        self.status.set_text("Transkribiere …")
+        wav = self.rec_wav
+
+        def work():
+            try:
+                r = ipc_call({"cmd": "transcribe", "wav": wav})
+            except Exception as exc:
+                r = {"error": str(exc)}
+            GLib.idle_add(self._after_transcribe, r)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_transcribe(self, r: dict) -> bool:
+        if "error" in r:
+            self.status.set_text(f"Fehler: {r['error']}")
+            return False
+        text = str(r.get("text", "")).strip()
+        cur = self._text()
+        joined = (cur + " " + text).strip() if cur else text
+        self._set_text(joined)
+        self.status.set_text("Bereit" if text else "Nichts erkannt")
+        return False
+
+    def _run_instruction(self, *_a) -> None:
+        instruction = self.instr.get_text().strip()
+        text = self._text()
+        if not instruction or not text:
+            return
+        self.send_btn.set_sensitive(False)
+        self.status.set_text("🤖 KI arbeitet …")
+
+        def work():
+            try:
+                r = ipc_call({"cmd": "instruct", "text": text, "instruction": instruction})
+            except Exception as exc:
+                r = {"error": str(exc)}
+            GLib.idle_add(self._after_instruct, r)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_instruct(self, r: dict) -> bool:
+        self.send_btn.set_sensitive(True)
+        if "error" in r:
+            self.status.set_text(f"Fehler: {r['error']}")
+            return False
+        self._set_text(str(r.get("text", "")).strip())
+        self.instr.set_text("")
+        self.status.set_text("Bereit")
+        return False
+
+    def _copy(self, *_a) -> None:
+        subprocess.run(["wl-copy"], input=self._text().encode("utf-8"), check=False)
+        self.status.set_text("In Zwischenablage kopiert ✓")
+
+
 class SettingsWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application):
         super().__init__(application=app, title="Whisper Dictation")
@@ -241,6 +401,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         header.pack_start(save_button)
 
         menu = Gio.Menu()
+        menu.append("Werkbank (Diktat + KI)", "win.werkbank")
         menu.append("Diagnose", "win.diagnose")
         menu.append("Daemon starten", "win.start")
         menu.append("Daemon neu starten", "win.restart")
@@ -253,6 +414,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             ("start", self._on_start), ("restart", self._on_restart),
             ("stop", self._on_stop), ("log", self._on_log),
             ("diagnose", self._on_diagnose), ("about", self._on_about),
+            ("werkbank", self._on_werkbank),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
@@ -550,6 +712,12 @@ class SettingsWindow(Adw.ApplicationWindow):
             Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(str(LOG_FILE), None), None)
         else:
             self._toast("Noch keine Logdatei vorhanden.")
+
+    def _on_werkbank(self, *_a) -> None:
+        if not IPC_SOCKET.exists():
+            self._toast("Daemon läuft nicht — Werkbank braucht den laufenden Dienst.")
+            return
+        WorkbenchWindow(self).present()
 
     def _on_diagnose(self, *_a) -> None:
         import re
