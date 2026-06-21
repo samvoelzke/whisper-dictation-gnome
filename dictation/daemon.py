@@ -1119,9 +1119,13 @@ class WhisperDictationDaemon:
                 if not result:
                     self._status("Befehl fehlgeschlagen", "Leeres Ergebnis.", timeout_ms=4000)
                     return
-                pasted = self._paste_text(result)
+                # Keep the result in the clipboard (restore=False): in an
+                # editable field Ctrl+V replaces the selection, but on a
+                # read-only page (e.g. Wikipedia) the paste is a no-op and the
+                # user can still paste the result wherever they want.
+                pasted = self._paste_text(result, restore=False)
                 if pasted:
-                    self._status("✓ Ersetzt", result[:120], timeout_ms=4000)
+                    self._status("✓ Ersetzt (auch in Zwischenablage)", result[:120], timeout_ms=4000)
                 else:
                     self._status("📋 In Zwischenablage", "Manuell mit Strg+V: " + result[:90], timeout_ms=6000)
                 self._play_sound("done")
@@ -1353,20 +1357,24 @@ class WhisperDictationDaemon:
 
     # -- Paste ------------------------------------------------------------------
 
-    def _paste_text(self, text: str) -> bool:
-        """Returns True if the text was auto-pasted, False if only copied."""
+    def _paste_text(self, text: str, restore: bool = True) -> bool:
+        """Returns True if the text was auto-pasted, False if only copied.
+
+        restore=False keeps the text in the clipboard (used by command mode, so
+        a read-only target like a web page still leaves the result available).
+        """
         if IS_MACOS:
             return self._paste_macos(text)
-        return self._paste_linux(text)
+        return self._paste_linux(text, restore=restore)
 
-    def _paste_linux(self, text: str) -> bool:
+    def _paste_linux(self, text: str, restore: bool = True) -> bool:
         if shutil_which("wl-copy") is None:
             raise RuntimeError("wl-copy ist nicht installiert (sudo dnf install wl-clipboard).")
 
         # Remember the current clipboard (best effort, text only) to restore it
         # after pasting, so dictation doesn't clobber what the user had copied.
         saved: bytes | None = None
-        if self.config.get("restore_clipboard", True) and shutil_which("wl-paste"):
+        if restore and self.config.get("restore_clipboard", True) and shutil_which("wl-paste"):
             try:
                 saved = subprocess.run(
                     ["wl-paste", "-n"], capture_output=True, timeout=2
