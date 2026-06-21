@@ -322,11 +322,12 @@ class WorkbenchView(Gtk.Box):
 
         presets = Gtk.FlowBox(
             selection_mode=Gtk.SelectionMode.NONE,
-            column_spacing=6, row_spacing=6, max_children_per_line=12,
+            column_spacing=4, row_spacing=4, max_children_per_line=12,
+            halign=Gtk.Align.START,
         )
         for label, instruction in WB_PRESETS:
             chip = Gtk.Button(label=label)
-            chip.add_css_class("pill")
+            chip.add_css_class("flat")
             chip.connect("clicked", lambda _b, i=instruction: self._do_instruct(i))
             presets.append(chip)
         box.append(presets)
