@@ -16,7 +16,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 
 def detect_alsa_capture_devices() -> list[tuple[str, str]]:
@@ -223,6 +223,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.set_default_size(560, 720)
         self.config = load_config()
         self.device_options = detect_alsa_capture_devices()
+        self._capturing = None          # (combo, opts_attr, button) while learning a key
+        self._capture_ctrl = None
 
         self.toasts = Adw.ToastOverlay()
         self.set_content(self.toasts)
@@ -301,6 +303,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._hotkey_opts = key_options(HOTKEY_OPTIONS, hotkey_cur)
         self.hotkey_row = self._combo("Aufnahme-Taste", self._hotkey_opts, hotkey_cur)
         inp.add(self.hotkey_row)
+        inp.add(self._make_capture_row("hotkey_row", "_hotkey_opts"))
         self.double_tap_row = Adw.SpinRow.new_with_range(150, 1200, 10)
         self.double_tap_row.set_title("Double-Tap-Fenster (ms)")
         self.double_tap_row.set_value(float(self.config["double_tap_window_ms"]))
@@ -357,6 +360,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         )
         self.llm_toggle_row.set_subtitle("Schaltet Cleanup an/aus. Muss sich von der Aufnahme-Taste unterscheiden.")
         llm.add(self.llm_toggle_row)
+        llm.add(self._make_capture_row("llm_toggle_row", "_llm_toggle_opts"))
 
         adv = Adw.PreferencesGroup(
             title="Kontext (Initial Prompt)",
@@ -389,6 +393,57 @@ class SettingsWindow(Adw.ApplicationWindow):
     @staticmethod
     def _combo_value(row: Adw.ComboRow, options: list[tuple[str, str]]) -> str:
         return options[row.get_selected()][0]
+
+    # ── Key capture (press a key to set it) ─────────────────────────────────────
+
+    def _make_capture_row(self, combo_attr: str, opts_attr: str) -> Adw.ActionRow:
+        row = Adw.ActionRow(title="… oder Taste drücken zum Festlegen")
+        btn = Gtk.Button(label="🎯 Taste erfassen", valign=Gtk.Align.CENTER)
+        btn.add_css_class("flat")
+        btn.connect("clicked", lambda *_: self._start_capture(combo_attr, opts_attr, btn))
+        row.add_suffix(btn)
+        row.set_activatable_widget(btn)
+        return row
+
+    def _start_capture(self, combo_attr: str, opts_attr: str, btn: Gtk.Button) -> None:
+        if self._capturing is not None:
+            return
+        self._capturing = (combo_attr, opts_attr, btn)
+        btn.set_label("… drück eine Taste (Esc = Abbruch)")
+        ctrl = Gtk.EventControllerKey()
+        ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        ctrl.connect("key-pressed", self._on_capture_key)
+        self.add_controller(ctrl)
+        self._capture_ctrl = ctrl
+
+    def _on_capture_key(self, _ctrl, keyval, keycode, _state) -> bool:
+        if self._capturing is None:
+            return False
+        combo_attr, opts_attr, btn = self._capturing
+        if keyval == Gdk.KEY_Escape:
+            self._end_capture(btn)
+            return True
+        evdev = keycode - 8  # GTK/X hardware keycode -> evdev code
+        name = Gdk.keyval_name(keyval) or f"Taste{evdev}"
+        value = f"code:{evdev}:{name}"
+        combo = getattr(self, combo_attr)
+        opts = getattr(self, opts_attr)
+        vals = [v for v, _ in opts]
+        if value not in vals:
+            opts.append((value, key_label(value)))
+            combo.get_model().append(key_label(value))
+            vals.append(value)
+        combo.set_selected(vals.index(value))
+        self._end_capture(btn)
+        self._toast(f"Taste erfasst: {key_label(value)} — jetzt Speichern")
+        return True
+
+    def _end_capture(self, btn: Gtk.Button) -> None:
+        btn.set_label("🎯 Taste erfassen")
+        if self._capture_ctrl is not None:
+            self.remove_controller(self._capture_ctrl)
+            self._capture_ctrl = None
+        self._capturing = None
 
     def _update_model_hint(self) -> None:
         model = self._combo_value(self.model_row, MODEL_OPTIONS)
