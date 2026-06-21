@@ -239,15 +239,18 @@ class SettingsWindow(Adw.ApplicationWindow):
         header.pack_start(save_button)
 
         menu = Gio.Menu()
+        menu.append("Diagnose", "win.diagnose")
         menu.append("Daemon starten", "win.start")
         menu.append("Daemon neu starten", "win.restart")
         menu.append("Daemon stoppen", "win.stop")
         menu.append("Log oeffnen", "win.log")
+        menu.append("Ueber Whisper Dictation", "win.about")
         menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
         header.pack_end(menu_button)
         for name, handler in (
             ("start", self._on_start), ("restart", self._on_restart),
             ("stop", self._on_stop), ("log", self._on_log),
+            ("diagnose", self._on_diagnose), ("about", self._on_about),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
@@ -338,7 +341,10 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.ollama_row.set_active(bool(self.config.get("ollama_postprocess", False)))
         llm.add(self.ollama_row)
         current_model = str(self.config.get("ollama_model", "qwen2.5:7b"))
-        self._llm_model_opts = list(LLM_MODEL_OPTIONS)
+        installed = self._installed_ollama_models()
+        self._llm_model_opts = [
+            (v, (("✓ " if v in installed else "") + lbl)) for v, lbl in LLM_MODEL_OPTIONS
+        ]
         if current_model not in [v for v, _ in self._llm_model_opts]:
             self._llm_model_opts.append((current_model, f"{current_model}  (eigenes)"))
         self.ollama_model_row = self._combo("Modell", self._llm_model_opts, current_model)
@@ -429,17 +435,23 @@ class SettingsWindow(Adw.ApplicationWindow):
         return result.returncode, (result.stdout + result.stderr).strip()
 
     @staticmethod
-    def _ollama_model_installed(model: str) -> bool | None:
-        """True/False if known; None if it can't be checked (server down)."""
+    def _ollama_list() -> tuple[bool, set]:
+        """Return (server_up, set_of_installed_model_names)."""
         try:
             out = subprocess.run(["ollama", "list"], capture_output=True,
                                  text=True, timeout=3, check=False)
             if out.returncode != 0:
-                return None
-            installed = {ln.split()[0] for ln in out.stdout.splitlines()[1:] if ln.split()}
-            return model in installed
+                return False, set()
+            return True, {ln.split()[0] for ln in out.stdout.splitlines()[1:] if ln.split()}
         except Exception:
-            return None
+            return False, set()
+
+    def _installed_ollama_models(self) -> set:
+        return self._ollama_list()[1]
+
+    def _ollama_model_installed(self, model: str) -> bool | None:
+        up, installed = self._ollama_list()
+        return (model in installed) if up else None
 
     # ── Actions ────────────────────────────────────────────────────────────────
 
@@ -483,6 +495,43 @@ class SettingsWindow(Adw.ApplicationWindow):
             Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(str(LOG_FILE), None), None)
         else:
             self._toast("Noch keine Logdatei vorhanden.")
+
+    def _on_diagnose(self, *_a) -> None:
+        import re
+        device = backend = "?"
+        try:
+            log = LOG_FILE.read_text(errors="ignore")
+            dev = re.findall(r"using device=(\w+)", log)
+            be = re.findall(r"backend=(\w+)", log)
+            device = dev[-1] if dev else "?"
+            backend = be[-1] if be else "?"
+        except Exception:
+            pass
+        up, installed = self._ollama_list()
+        model = self._combo_value(self.ollama_model_row, self._llm_model_opts)
+        body = (
+            f"Daemon: {'läuft' if daemon_running() else 'gestoppt'}\n"
+            f"Backend: {backend}\n"
+            f"Gerät: {device}\n"
+            f"Ollama-Server: {'läuft' if up else 'aus'}\n"
+            f"Cleanup-Modell ({model}): "
+            f"{'installiert' if model in installed else ('nicht installiert' if up else '?')}"
+        )
+        dlg = Adw.AlertDialog(heading="Diagnose", body=body)
+        dlg.add_response("ok", "OK")
+        dlg.present(self)
+
+    def _on_about(self, *_a) -> None:
+        about = Adw.AboutDialog(
+            application_name="Whisper Dictation",
+            application_icon="io.voelzke.WhisperDictation",
+            version="1.0",
+            developer_name="Sam Völzke",
+            comments="Lokales Sprache-zu-Text-Diktat für GNOME/Wayland — "
+                     "Whisper auf der Intel-GPU via OpenVINO.",
+            license_type=Gtk.License.MIT_X11,
+        )
+        about.present(self)
 
 
 class WhisperDictationApp(Adw.Application):
