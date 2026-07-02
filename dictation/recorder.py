@@ -407,7 +407,8 @@ class _Backend:
     def transcribe(self, audio: np.ndarray) -> str:
         lang = str(self.cfg.get("recorder_language") or self.cfg.get("language") or "").strip().lower()
         language = None if lang in ("", "auto") else lang
-        prompt = str(self.cfg.get("initial_prompt") or "").strip() or None
+        from common import effective_prompt_and_hotwords
+        prompt, hotwords = effective_prompt_and_hotwords(self.cfg)
         if self.kind == "openvino":
             kwargs: dict[str, Any] = {"task": "transcribe"}
             if language:
@@ -416,7 +417,7 @@ class _Backend:
                 kwargs["initial_prompt"] = prompt
             return str(self.ov_pipe.generate(audio, **kwargs))  # type: ignore[union-attr]
         segments, _ = self.fw_model.transcribe(  # type: ignore[union-attr]
-            audio, language=language, initial_prompt=prompt,
+            audio, language=language, initial_prompt=prompt, hotwords=hotwords,
             beam_size=int(self.cfg.get("beam_size", 5)),
             condition_on_previous_text=False,
             vad_filter=bool(self.cfg.get("vad_filter", True)),

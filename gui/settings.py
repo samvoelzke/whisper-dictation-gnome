@@ -52,13 +52,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "dictation"))
 from common import (  # noqa: E402
     DEFAULT_CONFIG,
+    DICTATION_MODES,
     HISTORY_FILE,
     IPC_SOCKET,
     LOG_FILE,
+    dictionary_terms,
     key_label,
     load_config,
     save_config,
 )
+
+DICT_MODE_OPTIONS = [(key, label) for key, (label, _prompt) in DICTATION_MODES.items()]
 
 
 def ipc_call(req: dict, timeout: float = 200) -> dict:
@@ -1955,6 +1959,16 @@ class PrefsDialog(Adw.PreferencesDialog):
         # ── Seite 2: KI & Kontext ────────────────────────────────────────
         page2 = Adw.PreferencesPage(title="KI & Kontext", icon_name="text-editor-symbolic")
         self.add(page2)
+        mode_group = Adw.PreferencesGroup(
+            title="Diktier-Modus",
+            description="Bestimmt, wie diktierter Text formuliert wird. "
+                        "E-Mail und Chat nutzen immer die KI, Roh nie.",
+        )
+        page2.add(mode_group)
+        self.dict_mode_row = self._combo(
+            "Modus", DICT_MODE_OPTIONS, str(self.config.get("dictation_mode", "standard")))
+        self._bind_combo(self.dict_mode_row, DICT_MODE_OPTIONS, "dictation_mode")
+        mode_group.add(self.dict_mode_row)
         llm = Adw.PreferencesGroup(
             title="Textverbesserung (Ollama)",
             description="Optionaler LLM-Schritt: entfernt Füllwörter, korrigiert "
@@ -2016,6 +2030,42 @@ class PrefsDialog(Adw.PreferencesDialog):
         prompt_scroller.set_child(self.prompt_view)
         adv.add(prompt_scroller)
 
+        # ── Seite 3: Wörterbuch ──────────────────────────────────────────
+        page3 = Adw.PreferencesPage(title="Wörterbuch", icon_name="accessories-dictionary-symbolic")
+        self.add(page3)
+
+        dict_group = Adw.PreferencesGroup(
+            title="Eigene Begriffe",
+            description="Namen, Fachbegriffe, Abkürzungen — ein Begriff pro Zeile. "
+                        "Sie fließen in die Erkennung ein und werden richtig geschrieben.",
+        )
+        page3.add(dict_group)
+        dict_group.add(self._editor_card(
+            "\n".join(dictionary_terms(self.config)), self._on_dictionary_changed))
+
+        repl_group = Adw.PreferencesGroup(
+            title="Ersetzungen",
+            description="Hartnäckige Fehlerkennungen automatisch korrigieren. "
+                        "Eine pro Zeile im Format: falsch = richtig",
+        )
+        page3.add(repl_group)
+        repl = self.config.get("replacements") or {}
+        repl_group.add(self._editor_card(
+            "\n".join(f"{k} = {v}" for k, v in repl.items()),
+            self._on_replacements_changed))
+
+        snip_group = Adw.PreferencesGroup(
+            title="Sprach-Schnipsel",
+            description="Sprich exakt den Auslöser, und der hinterlegte Text wird "
+                        "eingefügt — z. B. für Grußformeln oder Adressen. "
+                        "Eine pro Zeile: auslöser = Text (\\n = Zeilenumbruch)",
+        )
+        page3.add(snip_group)
+        snippets = self.config.get("snippets") or {}
+        snip_group.add(self._editor_card(
+            "\n".join(f"{k} = {str(v).replace(chr(10), '\\n')}" for k, v in snippets.items()),
+            self._on_snippets_changed))
+
         self.refresh_status()
 
     # ── Instant apply ─────────────────────────────────────────────────────
@@ -2054,8 +2104,50 @@ class PrefsDialog(Adw.PreferencesDialog):
                     lambda *_: self._apply_debounced(key, row.get_text().strip()))
 
     def _on_prompt_changed(self, buf) -> None:
-        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
-        self._apply_debounced("initial_prompt", text)
+        self._apply_debounced("initial_prompt", self._buffer_text(buf).strip())
+
+    # ── Wörterbuch / Ersetzungen / Schnipsel ──────────────────────────────
+
+    def _editor_card(self, initial: str, on_changed) -> Gtk.ScrolledWindow:
+        scroller = Gtk.ScrolledWindow(min_content_height=96)
+        scroller.add_css_class("card")
+        scroller.add_css_class("editor-card")
+        view = Gtk.TextView(
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            top_margin=8, bottom_margin=8, left_margin=8, right_margin=8,
+        )
+        view.get_buffer().set_text(initial)
+        view.get_buffer().connect("changed", on_changed)
+        scroller.set_child(view)
+        return scroller
+
+    @staticmethod
+    def _buffer_text(buf) -> str:
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+    def _on_dictionary_changed(self, buf) -> None:
+        words = [ln.strip() for ln in self._buffer_text(buf).splitlines() if ln.strip()]
+        self._apply_debounced("dictionary", words)
+
+    def _on_replacements_changed(self, buf) -> None:
+        self._apply_debounced(
+            "replacements", self._parse_pairs(self._buffer_text(buf), unescape=False))
+
+    def _on_snippets_changed(self, buf) -> None:
+        self._apply_debounced(
+            "snippets", self._parse_pairs(self._buffer_text(buf), unescape=True))
+
+    @staticmethod
+    def _parse_pairs(text: str, unescape: bool) -> dict:
+        pairs: dict[str, str] = {}
+        for line in text.splitlines():
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if key and value:
+                pairs[key] = value.replace("\\n", "\n") if unescape else value
+        return pairs
 
     def _apply_debounced(self, key: str, value) -> None:
         """Free-text fields save 800 ms after the last keystroke, not on each."""
@@ -2433,6 +2525,13 @@ class SettingsWindow(Adw.ApplicationWindow):
             copy.set_tooltip_text("Kopieren")
             copy.connect("clicked", lambda _b, t=text: self._copy_text(t))
             row.add_suffix(copy)
+            raw = str(entry.get("raw", "")).strip()
+            if raw and raw != text:
+                raw_btn = Gtk.Button(icon_name="edit-undo-symbolic", valign=Gtk.Align.CENTER)
+                raw_btn.add_css_class("flat")
+                raw_btn.set_tooltip_text("Rohtext kopieren (vor KI-Bearbeitung)")
+                raw_btn.connect("clicked", lambda _b, t=raw: self._copy_text(t))
+                row.add_suffix(raw_btn)
             load = Gtk.Button(label="In Werkbank", valign=Gtk.Align.CENTER)
             load.add_css_class("flat")
             load.connect("clicked", lambda _b, t=text: self._load_to_workbench(t))

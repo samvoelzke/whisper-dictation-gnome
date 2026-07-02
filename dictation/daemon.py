@@ -24,6 +24,7 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (
     CACHE_DIR,
+    DICTATION_MODES,
     HISTORY_FILE,
     HOTKEY_SPECS,
     IPC_SOCKET,
@@ -31,12 +32,15 @@ from common import (
     IS_MACOS,
     FASTER_MODEL_MAP,
     OV_MODEL_REPOS,
+    apply_replacements,
     clipboard_manager_running,
     cuda_available,
+    effective_prompt_and_hotwords,
     evdev_code_for,
     key_label,
     load_config,
     load_ov_pipeline,
+    match_snippet,
     ollama_chat,
     save_config,
 )
@@ -681,12 +685,15 @@ class WhisperDictationDaemon:
         except Exception as exc:
             print(f"[whisper-dictation] could not save config: {exc}", file=sys.stderr, flush=True)
 
-    def _append_history(self, text: str) -> None:
+    def _append_history(self, text: str, raw: str | None = None) -> None:
         if not self.config.get("save_history", True) or not text.strip():
             return
+        entry: dict[str, Any] = {"ts": time.time(), "text": text}
+        if raw and raw.strip() and raw.strip() != text.strip():
+            entry["raw"] = raw  # pre-LLM transcription, for "copy raw"
         try:
             with HISTORY_FILE.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False) + "\n")
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
             lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
             if len(lines) > 500:  # keep the file bounded
                 HISTORY_FILE.write_text("\n".join(lines[-500:]) + "\n", encoding="utf-8")
@@ -985,20 +992,38 @@ class WhisperDictationDaemon:
                 self._play_sound("done")
                 return
 
-            if self.config.get("ollama_postprocess"):
-                self._status("🤖 Verfeinere Text…", "Ollama läuft…", urgency="critical", timeout_ms=0)
-                try:
-                    text = self._ollama_postprocess(text)
-                except Exception as exc:
-                    print(f"[whisper-dictation] ollama failed, using raw: {exc}", file=sys.stderr, flush=True)
+            raw_text = text
+            snippet = match_snippet(self.config, text)
+            if snippet is not None:
+                # The utterance was exactly a snippet trigger: insert the
+                # stored text verbatim, no LLM/voice-command processing.
+                print(f"[whisper-dictation] snippet matched: {text[:40]!r}", flush=True)
+                text = snippet
+            else:
+                text = apply_replacements(self.config, text)
 
-            if self.config.get("voice_commands"):
-                text = apply_voice_commands(text)
-                if not text:
-                    self._status("Kein Text erkannt", "Nichts uebrig nach Befehlen.", timeout_ms=4000)
-                    return
+                mode = str(self.config.get("dictation_mode", "standard"))
+                _label, mode_prompt = DICTATION_MODES.get(mode, DICTATION_MODES["standard"])
+                # standard: follow the ollama_postprocess switch; email/chat:
+                # always post-process; raw: never.
+                run_llm = (
+                    bool(self.config.get("ollama_postprocess"))
+                    if mode_prompt is None else bool(mode_prompt)
+                )
+                if run_llm:
+                    self._status("🤖 Verfeinere Text…", "Ollama läuft…", urgency="critical", timeout_ms=0)
+                    try:
+                        text = self._ollama_postprocess(text, mode_prompt or None)
+                    except Exception as exc:
+                        print(f"[whisper-dictation] ollama failed, using raw: {exc}", file=sys.stderr, flush=True)
 
-            self._append_history(text)
+                if self.config.get("voice_commands"):
+                    text = apply_voice_commands(text)
+                    if not text:
+                        self._status("Kein Text erkannt", "Nichts uebrig nach Befehlen.", timeout_ms=4000)
+                        return
+
+            self._append_history(text, raw_text)
             pasted = self._paste_text(text)
             if pasted:
                 self._status("✓ Eingefügt", text[:120], timeout_ms=4000)
@@ -1017,9 +1042,9 @@ class WhisperDictationDaemon:
     def _transcribe_audio(self, audio: np.ndarray) -> str:
         lang_cfg = str(self.config.get("language") or "").strip().lower()
         language = None if lang_cfg in ("", "auto") else lang_cfg
-        initial_prompt = str(self.config.get("initial_prompt") or "").strip() or None
-
-        hotwords = str(self.config.get("hotwords") or "").strip() or None
+        # Personal dictionary terms are merged into prompt + hotwords so
+        # names/jargon are recognized correctly.
+        initial_prompt, hotwords = effective_prompt_and_hotwords(self.config)
 
         if self.backend == "openvino":
             if self.ov_pipe is None:
@@ -1065,14 +1090,22 @@ class WhisperDictationDaemon:
             result = self.model.transcribe(audio, **options)
         return str(result["text"])
 
-    def _ollama_postprocess(self, text: str) -> str:
-        # A custom system prompt (if set) overrides the default cleanup rules.
-        system = str(self.config.get("ollama_system_prompt", "")).strip() or OLLAMA_CLEANUP_SYSTEM
-        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
-        for example_in, example_out in OLLAMA_CLEANUP_SHOTS:
-            messages.append({"role": "user", "content": example_in})
-            messages.append({"role": "assistant", "content": example_out})
-        messages.append({"role": "user", "content": text})
+    def _ollama_postprocess(self, text: str, mode_prompt: str | None = None) -> str:
+        if mode_prompt:
+            # Dictation mode (email/chat): its prompt replaces the cleanup
+            # pipeline; no few-shot examples (they'd bias against reformulating).
+            messages: list[dict[str, str]] = [
+                {"role": "system", "content": mode_prompt},
+                {"role": "user", "content": text},
+            ]
+        else:
+            # A custom system prompt (if set) overrides the default cleanup rules.
+            system = str(self.config.get("ollama_system_prompt", "")).strip() or OLLAMA_CLEANUP_SYSTEM
+            messages = [{"role": "system", "content": system}]
+            for example_in, example_out in OLLAMA_CLEANUP_SHOTS:
+                messages.append({"role": "user", "content": example_in})
+                messages.append({"role": "assistant", "content": example_out})
+            messages.append({"role": "user", "content": text})
 
         print(
             f"[whisper-dictation] ollama chat model={self.config.get('ollama_model')} "

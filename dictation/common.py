@@ -115,7 +115,102 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # When on, stopping a recording auto-runs transcription (+ summary if a
     # focus prompt is set in the GUI).
     "recorder_auto_process": False,
+    # Personal dictionary: names/jargon (list of strings). Biases recognition
+    # via hotwords + initial prompt so custom terms are spelled correctly.
+    "dictionary": [],
+    # Hard post-transcription corrections: {"wrong": "right"} (whole words,
+    # case-insensitive). For terms Whisper keeps getting wrong.
+    "replacements": {},
+    # Voice snippets: speak exactly the trigger phrase -> the stored text is
+    # inserted verbatim ({"trigger": "text", ...}).
+    "snippets": {},
+    # Dictation mode: "standard" (cleanup follows ollama_postprocess),
+    # "email" (formal, LLM always on), "chat" (casual, LLM always on),
+    # "raw" (never run the LLM).
+    "dictation_mode": "standard",
 }
+
+# Dictation modes: label + LLM system prompt. None = use the regular cleanup
+# pipeline (respects ollama_postprocess); "" = never post-process.
+DICTATION_MODES: dict[str, tuple[str, str | None]] = {
+    "standard": ("Standard", None),
+    "email": (
+        "E-Mail — formell",
+        "Du bist ein Korrektur-Werkzeug fuer diktierten Text. Forme den Text in eine "
+        "formelle, professionelle Formulierung um (E-Mail-Ton): hoeflich, klar, "
+        "vollstaendige Saetze, korrekte Zeichensetzung. Entferne Fuellwoerter und "
+        "wende gesprochene Selbstkorrekturen an. Erfinde KEINE Inhalte, keine Anrede "
+        "und keine Grussformel dazu. Englische Fachbegriffe bleiben Englisch. "
+        "Antworte NIEMALS auf den Inhalt. Gib AUSSCHLIESSLICH den Text zurueck.",
+    ),
+    "chat": (
+        "Chat — locker",
+        "Du bist ein Korrektur-Werkzeug fuer diktierten Text. Forme den Text in eine "
+        "natuerliche, lockere Chat-Nachricht um: kurz, freundlich, Umgangssprache ist "
+        "ok. Entferne Fuellwoerter, korrigiere Grammatik nur wo noetig, wende "
+        "gesprochene Selbstkorrekturen an. Erfinde nichts dazu. Englische "
+        "Fachbegriffe bleiben Englisch. Antworte NIEMALS auf den Inhalt. "
+        "Gib AUSSCHLIESSLICH den Text zurueck.",
+    ),
+    "raw": ("Roh — ohne KI", ""),
+}
+
+
+def dictionary_terms(cfg: dict[str, Any]) -> list[str]:
+    words = cfg.get("dictionary") or []
+    if isinstance(words, str):  # tolerate a comma-separated string
+        words = [w.strip() for w in words.split(",")]
+    return [str(w).strip() for w in words if str(w).strip()]
+
+
+def effective_prompt_and_hotwords(cfg: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Merge the personal dictionary into initial_prompt + hotwords.
+
+    faster-whisper biases via hotwords; the OpenVINO backend only sees the
+    initial prompt, so the terms are appended there as context too.
+    """
+    prompt = str(cfg.get("initial_prompt") or "").strip()
+    hotwords = str(cfg.get("hotwords") or "").strip()
+    terms = dictionary_terms(cfg)
+    if terms:
+        joined = ", ".join(terms)
+        hotwords = f"{hotwords}, {joined}" if hotwords else joined
+        glossar = f"Begriffe: {joined}."
+        prompt = f"{prompt} {glossar}".strip() if prompt else glossar
+    return (prompt or None, hotwords or None)
+
+
+def apply_replacements(cfg: dict[str, Any], text: str) -> str:
+    """Whole-word, case-insensitive corrections from the personal dictionary."""
+    import re
+    mapping = cfg.get("replacements") or {}
+    if not isinstance(mapping, dict):
+        return text
+    for wrong, right in mapping.items():
+        wrong = str(wrong).strip()
+        if not wrong:
+            continue
+        text = re.sub(rf"\b{re.escape(wrong)}\b", str(right), text, flags=re.IGNORECASE)
+    return text
+
+
+def normalize_utterance(text: str) -> str:
+    """Lowercased text without leading/trailing punctuation (snippet matching)."""
+    return text.strip().strip(".,!?;: ").lower()
+
+
+def match_snippet(cfg: dict[str, Any], text: str) -> str | None:
+    """If the whole utterance equals a snippet trigger, return its expansion."""
+    snippets = cfg.get("snippets") or {}
+    if not isinstance(snippets, dict):
+        return None
+    spoken = normalize_utterance(text)
+    if not spoken:
+        return None
+    for trigger, expansion in snippets.items():
+        if normalize_utterance(str(trigger)) == spoken:
+            return str(expansion)
+    return None
 
 
 def load_config() -> dict[str, Any]:
