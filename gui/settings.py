@@ -1608,6 +1608,12 @@ class RecorderView(Gtk.Box):
         title_lbl.add_css_class("title-2")
         head.append(title_lbl)
         self._detail["title_lbl"] = title_lbl
+        qa_btn = Gtk.Button(icon_name="dialog-question-symbolic", valign=Gtk.Align.CENTER)
+        qa_btn.add_css_class("flat")
+        qa_btn.set_tooltip_text("Frag die Aufnahme — inhaltliche Fragen ans Transkript")
+        qa_btn.connect("clicked", lambda *_: self._open_qa(base))
+        self._detail["qa_btn"] = qa_btn
+        head.append(qa_btn)
         rename = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER)
         rename.add_css_class("flat")
         rename.set_tooltip_text("Titel bearbeiten")
@@ -1769,30 +1775,6 @@ class RecorderView(Gtk.Box):
         self._detail["nt_btn"] = nt_btn
         nt_group.add(self._row_wrap(nt_empty))
 
-        # Q&A: content questions answered strictly from the transcript
-        qa_group = Adw.PreferencesGroup(
-            title="Frag die Aufnahme",
-            description="Inhaltliche Fragen — die KI antwortet nur aus dem Transkript.",
-        )
-        box.append(qa_group)
-        self._detail["qa_group"] = qa_group
-        qa_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        qa_answers = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self._detail["qa_answers"] = qa_answers
-        qa_box.append(qa_answers)
-        qa_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        qa_entry = Gtk.Entry(hexpand=True)
-        qa_entry.set_placeholder_text("Was wurde zu … gesagt?")
-        qa_entry.connect("activate", lambda *_: self._ask_question(base))
-        self._detail["qa_entry"] = qa_entry
-        qa_row.append(qa_entry)
-        qa_send = Gtk.Button(label="Fragen")
-        qa_send.connect("clicked", lambda *_: self._ask_question(base))
-        self._detail["qa_send"] = qa_send
-        qa_row.append(qa_send)
-        qa_box.append(qa_row)
-        qa_group.add(self._row_wrap(qa_box))
-
         page = Adw.NavigationPage(title=current_title, child=scroller)
         self._detail["page"] = page
         self.nav.push(page)
@@ -1808,6 +1790,7 @@ class RecorderView(Gtk.Box):
     def _detail_menu_button(self, base) -> Gtk.MenuButton:
         actions = Gio.SimpleActionGroup()
         for name, callback in (
+            ("ask", lambda: self._open_qa(base)),
             ("export-obsidian", lambda: self._export_obsidian(base)),
             ("retranscribe", lambda: self._confirm_retranscribe(base)),
             ("open-folder", self._open_folder),
@@ -1819,6 +1802,7 @@ class RecorderView(Gtk.Box):
             actions.add_action(action)
         menu = Gio.Menu()
         section = Gio.Menu()
+        section.append("Frag die Aufnahme …", "detail.ask")
         section.append("Nach Obsidian exportieren", "detail.export-obsidian")
         section.append("Erneut transkribieren", "detail.retranscribe")
         section.append("Ordner öffnen", "detail.open-folder")
@@ -1954,7 +1938,54 @@ class RecorderView(Gtk.Box):
         dlg.connect("response", on_resp)
         dlg.present(self.get_root())
 
-    # ── detail: Q&A (Frag die Aufnahme) ──────────────────────────────────────
+    # ── detail: Q&A (Frag die Aufnahme) — dezenter On-Demand-Dialog ──────────
+
+    def _open_qa(self, base) -> None:
+        if not (RECORDINGS_DIR / f"{base}.txt").exists():
+            self._toast("Erst transkribieren — dann kannst du Fragen stellen.")
+            return
+        dlg = self._detail.get("qa_dialog")
+        if dlg is None:
+            dlg = Adw.Dialog(title="Frag die Aufnahme",
+                             content_width=560, content_height=520)
+            toolbar = Adw.ToolbarView()
+            toolbar.add_top_bar(Adw.HeaderBar())
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                            margin_top=6, margin_bottom=12,
+                            margin_start=14, margin_end=14)
+
+            scroller = Gtk.ScrolledWindow(vexpand=True)
+            qa_answers = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+            self._detail["qa_answers"] = qa_answers
+            hint = Gtk.Label(
+                label="Stell eine inhaltliche Frage zur Aufnahme —\n"
+                      "die KI antwortet nur aus dem Transkript.",
+                justify=Gtk.Justification.CENTER, vexpand=True,
+                valign=Gtk.Align.CENTER)
+            hint.add_css_class("dim-label")
+            self._detail["qa_hint"] = hint
+            qa_answers.append(hint)
+            scroller.set_child(qa_answers)
+            outer.append(scroller)
+
+            qa_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            qa_entry = Gtk.Entry(hexpand=True)
+            qa_entry.set_placeholder_text("Was wurde zu … gesagt?")
+            qa_entry.connect("activate", lambda *_: self._ask_question(base))
+            self._detail["qa_entry"] = qa_entry
+            qa_row.append(qa_entry)
+            qa_send = Gtk.Button(label="Fragen")
+            qa_send.add_css_class("suggested-action")
+            qa_send.connect("clicked", lambda *_: self._ask_question(base))
+            self._detail["qa_send"] = qa_send
+            qa_row.append(qa_send)
+            outer.append(qa_row)
+
+            toolbar.set_content(outer)
+            dlg.set_child(toolbar)
+            self._detail["qa_dialog"] = dlg
+        dlg.present(self.get_root())
+        self._detail["qa_entry"].grab_focus()
 
     def _ask_question(self, base) -> None:
         entry = self._detail.get("qa_entry")
@@ -1965,6 +1996,9 @@ class RecorderView(Gtk.Box):
             return
         self._qa_busy = True
         entry.set_text("")
+        hint = self._detail.get("qa_hint")
+        if hint is not None and hint.get_parent() is not None:
+            self._detail["qa_answers"].remove(hint)
         send = self._detail.get("qa_send")
         if send is not None:
             send.set_sensitive(False)
@@ -2068,6 +2102,12 @@ class RecorderView(Gtk.Box):
             self._toast(f"Export fehlgeschlagen: {exc}")
 
     def _on_popped(self, _nav, _page):
+        qa_dialog = self._detail.get("qa_dialog")
+        if qa_dialog is not None:
+            try:
+                qa_dialog.force_close()
+            except Exception:
+                pass
         self._detail_base = None
         self._detail = {}
         self._stop_play()
@@ -2108,11 +2148,11 @@ class RecorderView(Gtk.Box):
         self._detail["nt_scroller"].set_visible(has_notes)
         self._detail["nt_actions"].set_visible(has_notes)
         self._detail["nt_empty"].set_visible(not has_notes and not busy)
-        # can only summarize once a transcript exists
+        # can only summarize/ask once a transcript exists
         if not has_notes:
             self._detail["nt_btn"].set_sensitive(has_txt)
-        if self._detail.get("qa_group") is not None:
-            self._detail["qa_group"].set_visible(has_txt)
+        if self._detail.get("qa_btn") is not None:
+            self._detail["qa_btn"].set_sensitive(has_txt)
         self._update_detail_progress(base)
 
     def _update_detail_progress(self, base):
