@@ -210,7 +210,8 @@ Quelle (Mic + System / System / Mic) wechselst du mit einem Klick per
 Toggle-Gruppe. Pro Aufnahme gibt es eine **Detail-Seite** mit richtigem
 **Audio-Player (Spulen, ±10 s, Pause, Lautstärke)**, klickbaren
 Zeitmarken, **Suche im Transkript** (mit Treffer-Hervorhebung), editierbarem
-Transkript und Notizen. Über das ⋮-Menü: Obsidian-Export, erneut
+Transkript, Notizen und **„Frag die Aufnahme"** (inhaltliche Fragen, von der
+KI nur aus dem Transkript beantwortet). Über das ⋮-Menü: Obsidian-Export, erneut
 transkribieren, **„Audio entfernen, Transkript behalten"** (spart bei
 Vorlesungen ~40 MB pro Stunde) und Löschen. Die Visualisierung ist in den
 Einstellungen umschaltbar: **Wellen / Balken / Aus**.
