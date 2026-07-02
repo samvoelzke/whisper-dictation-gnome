@@ -227,6 +227,23 @@ def apply_voice_commands(text: str) -> str:
     out = _re.sub(r"[ \t]*\n[ \t]*", "\n", out)      # trim spaces around newlines
     return out.strip()
 
+# Clipboard managers with their own history (process names, matched whole).
+# Restoring the previous clipboard after a paste would land as the newest
+# entry in their history and push the fresh dictation down to slot 2 — so
+# the restore is skipped while one of these is running (the previous content
+# is preserved in the manager's history anyway).
+_CLIPBOARD_MANAGERS = r"vicinae-server|vicinae|copyq|gpaste-daemon|cliphist|clipman|clipse|parcellite"
+
+
+def clipboard_manager_running() -> bool:
+    try:
+        return subprocess.run(
+            ["pgrep", "-x", _CLIPBOARD_MANAGERS], capture_output=True,
+        ).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 # Linux input event codes for ydotool paste injection.
 _YDOTOOL_KEYS = {
     "ctrl_v": ["29:1", "47:1", "47:0", "29:0"],
@@ -1394,12 +1411,19 @@ class WhisperDictationDaemon:
         # after pasting, so dictation doesn't clobber what the user had copied.
         saved: bytes | None = None
         if restore and self.config.get("restore_clipboard", True) and shutil_which("wl-paste"):
-            try:
-                saved = subprocess.run(
-                    ["wl-paste", "-n"], capture_output=True, timeout=2
-                ).stdout
-            except Exception:
-                saved = None
+            if clipboard_manager_running():
+                print(
+                    "[whisper-dictation] clipboard manager running; "
+                    "skipping restore (keeps dictation on top of its history)",
+                    flush=True,
+                )
+            else:
+                try:
+                    saved = subprocess.run(
+                        ["wl-paste", "-n"], capture_output=True, timeout=2
+                    ).stdout
+                except Exception:
+                    saved = None
 
         subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=True)
         time.sleep(0.08)

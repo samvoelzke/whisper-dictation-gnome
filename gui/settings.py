@@ -1890,7 +1890,9 @@ class SettingsWindow(Adw.ApplicationWindow):
         inp.add(self.sound_row)
         self.clipboard_row = Adw.SwitchRow(
             title="Zwischenablage schonen",
-            subtitle="Inhalt nach dem Einfügen wiederherstellen",
+            subtitle="Inhalt nach dem Einfügen wiederherstellen. Pausiert automatisch, "
+                     "wenn ein Clipboard-Manager (z. B. Vicinae) läuft — so bleibt das "
+                     "Diktat dort an erster Stelle.",
         )
         self.clipboard_row.set_active(bool(self.config.get("restore_clipboard", True)))
         inp.add(self.clipboard_row)
