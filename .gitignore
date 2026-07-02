@@ -14,3 +14,7 @@ whisper/
 *.pid
 *.wav
 app/AppIcon.iconset/
+
+# Build-Artefakte (macOS pkg)
+*.pkg
+*.pkg.zip

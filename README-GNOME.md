@@ -138,6 +138,49 @@ Dann in der GUI **„Ollama-Nachbearbeitung"** einschalten (oder
 auf den Rohtext zurück. Kleinere Modelle (< 7B) neigen dazu, den Text zu
 *beantworten* statt zu korrigieren — `qwen2.5:7b` ist der getestete Sweet Spot.
 
+## Rekorder (Langaufnahmen: Vorlesungen & Calls)
+
+Zusätzlich zum Live-Diktat gibt es im GUI den Tab **„Rekorder"** für stunden­lange
+Aufnahmen (Vorlesungen, Meetings, Zoom/Teams-Calls). Bewusst dreistufig, damit
+ein Absturz nicht alles verliert:
+
+1. **Aufnahme** – `ffmpeg` schreibt **laufend** eine Opus-Datei (3 h ≈ ~40 MB).
+   Quelle wählbar: **Mikrofon + System-Ton** (Standard), nur System-Ton
+   (PipeWire-Monitor – für Online-Calls/Videos) oder nur Mikrofon.
+2. **Transkription** – erst nach der Aufnahme, in **~5-Minuten-Chunks** über das
+   Whisper-Backend (Standard `large-v3`). Chunk-Grenzen werden an **Sprechpausen
+   ausgerichtet** (Silence-Detection), damit keine Wörter zerschnitten werden.
+   Teil-Transkript + Fortschritt werden nach **jedem** Chunk gespeichert →
+   abbruchsicher und fortsetzbar (auch nach Absturz/Kill, inkl. abgeschnittener
+   Dateien ohne Dauer-Metadaten). Chunk-Länge: `recorder_chunk_seconds`.
+3. **Zusammenfassung** – optional via Ollama (Map-Reduce). Du gibst einen
+   **Fokus-Prompt** an (z. B. „prüfungsrelevante Definitionen") und bekommst
+   strukturierte Notizen.
+
+Im GUI gibt's außerdem live **Pegel-/Wellen-Anzeigen** (sehen, ob Ton ankommt —
+auch vor der Aufnahme), Pause/Fortsetzen, sichtbare Optionen (Geräte, Modell,
+Qualität, Sprache, Chunk-Länge) und pro Aufnahme eine **Detail-Seite** (Audio
+abspielen, Transkript bearbeiten, Notizen, umbenennen, exportieren). Die
+Visualisierung ist in den Einstellungen umschaltbar: **Wellen / Balken / Aus**
+(gilt für Werkbank und Rekorder).
+
+Dateien liegen unter `~/.local/share/whisper-dictation/recordings/`
+(`.opus`, `.txt`, `.summary.md`). CLI direkt nutzbar:
+
+```bash
+bin/whisper-recorder.sh record-start --source both --title "Vorlesung"
+bin/whisper-recorder.sh record-stop
+bin/whisper-recorder.sh transcribe <id> --model large-v3
+bin/whisper-recorder.sh summarize  <id> --focus "Action-Items"
+```
+
+> **Hinweis:** Das Mitschneiden des nicht-öffentlich gesprochenen Worts anderer
+> ohne deren Einwilligung ist in DE rechtlich heikel (§201 StGB). Eigene
+> Vorlesungen / Aufnahmen mit Einwilligung sind unproblematisch.
+
+Braucht `ffmpeg`/`ffprobe` und `pactl` (PipeWire):
+`sudo dnf install ffmpeg-free pipewire-utils`.
+
 ## Logs
 
 `~/.cache/whisper-dictation/daemon.log`

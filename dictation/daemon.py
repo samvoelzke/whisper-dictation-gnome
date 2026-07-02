@@ -86,6 +86,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Command mode: double-tap this key, speak an instruction, and the AI
     # rewrites the currently selected text in place ("" = disabled).
     "command_key": "",
+    # Long-form recorder (lectures/calls) — separate from live dictation.
+    # Default audio source: "both" (mic + system) | "system" | "mic".
+    "recorder_source": "both",
+    # Whisper model for recordings (large-v3 = most accurate, slower).
+    "recorder_model": "large-v3",
+    # Transcription chunk length in seconds (crash-safe partial saves).
+    "recorder_chunk_seconds": 300,
+    # Recorder language ("" = fall back to the global `language`).
+    "recorder_language": "",
+    # Preferred capture devices for the recorder ("" = system default).
+    "recorder_mic_device": "",
+    "recorder_monitor_device": "",
+    # GUI live audio visualization: "waves" | "bar" | "none".
+    "audio_visualizer": "waves",
+    # Opus bitrate; 32k mono is plenty for speech and tiny for hour-long files.
+    "recorder_bitrate": "32k",
+    # When on, stopping a recording auto-runs transcription (+ summary if a
+    # focus prompt is set in the GUI).
+    "recorder_auto_process": False,
 }
 
 # Hotkey spec per logical name:

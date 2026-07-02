@@ -263,33 +263,38 @@ class OllamaWizard(tk.Tk):
 
         def run():
             import json as _json
-            proc = subprocess.Popen(
-                ["ollama", "pull", model],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            import urllib.request
+            req = urllib.request.Request(
+                "http://localhost:11434/api/pull",
+                data=_json.dumps({"name": model, "stream": True}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
-            total = 0
-            completed = 0
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = _json.loads(line)
-                    t = data.get("total", 0) or 0
-                    c = data.get("completed", 0) or 0
-                    status = data.get("status", "")
-                    if t > 0:
-                        total, completed = t, c
-                        pct = min(int(c / t * 100), 100)
-                        mb_done = c / (1024 ** 2)
-                        mb_total = t / (1024 ** 2)
-                        label = f"Lade {model}… {pct}%  ({mb_done:.0f} / {mb_total:.0f} MB)"
-                        self.after(0, lambda l=label, p=pct: self._update_progress(l, p))
-                    elif status:
-                        self.after(0, lambda s=status: self.progress_label.config(text=s, fg="#FF9500"))
-                except Exception:
-                    pass
-            proc.wait()
+            try:
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    for raw in resp:
+                        line = raw.decode().strip()
+                        if not line:
+                            continue
+                        try:
+                            data = _json.loads(line)
+                            t = data.get("total", 0) or 0
+                            c = data.get("completed", 0) or 0
+                            status = data.get("status", "")
+                            if t > 0:
+                                pct = min(int(c / t * 100), 100)
+                                mb_done = c / (1024 ** 2)
+                                mb_total = t / (1024 ** 2)
+                                label = f"Lade {model}… {pct}%  ({mb_done:.0f} / {mb_total:.0f} MB)"
+                                self.after(0, lambda l=label, p=pct: self._update_progress(l, p))
+                            elif status:
+                                self.after(0, lambda s=status: self.progress_label.config(text=s, fg="#FF9500"))
+                        except Exception:
+                            pass
+            except Exception as e:
+                self.after(0, lambda: self.progress_label.config(
+                    text=f"✗ Fehler: {e}", fg="#FF3B30"))
+                return
             self.after(0, lambda: self._download_done(model))
 
         threading.Thread(target=run, daemon=True).start()

@@ -58,16 +58,21 @@ step "System-Pakete installieren..."
 brew list portaudio &>/dev/null || brew install portaudio
 ok "portaudio"
 
-# tkinter für Settings-GUI
-brew list "python-tk@${PY_VERSION}" &>/dev/null || brew install "python-tk@${PY_VERSION}" 2>/dev/null || \
-  warn "python-tk@${PY_VERSION} nicht verfügbar – GUI könnte eingeschränkt sein"
+# tkinter für Settings-GUI (für alle installierten Python-Versionen)
+for _tkver in "${PY_VERSION}" 3.14 3.13 3.12 3.11; do
+  if brew list "python@${_tkver}" &>/dev/null 2>&1; then
+    brew list "python-tk@${_tkver}" &>/dev/null || \
+      brew install "python-tk@${_tkver}" 2>/dev/null || \
+      warn "python-tk@${_tkver} nicht verfügbar"
+  fi
+done
 ok "python-tk"
 
 # Ollama (optional – für Text-Cleanup nach Transkription)
 if ! command -v ollama &>/dev/null; then
   echo ""
   read -r -p "  Ollama installieren? (für KI-Textkorrektur nach Diktat) [j/N] " INSTALL_OLLAMA
-  if [[ "${INSTALL_OLLAMA,,}" == "j" ]]; then
+  if [[ "$(echo "$INSTALL_OLLAMA" | tr '[:upper:]' '[:lower:]')" == "j" ]]; then
     brew install ollama
     ok "Ollama installiert"
   else

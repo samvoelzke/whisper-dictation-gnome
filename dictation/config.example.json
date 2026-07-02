@@ -19,5 +19,14 @@
   "ollama_postprocess": false,
   "ollama_model": "qwen2.5:7b",
   "llm_toggle_key": "",
-  "command_key": ""
+  "command_key": "",
+  "recorder_source": "both",
+  "recorder_model": "large-v3",
+  "recorder_bitrate": "32k",
+  "recorder_chunk_seconds": 300,
+  "recorder_language": "",
+  "recorder_mic_device": "",
+  "recorder_monitor_device": "",
+  "recorder_auto_process": false,
+  "audio_visualizer": "waves"
 }

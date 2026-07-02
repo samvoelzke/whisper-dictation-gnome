@@ -19,12 +19,13 @@ mkdir -p "${AUTOSTART_DIR}" "${APPLICATIONS_DIR}" "${CONFIG_DIR}" "${SYSTEMD_USE
 
 # ── System dependencies (best effort hint) ─────────────────────────────────
 missing=()
-for tool in arecord wl-copy ydotool notify-send; do
+for tool in arecord wl-copy ydotool notify-send ffmpeg ffprobe pactl; do
   command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
 done
 if ((${#missing[@]})); then
   echo "WARNUNG: Folgende Tools fehlen: ${missing[*]}"
-  echo "  Auf Fedora:  sudo dnf install alsa-utils wl-clipboard ydotool libnotify"
+  echo "  (ffmpeg/ffprobe/pactl werden vom Rekorder fuer Langaufnahmen gebraucht.)"
+  echo "  Auf Fedora:  sudo dnf install alsa-utils wl-clipboard ydotool libnotify ffmpeg-free pipewire-utils"
   echo "  (Installation laeuft trotzdem weiter.)"
 fi
 

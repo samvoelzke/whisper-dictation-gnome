@@ -9,12 +9,7 @@ DAEMON_PATTERN='dictation/daemon.py'
 mkdir -p "${LOG_DIR}"
 
 start_daemon() {
-  if pgrep -f "${DAEMON_PATTERN}" >/dev/null 2>&1; then
-    echo "Daemon läuft bereits."
-    return
-  fi
-  nohup "${ROOT}/.venv/bin/python" -u "${ROOT}/dictation/daemon.py" \
-    >> "${LOG_DIR}/daemon.log" 2>&1 &
+  launchctl load "${PLIST}" 2>/dev/null || true
   sleep 2
   if pgrep -f "${DAEMON_PATTERN}" >/dev/null 2>&1; then
     echo "Daemon gestartet."
@@ -25,6 +20,7 @@ start_daemon() {
 }
 
 stop_daemon() {
+  launchctl unload "${PLIST}" 2>/dev/null || true
   pkill -f "${DAEMON_PATTERN}" 2>/dev/null || true
   for _ in {1..20}; do
     pgrep -f "${DAEMON_PATTERN}" >/dev/null 2>&1 || { echo "Daemon gestoppt."; return; }
