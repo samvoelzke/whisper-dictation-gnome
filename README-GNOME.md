@@ -197,11 +197,15 @@ ein Absturz nicht alles verliert:
    strukturierte Notizen.
 
 Im GUI gibt's außerdem live **Pegel-/Wellen-Anzeigen** (sehen, ob Ton ankommt —
-auch vor der Aufnahme), Pause/Fortsetzen, sichtbare Optionen (Geräte, Modell,
-Qualität, Sprache, Chunk-Länge) und pro Aufnahme eine **Detail-Seite** (Audio
-abspielen, Transkript bearbeiten, Notizen, umbenennen, exportieren). Die
-Visualisierung ist in den Einstellungen umschaltbar: **Wellen / Balken / Aus**
-(gilt für Werkbank und Rekorder).
+auch vor der Aufnahme), Pause/Fortsetzen und während der Aufnahme die
+**wachsende Dateigröße** (Beweis, dass wirklich geschrieben wird). Die
+Aufnahmen-Liste ist **nach Datum gruppiert** (Heute/Gestern/Diese Woche/Älter),
+und jede Zeile kann direkt **angehört** (▶) und **gelöscht** werden. Die
+Quelle (Mic + System / System / Mic) wechselst du mit einem Klick per
+Toggle-Gruppe. Pro Aufnahme gibt es eine **Detail-Seite** mit richtigem
+**Audio-Player (Spulen, Pause, Lautstärke)**, editierbarem Transkript,
+Notizen und Umbenennen. Die Visualisierung ist in den Einstellungen
+umschaltbar: **Wellen / Balken / Aus** (gilt für Werkbank und Rekorder).
 
 Dateien liegen unter `~/.local/share/whisper-dictation/recordings/`
 (`.opus`, `.txt`, `.summary.md`). CLI direkt nutzbar:

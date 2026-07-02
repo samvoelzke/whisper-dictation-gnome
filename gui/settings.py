@@ -371,6 +371,28 @@ def fmt_duration(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d} h" if h else f"{m}:{s:02d} min"
 
 
+def fmt_size(num_bytes: int) -> str:
+    mb = num_bytes / (1024 * 1024)
+    return f"{mb:.0f} MB" if mb >= 10 else f"{mb:.1f} MB"
+
+
+def date_bucket(created_iso: str) -> str:
+    """Group label for the recordings list (Heute/Gestern/Diese Woche/Älter)."""
+    import datetime as _dt
+    try:
+        d = _dt.datetime.fromisoformat(created_iso).date()
+    except (ValueError, TypeError):
+        return "Älter"
+    today = _dt.date.today()
+    if d == today:
+        return "Heute"
+    if d == today - _dt.timedelta(days=1):
+        return "Gestern"
+    if d >= today - _dt.timedelta(days=6):
+        return "Diese Woche"
+    return "Älter"
+
+
 def key_options(base: list, current: str) -> list:
     """Return base options, appending the current key if it's a captured one."""
     opts = list(base)
@@ -774,6 +796,11 @@ class RecorderView(Gtk.Box):
         self._play_proc = None
         self._play_timer = None
         self._play_start = 0.0
+        self._media = None              # native detail player (Gtk.MediaFile)
+        # inline row preview (one at a time)
+        self._preview_media = None
+        self._preview_base = None
+        self._preview_btn = None
 
         self.nav = Adw.NavigationView()
         self.append(self.nav)
@@ -882,10 +909,25 @@ class RecorderView(Gtk.Box):
             description="Für Vorlesungen und Calls. Wird laufend gespeichert — "
                         "ein Absturz kostet höchstens die letzten Sekunden.")
         outer.append(ctl)
-        self.source_row = self._combo("Quelle", REC_SOURCE_OPTIONS,
-                                      str(cfg.get("recorder_source", "both")))
-        self.source_row.connect("notify::selected", self._on_source_changed)
-        ctl.add(self.source_row)
+        current_source = str(cfg.get("recorder_source", "both"))
+        if hasattr(Adw, "ToggleGroup"):
+            # One-click switching between call (Mic+System) and lecture (Mic).
+            source_row = Adw.ActionRow(title="Quelle")
+            self._source_toggle = Adw.ToggleGroup(valign=Gtk.Align.CENTER)
+            for value, label in (("both", "Mic + System"), ("system", "System"), ("mic", "Mic")):
+                toggle = Adw.Toggle(label=label)
+                toggle.set_name(value)
+                self._source_toggle.add(toggle)
+            self._source_toggle.set_active_name(current_source)
+            self._source_toggle.connect("notify::active", self._on_source_changed)
+            source_row.add_suffix(self._source_toggle)
+            self.source_row = None
+            ctl.add(source_row)
+        else:
+            self._source_toggle = None
+            self.source_row = self._combo("Quelle", REC_SOURCE_OPTIONS, current_source)
+            self.source_row.connect("notify::selected", self._on_source_changed)
+            ctl.add(self.source_row)
         self.title_row = Adw.EntryRow(title="Titel (optional)")
         ctl.add(self.title_row)
 
@@ -967,13 +1009,9 @@ class RecorderView(Gtk.Box):
         self.timer_label.add_css_class("numeric")
         ctlbox.append(self.timer_label)
 
-        self.list_group = Adw.PreferencesGroup(title="Aufnahmen")
-        refresh = Gtk.Button(icon_name="view-refresh-symbolic", valign=Gtk.Align.CENTER)
-        refresh.add_css_class("flat")
-        refresh.set_tooltip_text("Aktualisieren")
-        refresh.connect("clicked", lambda *_: self.refresh())
-        self.list_group.set_header_suffix(refresh)
-        outer.append(self.list_group)
+        # Recordings are grouped by date (Heute/Gestern/…) at refresh time.
+        self._list_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        outer.append(self._list_container)
 
         self._empty_status = Adw.StatusPage(
             icon_name="audio-input-microphone-symbolic",
@@ -987,8 +1025,13 @@ class RecorderView(Gtk.Box):
         self.refresh()
         return scroller
 
+    def _current_source(self) -> str:
+        if self._source_toggle is not None:
+            return self._source_toggle.get_active_name() or "both"
+        return self._cv(self.source_row, REC_SOURCE_OPTIONS)
+
     def _on_source_changed(self, *_):
-        self._persist("recorder_source", self._cv(self.source_row, REC_SOURCE_OPTIONS))
+        self._persist("recorder_source", self._current_source())
         if self._meters_on:
             self._start_meters()
 
@@ -1019,7 +1062,7 @@ class RecorderView(Gtk.Box):
             return
         self._meters_on = True
         self._sync_meters_visibility()
-        src = self._cv(self.source_row, REC_SOURCE_OPTIONS)
+        src = self._current_source()
         mic = self._cv(self.mic_row, self._mic_opts) or self._default_mic
         mon = self._cv(self.mon_row, self._mon_opts) or self._default_monitor
         if src in ("both", "mic") and mic:
@@ -1094,7 +1137,7 @@ class RecorderView(Gtk.Box):
             self._stop_record()
 
     def _start_record(self):
-        src = self._cv(self.source_row, REC_SOURCE_OPTIONS)
+        src = self._current_source()
         title = self.title_row.get_text().strip()
         mic = self._cv(self.mic_row, self._mic_opts)
         mon = self._cv(self.mon_row, self._mon_opts)
@@ -1196,7 +1239,17 @@ class RecorderView(Gtk.Box):
             el = GLib.get_monotonic_time() / 1e6 - self._rec_start
             self.timer_label.remove_css_class("warning")
             self.timer_label.add_css_class("error")
-        self.timer_label.set_text(f"● {int(el) // 60}:{int(el) % 60:02d}")
+        text = f"● {int(el) // 60}:{int(el) % 60:02d}"
+        # Growing file size = visible proof the recording is really being
+        # written (reassuring during hour-long calls).
+        if not self._paused and self._recording_base:
+            try:
+                size = (RECORDINGS_DIR / f"{self._recording_base}.opus").stat().st_size
+                if size > 0:
+                    text += f" · {fmt_size(size)}"
+            except OSError:
+                pass
+        self.timer_label.set_text(text)
         return True
 
     def _apply_record_status(self, r: dict):
@@ -1231,18 +1284,35 @@ class RecorderView(Gtk.Box):
 
     def _apply_refresh(self, status: dict, data: dict):
         self._apply_record_status(status)
-        for row in self._rows_by_base.values():
-            self.list_group.remove(row)
+        child = self._list_container.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self._list_container.remove(child)
+            child = nxt
         self._rows_by_base = {}
         items = data.get("recordings", []) if isinstance(data, dict) else []
         has_items = bool(items)
-        self.list_group.set_visible(has_items)
+        self._list_container.set_visible(has_items)
         if hasattr(self, "_empty_status"):
             self._empty_status.set_visible(not has_items)
         if not has_items:
             return False
-        for item in items:
-            self._add_row(item)
+        groups: dict[str, Adw.PreferencesGroup] = {}
+        for item in items:  # already sorted newest-first
+            bucket = date_bucket(str(item.get("created", "")))
+            group = groups.get(bucket)
+            if group is None:
+                group = Adw.PreferencesGroup(title=bucket)
+                if not groups:  # first (newest) group carries the refresh button
+                    refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic",
+                                             valign=Gtk.Align.CENTER)
+                    refresh_btn.add_css_class("flat")
+                    refresh_btn.set_tooltip_text("Aktualisieren")
+                    refresh_btn.connect("clicked", lambda *_: self.refresh())
+                    group.set_header_suffix(refresh_btn)
+                groups[bucket] = group
+                self._list_container.append(group)
+            self._add_row(item, group)
         if self._busy and self._poll_id is None:
             self._poll_id = GLib.timeout_add(400, self._poll_progress)
         return False
@@ -1250,16 +1320,21 @@ class RecorderView(Gtk.Box):
     def _status_line(self, item):
         parts = [fmt_duration(item.get("duration_seconds", 0)),
                  REC_SOURCE_SHORT.get(item.get("source", ""), item.get("source", ""))]
+        try:
+            parts.append(fmt_size((RECORDINGS_DIR / f"{item['base']}.opus").stat().st_size))
+        except OSError:
+            pass
         if item.get("transcribed"):
             parts.append("✓ Transkript")
         if item.get("summarized"):
             parts.append("✓ Notizen")
         return " · ".join(p for p in parts if p)
 
-    def _add_row(self, item):
+    def _add_row(self, item, group):
         base = item["base"]
-        row = Adw.ActionRow(title=item.get("title", base))
-        self.list_group.add(row)
+        row = Adw.ActionRow()
+        row.set_title(GLib.markup_escape_text(item.get("title", base)))
+        group.add(row)
         self._rows_by_base[base] = row
         if item.get("recording"):
             row.set_subtitle("● nimmt auf …")
@@ -1284,11 +1359,21 @@ class RecorderView(Gtk.Box):
             row.add_suffix(Gtk.Spinner(spinning=True, valign=Gtk.Align.CENTER))
             return
         row.set_subtitle(self._status_line(item))
+        play = Gtk.Button(icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER)
+        play.add_css_class("flat")
+        play.set_tooltip_text("Anhören")
+        play.connect("clicked", lambda b, x=base: self._toggle_row_preview(x, b))
+        row.add_suffix(play)
         if not item.get("transcribed"):
             b = Gtk.Button(label="Transkribieren", valign=Gtk.Align.CENTER)
             b.add_css_class("flat")
             b.connect("clicked", lambda _b, x=base: self._transcribe(x))
             row.add_suffix(b)
+        trash = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
+        trash.add_css_class("flat")
+        trash.set_tooltip_text("Löschen")
+        trash.connect("clicked", lambda _b, x=base: self._delete(x))
+        row.add_suffix(trash)
         row.add_suffix(Gtk.Image(icon_name="go-next-symbolic", valign=Gtk.Align.CENTER))
 
     # ── transcribe / summarize (background) ──────────────────────────────────
@@ -1497,19 +1582,36 @@ class RecorderView(Gtk.Box):
             REC_SOURCE_SHORT.get(meta.get("source", ""), meta.get("source", "")),
         ] if p)
         player = Adw.ActionRow(title="Audio", subtitle=meta_line)
-        play_btn = Gtk.Button(icon_name="media-playback-start-symbolic",
-                              valign=Gtk.Align.CENTER)
-        play_btn.set_tooltip_text("Abspielen")
-        play_btn.add_css_class("flat")
-        play_lbl = Gtk.Label(label="")
-        play_lbl.add_css_class("numeric")
-        play_lbl.add_css_class("dim-label")
-        play_btn.connect("clicked", lambda *_: self._toggle_play(base, play_btn, play_lbl))
-        player.add_suffix(play_lbl)
-        player.add_suffix(play_btn)
-        self._detail["play_btn"] = play_btn
-        self._detail["play_lbl"] = play_lbl
         info.add(player)
+        audio_path = RECORDINGS_DIR / f"{base}.opus"
+        if hasattr(Gtk, "MediaControls") and audio_path.exists():
+            # Native seekable player (play/pause, scrubbing, volume) — for
+            # jumping to minute 47 of a lecture instead of ffplay's
+            # start/stop-only playback.
+            self._media = Gtk.MediaFile.new_for_filename(str(audio_path))
+            controls = Gtk.MediaControls(media_stream=self._media)
+            controls.set_hexpand(True)
+            controls.set_margin_top(4)
+            controls.set_margin_bottom(4)
+            controls.set_margin_start(8)
+            controls.set_margin_end(8)
+            controls_row = Gtk.ListBoxRow(activatable=False, selectable=False,
+                                          child=controls)
+            info.add(controls_row)
+        else:
+            # Fallback without a GStreamer GTK backend: simple ffplay toggle.
+            play_btn = Gtk.Button(icon_name="media-playback-start-symbolic",
+                                  valign=Gtk.Align.CENTER)
+            play_btn.set_tooltip_text("Abspielen")
+            play_btn.add_css_class("flat")
+            play_lbl = Gtk.Label(label="")
+            play_lbl.add_css_class("numeric")
+            play_lbl.add_css_class("dim-label")
+            play_btn.connect("clicked", lambda *_: self._toggle_play(base, play_btn, play_lbl))
+            player.add_suffix(play_lbl)
+            player.add_suffix(play_btn)
+            self._detail["play_btn"] = play_btn
+            self._detail["play_lbl"] = play_lbl
 
         # progress (transcription / summary)
         prog_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -1841,6 +1943,15 @@ class RecorderView(Gtk.Box):
             pass
 
     def _stop_play(self):
+        # native detail player
+        if self._media is not None:
+            try:
+                self._media.pause()
+            except Exception:
+                pass
+            self._media = None
+        self._stop_row_preview()
+        # ffplay fallback
         if self._play_timer is not None:
             GLib.source_remove(self._play_timer)
             self._play_timer = None
@@ -1852,6 +1963,46 @@ class RecorderView(Gtk.Box):
             self._play_proc = None
         if self._detail.get("play_btn"):
             self._reset_play_button(self._detail["play_btn"], self._detail.get("play_lbl"))
+
+    # ── inline row preview (listen without opening the detail page) ──────────
+    def _toggle_row_preview(self, base, btn):
+        if self._preview_base == base:
+            self._stop_row_preview()
+            return
+        self._stop_row_preview()
+        path = RECORDINGS_DIR / f"{base}.opus"
+        if not path.exists() or not hasattr(Gtk, "MediaControls"):
+            self._open_detail(base)   # fallback: detail page has a player
+            return
+        try:
+            media = Gtk.MediaFile.new_for_filename(str(path))
+        except Exception:
+            self._toast("Wiedergabe nicht möglich.")
+            return
+        self._preview_media = media
+        self._preview_base = base
+        self._preview_btn = btn
+        btn.set_icon_name("media-playback-stop-symbolic")
+        btn.set_tooltip_text("Stopp")
+        media.connect("notify::ended",
+                      lambda m, _p: self._stop_row_preview() if m is self._preview_media else None)
+        media.play()
+
+    def _stop_row_preview(self):
+        if self._preview_media is not None:
+            try:
+                self._preview_media.pause()
+            except Exception:
+                pass
+        if self._preview_btn is not None:
+            try:
+                self._preview_btn.set_icon_name("media-playback-start-symbolic")
+                self._preview_btn.set_tooltip_text("Anhören")
+            except Exception:
+                pass
+        self._preview_media = None
+        self._preview_base = None
+        self._preview_btn = None
 
 
 # Changing these keys re-grabs the evdev listener, which only happens at
