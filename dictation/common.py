@@ -115,6 +115,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # When on, stopping a recording auto-runs transcription (+ summary if a
     # focus prompt is set in the GUI).
     "recorder_auto_process": False,
+    # After transcription, let Ollama suggest a short title when the
+    # recording still has the default one.
+    "recorder_auto_title": True,
+    # Obsidian vault folder for exporting transcripts/notes ("" = ask once).
+    "obsidian_vault": "",
     # Personal dictionary: names/jargon (list of strings). Biases recognition
     # via hotwords + initial prompt so custom terms are spelled correctly.
     "dictionary": [],

@@ -968,6 +968,23 @@ class RecorderView(Gtk.Box):
         self.auto_row.connect("notify::active",
                               lambda *_: self._persist("recorder_auto_process", bool(self.auto_row.get_active())))
         opt.add_row(self.auto_row)
+        self.auto_title_row = Adw.SwitchRow(
+            title="Titel automatisch vergeben",
+            subtitle="Nach der Transkription schlägt die KI einen kurzen Titel vor.")
+        self.auto_title_row.set_active(bool(cfg.get("recorder_auto_title", True)))
+        self.auto_title_row.connect(
+            "notify::active",
+            lambda *_: self._persist("recorder_auto_title", bool(self.auto_title_row.get_active())))
+        opt.add_row(self.auto_title_row)
+        vault = str(cfg.get("obsidian_vault", "")).strip()
+        self.vault_row = Adw.ActionRow(
+            title="Obsidian-Vault",
+            subtitle=vault or "Nicht gesetzt — wird beim ersten Export gewählt")
+        vault_btn = Gtk.Button(label="Wählen …", valign=Gtk.Align.CENTER)
+        vault_btn.add_css_class("flat")
+        vault_btn.connect("clicked", self._pick_vault)
+        self.vault_row.add_suffix(vault_btn)
+        opt.add_row(self.vault_row)
 
         viz_mode = str(cfg.get("audio_visualizer", "waves"))
         self._meters_group = Adw.PreferencesGroup(
@@ -1034,6 +1051,23 @@ class RecorderView(Gtk.Box):
         self._persist("recorder_source", self._current_source())
         if self._meters_on:
             self._start_meters()
+
+    def _pick_vault(self, *_a):
+        dialog = Gtk.FileDialog(title="Obsidian-Vault wählen")
+
+        def done(dlg, result):
+            try:
+                folder = dlg.select_folder_finish(result)
+            except Exception:
+                return
+            path = folder.get_path() if folder else None
+            if not path:
+                return
+            self._persist("obsidian_vault", path)
+            self.vault_row.set_subtitle(path)
+            self._toast("Obsidian-Vault gesetzt ✓")
+
+        dialog.select_folder(self.get_root(), None, done)
 
     def _on_device_changed(self, *_):
         if self._loading_devices:        # ignore programmatic repopulation
@@ -1403,14 +1437,34 @@ class RecorderView(Gtk.Box):
         if self._poll_id is None:
             self._poll_id = GLib.timeout_add(400, self._poll_progress)
 
+    # One-click summary styles for the common cases (free text stays possible).
+    FOCUS_PRESETS = (
+        ("Vorlesungsnotizen",
+         "prüfungsrelevante Inhalte, Definitionen und Beispiele — als strukturierte Lernnotizen"),
+        ("Meeting-Protokoll",
+         "besprochene Themen, Argumente und getroffene Entscheidungen — als Protokoll"),
+        ("Action-Items",
+         "Aufgaben, Verantwortliche und Fristen — als kompakte Action-Item-Liste"),
+    )
+
     def _ask_focus(self, base):
         dlg = Adw.AlertDialog(
-            heading="Worauf soll sich die Zusammenfassung fokussieren?",
-            body="Beschreibe den Fokus — z. B. »Prüfungsrelevante Definitionen«, "
-                 "»Action-Items und Entscheidungen« oder »Kernargumente des Vortrags«.")
+            heading="Wie soll zusammengefasst werden?",
+            body="Preset wählen — oder eigenen Fokus beschreiben.")
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        chips = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                        halign=Gtk.Align.CENTER)
+        for label, focus in self.FOCUS_PRESETS:
+            chip = Gtk.Button(label=label)
+            chip.add_css_class("pill")
+            chip.connect("clicked", lambda _b, f=focus: (dlg.force_close(),
+                                                         self._summarize(base, f)))
+            chips.append(chip)
+        content.append(chips)
         entry = Gtk.Entry(hexpand=True)
-        entry.set_placeholder_text("Fokus (leer = wichtigste Inhalte und Action-Items)")
-        dlg.set_extra_child(entry)
+        entry.set_placeholder_text("Eigener Fokus (leer = wichtigste Inhalte und Action-Items)")
+        content.append(entry)
+        dlg.set_extra_child(content)
         dlg.add_response("cancel", "Abbrechen")
         dlg.add_response("go", "Zusammenfassen")
         dlg.set_response_appearance("go", Adw.ResponseAppearance.SUGGESTED)
@@ -1540,25 +1594,28 @@ class RecorderView(Gtk.Box):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         clamp.set_child(box)
 
-        # header: back + title + rename
-        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        current_title = meta.get("title", base)
+
+        # header: back | title | edit pencil | actions menu
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         back = Gtk.Button(icon_name="go-previous-symbolic", valign=Gtk.Align.CENTER)
         back.add_css_class("flat")
         back.set_tooltip_text("Zurück")
         back.connect("clicked", lambda *_: self.nav.pop())
         head.append(back)
-        title_lbl = Gtk.Label(label=meta.get("title", base), xalign=0, hexpand=True, wrap=True)
+        title_lbl = Gtk.Label(label=current_title, xalign=0, hexpand=True, wrap=True)
         title_lbl.add_css_class("title-2")
         head.append(title_lbl)
         self._detail["title_lbl"] = title_lbl
-        rename = Gtk.Button(label="Titel ändern", valign=Gtk.Align.CENTER)
+        rename = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER)
         rename.add_css_class("flat")
         rename.set_tooltip_text("Titel bearbeiten")
         rename.connect("clicked", lambda *_: self._rename(base))
         head.append(rename)
+        head.append(self._detail_menu_button(base))
         box.append(head)
 
-        # metadata + player
+        # audio metadata + player
         info = Adw.PreferencesGroup()
         box.append(info)
         from datetime import datetime as _dt
@@ -1566,39 +1623,43 @@ class RecorderView(Gtk.Box):
             created = _dt.fromisoformat(meta.get("created", "")).strftime("%d.%m.%Y %H:%M")
         except Exception:
             created = ""
-        current_title = meta.get("title", base)
-        title_row = Adw.ActionRow(title="Titel", subtitle=current_title)
-        title_row.set_activatable(True)
-        title_row.add_prefix(Gtk.Image(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER))
-        edit_title = Gtk.Button(label="Bearbeiten", valign=Gtk.Align.CENTER)
-        edit_title.add_css_class("flat")
-        edit_title.connect("clicked", lambda *_: self._rename(base))
-        title_row.add_suffix(edit_title)
-        title_row.connect("activated", lambda *_: self._rename(base))
-        info.add(title_row)
-        self._detail["title_row"] = title_row
         meta_line = " · ".join(p for p in [
             created, fmt_duration(meta.get("duration_seconds", 0)),
             REC_SOURCE_SHORT.get(meta.get("source", ""), meta.get("source", "")),
         ] if p)
+        audio_path = RECORDINGS_DIR / f"{base}.opus"
+        try:
+            meta_line += f" · {fmt_size(audio_path.stat().st_size)}"
+        except OSError:
+            meta_line += " · Audio entfernt"
         player = Adw.ActionRow(title="Audio", subtitle=meta_line)
         info.add(player)
-        audio_path = RECORDINGS_DIR / f"{base}.opus"
         if hasattr(Gtk, "MediaControls") and audio_path.exists():
-            # Native seekable player (play/pause, scrubbing, volume) — for
-            # jumping to minute 47 of a lecture instead of ffplay's
-            # start/stop-only playback.
+            # Native seekable player (play/pause, scrubbing, volume) with
+            # ±10 s jump buttons — for navigating hour-long lectures.
             self._media = Gtk.MediaFile.new_for_filename(str(audio_path))
             controls = Gtk.MediaControls(media_stream=self._media)
             controls.set_hexpand(True)
-            controls.set_margin_top(4)
-            controls.set_margin_bottom(4)
-            controls.set_margin_start(8)
-            controls.set_margin_end(8)
+            back10 = Gtk.Button(icon_name="media-seek-backward-symbolic",
+                                valign=Gtk.Align.CENTER)
+            back10.add_css_class("flat")
+            back10.set_tooltip_text("10 Sekunden zurück")
+            back10.connect("clicked", lambda *_: self._seek_relative(-10))
+            fwd10 = Gtk.Button(icon_name="media-seek-forward-symbolic",
+                               valign=Gtk.Align.CENTER)
+            fwd10.add_css_class("flat")
+            fwd10.set_tooltip_text("10 Sekunden vor")
+            fwd10.connect("clicked", lambda *_: self._seek_relative(10))
+            pbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4,
+                           margin_top=4, margin_bottom=4,
+                           margin_start=8, margin_end=8)
+            pbox.append(back10)
+            pbox.append(controls)
+            pbox.append(fwd10)
             controls_row = Gtk.ListBoxRow(activatable=False, selectable=False,
-                                          child=controls)
+                                          child=pbox)
             info.add(controls_row)
-        else:
+        elif audio_path.exists():
             # Fallback without a GStreamer GTK backend: simple ffplay toggle.
             play_btn = Gtk.Button(icon_name="media-playback-start-symbolic",
                                   valign=Gtk.Align.CENTER)
@@ -1625,13 +1686,21 @@ class RecorderView(Gtk.Box):
         prog_box.append(bar)
         box.append(prog_box)
 
-        # transcript section
+        # transcript section (search + copy in the header; [mm:ss] markers in
+        # the text are clickable and seek the player)
         tr_group = Adw.PreferencesGroup(title="Transkript")
+        tr_suffix = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._tr_search = Gtk.SearchEntry(placeholder_text="Im Transkript suchen …")
+        self._tr_search.set_max_width_chars(22)
+        self._tr_search.connect("search-changed", lambda *_: self._tr_do_search(reset=True))
+        self._tr_search.connect("activate", lambda *_: self._tr_do_search(reset=False))
+        tr_suffix.append(self._tr_search)
         tr_copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
         tr_copy.add_css_class("flat")
         tr_copy.set_tooltip_text("Transkript kopieren")
         tr_copy.connect("clicked", lambda *_: self._copy(self._transcript_text()))
-        tr_group.set_header_suffix(tr_copy)
+        tr_suffix.append(tr_copy)
+        tr_group.set_header_suffix(tr_suffix)
         box.append(tr_group)
         tr_scroller = Gtk.ScrolledWindow(min_content_height=220)
         tr_scroller.add_css_class("card")
@@ -1639,6 +1708,9 @@ class RecorderView(Gtk.Box):
         tr_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=10, bottom_margin=10,
                                left_margin=10, right_margin=10)
         tr_view.add_css_class("editor-view")
+        click = Gtk.GestureClick()
+        click.connect("released", self._on_transcript_click)
+        tr_view.add_controller(click)
         tr_scroller.set_child(tr_view)
         self._detail["tr_view"] = tr_view
         self._detail["tr_scroller"] = tr_scroller
@@ -1696,26 +1768,6 @@ class RecorderView(Gtk.Box):
         self._detail["nt_btn"] = nt_btn
         nt_group.add(self._row_wrap(nt_empty))
 
-        # bottom actions
-        bottom = Adw.PreferencesGroup()
-        box.append(bottom)
-        retr = Adw.ActionRow(title="Erneut transkribieren", subtitle="Verwirft das aktuelle Transkript")
-        retr.set_activatable(True)
-        retr.add_prefix(Gtk.Image(icon_name="view-refresh-symbolic"))
-        retr.connect("activated", lambda *_: self._retranscribe(base))
-        bottom.add(retr)
-        folder = Adw.ActionRow(title="Ordner öffnen")
-        folder.set_activatable(True)
-        folder.add_prefix(Gtk.Image(icon_name="folder-symbolic"))
-        folder.connect("activated", lambda *_: self._open_folder())
-        bottom.add(folder)
-        delete = Adw.ActionRow(title="Löschen")
-        delete.add_css_class("error")
-        delete.set_activatable(True)
-        delete.add_prefix(Gtk.Image(icon_name="user-trash-symbolic"))
-        delete.connect("activated", lambda *_: self._delete(base, from_detail=True))
-        bottom.add(delete)
-
         page = Adw.NavigationPage(title=current_title, child=scroller)
         self._detail["page"] = page
         self.nav.push(page)
@@ -1725,6 +1777,221 @@ class RecorderView(Gtk.Box):
     def _row_wrap(widget):
         # PreferencesGroup expects rows; wrap arbitrary widgets so they sit in the card.
         return widget
+
+    # ── detail: actions menu ─────────────────────────────────────────────────
+
+    def _detail_menu_button(self, base) -> Gtk.MenuButton:
+        actions = Gio.SimpleActionGroup()
+        for name, callback in (
+            ("export-obsidian", lambda: self._export_obsidian(base)),
+            ("retranscribe", lambda: self._confirm_retranscribe(base)),
+            ("open-folder", self._open_folder),
+            ("drop-audio", lambda: self._drop_audio(base)),
+            ("delete", lambda: self._delete(base, from_detail=True)),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda _a, _p, cb=callback: cb())
+            actions.add_action(action)
+        menu = Gio.Menu()
+        section = Gio.Menu()
+        section.append("Nach Obsidian exportieren", "detail.export-obsidian")
+        section.append("Erneut transkribieren", "detail.retranscribe")
+        section.append("Ordner öffnen", "detail.open-folder")
+        menu.append_section(None, section)
+        section = Gio.Menu()
+        section.append("Audio entfernen (Transkript bleibt)", "detail.drop-audio")
+        section.append("Aufnahme löschen", "detail.delete")
+        menu.append_section(None, section)
+        btn = Gtk.MenuButton(icon_name="view-more-symbolic", valign=Gtk.Align.CENTER)
+        btn.add_css_class("flat")
+        btn.set_tooltip_text("Aktionen")
+        btn.set_menu_model(menu)
+        btn.insert_action_group("detail", actions)
+        return btn
+
+    # ── detail: player seek + clickable transcript markers ──────────────────
+
+    _TS_RE = re.compile(r"\[(\d+):(\d{2})(?::(\d{2}))?\]")
+
+    def _seek_to(self, seconds: float) -> None:
+        if self._media is None:
+            return
+        self._media.seek(max(0, int(seconds * 1_000_000)))
+        if not self._media.get_playing():
+            self._media.play()
+
+    def _seek_relative(self, delta: float) -> None:
+        if self._media is None:
+            return
+        self._seek_to(max(0.0, self._media.get_timestamp() / 1_000_000 + delta))
+
+    def _on_transcript_click(self, _gesture, _n_press, x, y) -> None:
+        """Click on a [mm:ss] marker → jump the player to that moment."""
+        view = self._detail.get("tr_view")
+        if view is None or self._media is None:
+            return
+        bx, by = view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
+        ok, it = view.get_iter_at_location(bx, by)
+        if not ok:
+            return
+        buf = view.get_buffer()
+        line_start = it.copy()
+        line_start.set_line_offset(0)
+        line_end = it.copy()
+        if not line_end.ends_line():
+            line_end.forward_to_line_end()
+        line = buf.get_text(line_start, line_end, False)
+        offset = it.get_line_offset()
+        for m in self._TS_RE.finditer(line):
+            if m.start() <= offset <= m.end():
+                first, mm, ss = m.group(1), m.group(2), m.group(3)
+                if ss is not None:
+                    seconds = int(first) * 3600 + int(mm) * 60 + int(ss)
+                else:
+                    seconds = int(first) * 60 + int(mm)
+                self._seek_to(seconds)
+                return
+
+    # ── detail: transcript search with highlight ────────────────────────────
+
+    def _tr_do_search(self, reset: bool) -> None:
+        view = self._detail.get("tr_view")
+        if view is None or not hasattr(self, "_tr_search"):
+            return
+        buf = view.get_buffer()
+        tag = buf.get_tag_table().lookup("search-hit")
+        if tag is None:
+            r, g, b = accent_rgb()
+            rgba = Gdk.RGBA()
+            rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 0.35
+            tag = buf.create_tag("search-hit")
+            tag.set_property("background-rgba", rgba)
+        start, end = buf.get_bounds()
+        buf.remove_tag(tag, start, end)
+        needle = self._tr_search.get_text().strip()
+        if not needle:
+            return
+        flags = Gtk.TextSearchFlags.CASE_INSENSITIVE | Gtk.TextSearchFlags.TEXT_ONLY
+        it = buf.get_start_iter()
+        first_match = None
+        while True:
+            result = it.forward_search(needle, flags, None)
+            if not result:
+                break
+            m_start, m_end = result
+            buf.apply_tag(tag, m_start, m_end)
+            if first_match is None:
+                first_match = m_start.copy()
+            it = m_end
+        if reset:
+            target = first_match
+        else:  # Enter: jump to the next match after the cursor
+            cursor = buf.get_iter_at_mark(buf.get_insert())
+            cursor.forward_char()
+            result = cursor.forward_search(needle, flags, None)
+            target = result[0] if result else first_match
+        if target is not None:
+            buf.place_cursor(target)
+            view.scroll_to_iter(target, 0.1, False, 0.0, 0.0)
+
+    # ── detail: destructive/maintenance actions ─────────────────────────────
+
+    def _confirm_retranscribe(self, base) -> None:
+        dlg = Adw.AlertDialog(heading="Erneut transkribieren?",
+                              body="Das aktuelle Transkript wird verworfen und neu erstellt.")
+        dlg.add_response("cancel", "Abbrechen")
+        dlg.add_response("go", "Neu transkribieren")
+        dlg.set_response_appearance("go", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.connect("response",
+                    lambda _d, resp: self._retranscribe(base) if resp == "go" else None)
+        dlg.present(self.get_root())
+
+    def _drop_audio(self, base) -> None:
+        dlg = Adw.AlertDialog(
+            heading="Audio entfernen?",
+            body="Die Audiodatei wird gelöscht, Transkript und Notizen bleiben "
+                 "erhalten. Spart Speicherplatz — Anhören ist danach nicht mehr möglich.")
+        dlg.add_response("cancel", "Abbrechen")
+        dlg.add_response("drop", "Audio entfernen")
+        dlg.set_response_appearance("drop", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def on_resp(_d, resp):
+            if resp != "drop":
+                return
+            self._stop_play()
+            (RECORDINGS_DIR / f"{base}.opus").unlink(missing_ok=True)
+            self._toast("Audio entfernt — Transkript bleibt")
+            if self._detail_base == base:
+                self.nav.pop()
+                self._open_detail(base)
+            self.refresh()
+
+        dlg.connect("response", on_resp)
+        dlg.present(self.get_root())
+
+    # ── detail: Obsidian export ──────────────────────────────────────────────
+
+    def _export_obsidian(self, base) -> None:
+        vault = str(load_config().get("obsidian_vault", "")).strip()
+        if vault and Path(vault).is_dir():
+            self._write_obsidian_note(base, Path(vault))
+            return
+
+        dialog = Gtk.FileDialog(title="Obsidian-Vault wählen")
+
+        def done(dlg, result):
+            try:
+                folder = dlg.select_folder_finish(result)
+            except Exception:
+                return  # abgebrochen
+            path = folder.get_path() if folder else None
+            if not path:
+                return
+            cfg = load_config()
+            cfg["obsidian_vault"] = path
+            save_config(cfg)
+            self._write_obsidian_note(base, Path(path))
+
+        dialog.select_folder(self.get_root(), None, done)
+
+    def _write_obsidian_note(self, base, vault: Path) -> None:
+        try:
+            meta = json.loads((RECORDINGS_DIR / f"{base}.meta.json").read_text())
+        except Exception:
+            meta = {}
+        title = str(meta.get("title", base)).strip() or base
+        try:
+            transcript = (RECORDINGS_DIR / f"{base}.txt").read_text(encoding="utf-8").strip()
+        except OSError:
+            transcript = ""
+        try:
+            notes = (RECORDINGS_DIR / f"{base}.summary.md").read_text(encoding="utf-8").strip()
+        except OSError:
+            notes = ""
+        created = str(meta.get("created", ""))[:10]
+        safe_title = "".join(c for c in title if c not in '\\/:*?"<>|').strip() or base
+        target_dir = vault / "Aufnahmen"
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"{created + ' ' if created else ''}{safe_title}.md"
+            n = 2
+            while target.exists():
+                target = target_dir / f"{created + ' ' if created else ''}{safe_title} ({n}).md"
+                n += 1
+            parts = [f"# {title}", ""]
+            facts = [p for p in (
+                f"Datum: {created}" if created else "",
+                f"Dauer: {fmt_duration(meta.get('duration_seconds', 0))}",
+            ) if p]
+            parts += [" · ".join(facts), ""]
+            if notes:
+                parts += ["## Notizen", "", notes, ""]
+            if transcript:
+                parts += ["## Transkript", "", transcript, ""]
+            target.write_text("\n".join(parts), encoding="utf-8")
+            self._toast(f"Exportiert: {target.name}")
+        except OSError as exc:
+            self._toast(f"Export fehlgeschlagen: {exc}")
 
     def _on_popped(self, _nav, _page):
         self._detail_base = None

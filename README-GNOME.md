@@ -192,9 +192,14 @@ ein Absturz nicht alles verliert:
    Teil-Transkript + Fortschritt werden nach **jedem** Chunk gespeichert →
    abbruchsicher und fortsetzbar (auch nach Absturz/Kill, inkl. abgeschnittener
    Dateien ohne Dauer-Metadaten). Chunk-Länge: `recorder_chunk_seconds`.
-3. **Zusammenfassung** – optional via Ollama (Map-Reduce). Du gibst einen
-   **Fokus-Prompt** an (z. B. „prüfungsrelevante Definitionen") und bekommst
-   strukturierte Notizen.
+   Das Transkript bekommt **`[mm:ss]`-Zeitmarken** pro Absatz — ein Klick auf
+   eine Marke springt im Player genau dorthin. Danach schlägt die KI
+   automatisch einen **Titel** vor (abschaltbar: `recorder_auto_title`).
+3. **Zusammenfassung** – optional via Ollama (Map-Reduce). Ein Klick auf ein
+   **Preset** (Vorlesungsnotizen / Meeting-Protokoll / Action-Items) oder ein
+   eigener **Fokus-Prompt** (z. B. „prüfungsrelevante Definitionen") liefert
+   strukturierte Notizen. Transkript + Notizen lassen sich als Markdown
+   **nach Obsidian exportieren** (Vault-Pfad: `obsidian_vault`).
 
 Im GUI gibt's außerdem live **Pegel-/Wellen-Anzeigen** (sehen, ob Ton ankommt —
 auch vor der Aufnahme), Pause/Fortsetzen und während der Aufnahme die
@@ -203,9 +208,12 @@ Aufnahmen-Liste ist **nach Datum gruppiert** (Heute/Gestern/Diese Woche/Älter),
 und jede Zeile kann direkt **angehört** (▶) und **gelöscht** werden. Die
 Quelle (Mic + System / System / Mic) wechselst du mit einem Klick per
 Toggle-Gruppe. Pro Aufnahme gibt es eine **Detail-Seite** mit richtigem
-**Audio-Player (Spulen, Pause, Lautstärke)**, editierbarem Transkript,
-Notizen und Umbenennen. Die Visualisierung ist in den Einstellungen
-umschaltbar: **Wellen / Balken / Aus** (gilt für Werkbank und Rekorder).
+**Audio-Player (Spulen, ±10 s, Pause, Lautstärke)**, klickbaren
+Zeitmarken, **Suche im Transkript** (mit Treffer-Hervorhebung), editierbarem
+Transkript und Notizen. Über das ⋮-Menü: Obsidian-Export, erneut
+transkribieren, **„Audio entfernen, Transkript behalten"** (spart bei
+Vorlesungen ~40 MB pro Stunde) und Löschen. Die Visualisierung ist in den
+Einstellungen umschaltbar: **Wellen / Balken / Aus**.
 
 Dateien liegen unter `~/.local/share/whisper-dictation/recordings/`
 (`.opus`, `.txt`, `.summary.md`). CLI direkt nutzbar:

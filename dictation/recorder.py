@@ -405,6 +405,14 @@ class _Backend:
             download_root=str(CACHE_DIR / "models-faster"))
 
     def transcribe(self, audio: np.ndarray) -> str:
+        return "".join(text for _s, _e, text in self.transcribe_segments(audio))
+
+    def transcribe_segments(self, audio: np.ndarray) -> list[tuple[float, float, str]]:
+        """Transcribe one chunk into (start, end, text) segments.
+
+        Times are relative to the chunk start; the caller offsets them.
+        Timestamps feed the click-to-seek markers in the GUI transcript.
+        """
         lang = str(self.cfg.get("recorder_language") or self.cfg.get("language") or "").strip().lower()
         language = None if lang in ("", "auto") else lang
         from common import effective_prompt_and_hotwords
@@ -415,14 +423,93 @@ class _Backend:
                 kwargs["language"] = f"<|{language}|>"
             if prompt:
                 kwargs["initial_prompt"] = prompt
-            return str(self.ov_pipe.generate(audio, **kwargs))  # type: ignore[union-attr]
+            try:
+                result = self.ov_pipe.generate(  # type: ignore[union-attr]
+                    audio, return_timestamps=True, **kwargs)
+                chunks = getattr(result, "chunks", None)
+                if chunks:
+                    return [
+                        (float(c.start_ts), float(c.end_ts), str(c.text))
+                        for c in chunks
+                    ]
+                return [(0.0, len(audio) / SAMPLE_RATE, str(result))]
+            except Exception:
+                # Older openvino-genai without timestamp support.
+                result = self.ov_pipe.generate(audio, **kwargs)  # type: ignore[union-attr]
+                return [(0.0, len(audio) / SAMPLE_RATE, str(result))]
         segments, _ = self.fw_model.transcribe(  # type: ignore[union-attr]
             audio, language=language, initial_prompt=prompt, hotwords=hotwords,
             beam_size=int(self.cfg.get("beam_size", 5)),
             condition_on_previous_text=False,
             vad_filter=bool(self.cfg.get("vad_filter", True)),
         )
-        return "".join(s.text for s in segments)
+        return [(float(s.start), float(s.end), str(s.text)) for s in segments]
+
+
+def _fmt_ts(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+
+def _strip_markers(text: str) -> str:
+    """Remove [mm:ss] paragraph markers (for LLM input / auto-title)."""
+    import re
+    return re.sub(r"\[\d+:\d{2}(?::\d{2})?\] ?", "", text)
+
+
+def _segments_to_paragraphs(segments: list[tuple[float, float, str]], offset: float,
+                            max_span: float = 45.0, gap: float = 2.0,
+                            ) -> list[tuple[float, str]]:
+    """Group whisper segments into paragraphs: break on a speech gap or when a
+    paragraph exceeds ~45 s. Returns [(absolute_start_seconds, text), ...]."""
+    paras: list[tuple[float, str]] = []
+    cur_start: float | None = None
+    cur_text: list[str] = []
+    prev_end = 0.0
+    for start, end, text in segments:
+        text = text.strip()
+        if not text:
+            continue
+        if cur_start is None:
+            cur_start = start
+        elif (start - prev_end) > gap or (end - cur_start) > max_span:
+            paras.append((offset + cur_start, " ".join(cur_text)))
+            cur_start, cur_text = start, []
+        cur_text.append(text)
+        prev_end = end
+    if cur_start is not None and cur_text:
+        paras.append((offset + cur_start, " ".join(cur_text)))
+    return paras
+
+
+def _maybe_auto_title(base: str, cfg: dict[str, Any]) -> None:
+    """Let Ollama suggest a short title while the recording has the default
+    one. Best effort — a missing Ollama server never fails the transcription."""
+    if not cfg.get("recorder_auto_title", True):
+        return
+    meta_path = RECORDINGS_DIR / f"{base}.meta.json"
+    meta = _read_json(meta_path, {})
+    if str(meta.get("title", "")).strip() not in ("", "Aufnahme"):
+        return
+    try:
+        excerpt = _strip_markers(
+            (RECORDINGS_DIR / f"{base}.txt").read_text(encoding="utf-8"))[:2500]
+        if len(excerpt.split()) < 20:
+            return
+        title = _ollama_chat(
+            cfg,
+            "Du benennst Audio-Aufnahmen. Antworte NUR mit einem kurzen, praegnanten "
+            "Titel (3-6 Woerter, in der Sprache des Inhalts, keine Anfuehrungszeichen).",
+            f"Transkript-Anfang:\n{excerpt}", timeout=60)
+        title = title.strip().strip('"„“').splitlines()[0].strip()[:80]
+        if title:
+            meta["title"] = title
+            _write_json(meta_path, meta)
+            print(f"[recorder] auto-title: {title}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[recorder] auto-title skipped: {exc}", file=sys.stderr, flush=True)
 
 
 def _decode_chunk(audio: Path, start: float, length: float):
@@ -535,9 +622,11 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
             audio_np = _decode_chunk(audio, pos, length)
             if audio_np.size < SAMPLE_RATE // 2:  # < 0.5s -> end of file
                 break
-            text = backend.transcribe(audio_np).strip()
-            if text:
-                fh.write(text + "\n")
+            paragraphs = _segments_to_paragraphs(
+                backend.transcribe_segments(audio_np), offset=pos)
+            if paragraphs:
+                fh.write("".join(
+                    f"[{_fmt_ts(start)}] {text}\n\n" for start, text in paragraphs))
                 fh.flush()
             pos = seg_end if have_dur else pos + length
             segs += 1
@@ -547,6 +636,7 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
 
     _progress(duration if have_dur else pos, "done", segs)
     chars = len(txt_path.read_text()) if txt_path.exists() else 0
+    _maybe_auto_title(base, cfg)
     _notify("Transkription fertig", f"{base} ({chars} Zeichen)")
     print(json.dumps({"base": base, "status": "done", "chars": chars}))
     if args.then_summarize:
@@ -576,7 +666,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     if not txt_path.exists():
         print(json.dumps({"error": "transcript_not_found", "base": base}))
         return 1
-    transcript = txt_path.read_text(encoding="utf-8").strip()
+    transcript = _strip_markers(txt_path.read_text(encoding="utf-8")).strip()
     if not transcript:
         print(json.dumps({"error": "empty_transcript", "base": base}))
         return 1
