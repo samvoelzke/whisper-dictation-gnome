@@ -797,6 +797,7 @@ class RecorderView(Gtk.Box):
         self._play_timer = None
         self._play_start = 0.0
         self._media = None              # native detail player (Gtk.MediaFile)
+        self._qa_busy = False           # one transcript question at a time
         # inline row preview (one at a time)
         self._preview_media = None
         self._preview_base = None
@@ -1768,6 +1769,30 @@ class RecorderView(Gtk.Box):
         self._detail["nt_btn"] = nt_btn
         nt_group.add(self._row_wrap(nt_empty))
 
+        # Q&A: content questions answered strictly from the transcript
+        qa_group = Adw.PreferencesGroup(
+            title="Frag die Aufnahme",
+            description="Inhaltliche Fragen — die KI antwortet nur aus dem Transkript.",
+        )
+        box.append(qa_group)
+        self._detail["qa_group"] = qa_group
+        qa_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        qa_answers = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self._detail["qa_answers"] = qa_answers
+        qa_box.append(qa_answers)
+        qa_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        qa_entry = Gtk.Entry(hexpand=True)
+        qa_entry.set_placeholder_text("Was wurde zu … gesagt?")
+        qa_entry.connect("activate", lambda *_: self._ask_question(base))
+        self._detail["qa_entry"] = qa_entry
+        qa_row.append(qa_entry)
+        qa_send = Gtk.Button(label="Fragen")
+        qa_send.connect("clicked", lambda *_: self._ask_question(base))
+        self._detail["qa_send"] = qa_send
+        qa_row.append(qa_send)
+        qa_box.append(qa_row)
+        qa_group.add(self._row_wrap(qa_box))
+
         page = Adw.NavigationPage(title=current_title, child=scroller)
         self._detail["page"] = page
         self.nav.push(page)
@@ -1929,6 +1954,55 @@ class RecorderView(Gtk.Box):
         dlg.connect("response", on_resp)
         dlg.present(self.get_root())
 
+    # ── detail: Q&A (Frag die Aufnahme) ──────────────────────────────────────
+
+    def _ask_question(self, base) -> None:
+        entry = self._detail.get("qa_entry")
+        if entry is None or self._qa_busy:
+            return
+        question = entry.get_text().strip()
+        if not question:
+            return
+        self._qa_busy = True
+        entry.set_text("")
+        send = self._detail.get("qa_send")
+        if send is not None:
+            send.set_sensitive(False)
+
+        q_lbl = Gtk.Label(label=question, xalign=0, wrap=True, selectable=True)
+        q_lbl.add_css_class("heading")
+        a_lbl = Gtk.Label(label="Die KI liest das Transkript …", xalign=0,
+                          wrap=True, selectable=True)
+        a_lbl.add_css_class("dim-label")
+        item = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        item.append(q_lbl)
+        item.append(a_lbl)
+        self._detail["qa_answers"].append(item)
+
+        def done(r: dict) -> bool:
+            self._qa_busy = False
+            if send is not None:
+                try:
+                    send.set_sensitive(True)
+                except Exception:
+                    pass
+            try:
+                if "error" in r:
+                    a_lbl.set_text(f"Fehler: {r['error']}")
+                    a_lbl.remove_css_class("dim-label")
+                    a_lbl.add_css_class("error")
+                else:
+                    a_lbl.set_text(str(r.get("answer", "")).strip() or "(keine Antwort)")
+                    a_lbl.remove_css_class("dim-label")
+            except Exception:
+                pass  # Detail-Seite wurde inzwischen geschlossen
+            return False
+
+        def work():
+            r = recorder_call("ask", base, "--question", question, timeout=600)
+            GLib.idle_add(done, r)
+        threading.Thread(target=work, daemon=True).start()
+
     # ── detail: Obsidian export ──────────────────────────────────────────────
 
     def _export_obsidian(self, base) -> None:
@@ -2037,6 +2111,8 @@ class RecorderView(Gtk.Box):
         # can only summarize once a transcript exists
         if not has_notes:
             self._detail["nt_btn"].set_sensitive(has_txt)
+        if self._detail.get("qa_group") is not None:
+            self._detail["qa_group"].set_visible(has_txt)
         self._update_detail_progress(base)
 
     def _update_detail_progress(self, base):

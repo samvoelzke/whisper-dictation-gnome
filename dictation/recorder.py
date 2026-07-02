@@ -709,6 +709,53 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Answer a content question strictly from the transcript (Q&A)."""
+    base = args.base
+    txt_path = RECORDINGS_DIR / f"{base}.txt"
+    if not txt_path.exists():
+        print(json.dumps({"error": "transcript_not_found", "base": base}))
+        return 1
+    transcript = _strip_markers(txt_path.read_text(encoding="utf-8")).strip()
+    question = (args.question or "").strip()
+    if not transcript or not question:
+        print(json.dumps({"error": "empty_transcript_or_question", "base": base}))
+        return 1
+    cfg = load_config()
+
+    system = (
+        "Du beantwortest Fragen zu einer Audio-Transkription praezise und NUR "
+        "anhand des gegebenen Texts. Steht die Antwort nicht im Text, sage das "
+        "ehrlich. Antworte in der Sprache der Frage, kompakt und konkret."
+    )
+    blocks = _split_words(transcript, 3000)
+    if len(blocks) == 1:
+        answer = _ollama_chat(
+            cfg, system, f"Transkript:\n{transcript}\n\nFrage: {question}")
+    else:
+        # Map: pull question-relevant passages per block; Reduce: answer.
+        partials = []
+        for idx, block in enumerate(blocks, 1):
+            print(f"[recorder] ask map {idx}/{len(blocks)}", flush=True)
+            partials.append(_ollama_chat(
+                cfg,
+                "Du extrahierst aus einem Transkript-Abschnitt alles, was zur "
+                "Beantwortung einer Frage beitraegt. Gib nur Relevantes wieder; "
+                "enthaelt der Abschnitt nichts Relevantes, antworte exakt: NICHTS.",
+                f"Frage: {question}\n\nAbschnitt {idx}/{len(blocks)}:\n{block}"))
+        relevant = [p for p in partials if p.strip().upper() != "NICHTS"]
+        if not relevant:
+            answer = "Dazu findet sich nichts im Transkript."
+        else:
+            answer = _ollama_chat(
+                cfg, system,
+                "Relevante Auszuege aus dem Transkript:\n\n"
+                + "\n\n".join(relevant) + f"\n\nFrage: {question}",
+                timeout=420)
+    print(json.dumps({"base": base, "answer": answer}))
+    return 0
+
+
 # ── listing ──────────────────────────────────────────────────────────────────
 
 def cmd_list(_args: argparse.Namespace) -> int:
@@ -784,6 +831,11 @@ def main() -> int:
     s.add_argument("base")
     s.add_argument("--focus", default="")
     s.set_defaults(func=cmd_summarize)
+
+    s = sub.add_parser("ask")
+    s.add_argument("base")
+    s.add_argument("--question", default="")
+    s.set_defaults(func=cmd_ask)
 
     s = sub.add_parser("delete")
     s.add_argument("base")
