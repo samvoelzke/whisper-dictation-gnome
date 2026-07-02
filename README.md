@@ -2,7 +2,7 @@
 
 Local speech-to-text for your desktop — double-tap a key, speak, double-tap again. The transcribed text is instantly pasted wherever your cursor is. No cloud, no subscription, everything runs locally via [OpenAI Whisper](https://github.com/openai/whisper).
 
-**Supported platforms:** macOS (Apple Silicon M1/M2/M3/M4) · Linux (GNOME/X11)
+**Supported platforms:** Linux (GNOME/Wayland — primary, see [README-GNOME.md](README-GNOME.md)) · macOS (Apple Silicon, experimental)
 
 ---
 
@@ -109,10 +109,15 @@ Config file: `~/.config/whisper-dictation/config.json`
 
 ---
 
-## Linux (GNOME / X11)
+## Linux (GNOME / Wayland)
+
+Linux ist die primär gepflegte Plattform — vollständige Doku inkl.
+OpenVINO-Beschleunigung (Intel GPU/NPU), Rekorder, Wörterbuch und
+Wayland-Details: **[README-GNOME.md](README-GNOME.md)**.
 
 ```bash
-sudo apt install python3 python3-venv git alsa-utils xclip
+sudo dnf install alsa-utils wl-clipboard ydotool libnotify python3 \
+  python3-gobject gtk4 libadwaita
 git clone https://github.com/samvoelzke/whisper-dictation-gnome
 cd whisper-dictation-gnome
 bash bin/install-whisper-dictation.sh

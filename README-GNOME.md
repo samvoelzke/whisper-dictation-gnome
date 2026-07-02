@@ -10,7 +10,14 @@ Getestet auf **Fedora / GNOME Shell 50 / Wayland**.
 
 - Doppelt `Right Ctrl`: Aufnahme starten
 - Doppelt `Right Ctrl`: Aufnahme stoppen → transkribieren → einfügen
+- Alternativ **Push-to-Talk** (`hotkey_mode`): Taste halten = aufnehmen,
+  loslassen = einfügen. Kurze Tipps (< 250 ms, z. B. `Strg+C`) starten
+  **keine** Aufnahme.
+- `Esc` während der Aufnahme: abbrechen ohne Transkription
 - Status erscheint als Desktop-Benachrichtigung (kein Tray-Icon nötig)
+- Läuft ein Clipboard-Manager (z. B. **Vicinae**), bleibt das Diktat an
+  **erster Stelle** seiner History (das Zurücksetzen der Zwischenablage wird
+  dann automatisch übersprungen — der alte Inhalt steckt ja im Manager).
 
 ## Warum kein Tray-Icon?
 
@@ -91,6 +98,32 @@ journalctl --user -u whisper-dictation -f      # Live-Log
 - Optional **GNOME-Tastenkombi** statt Doppel-Tap: Einstellungen → Tastatur →
   eigene Kürzel → Befehl `…/bin/whisper-dictation.sh --toggle`.
 
+## Die App (GTK4/libadwaita)
+
+`bin/open-whisper-dictation-settings.sh` öffnet die App mit drei Ansichten:
+
+- **Werkbank** — in ein Textfeld diktieren und den Text per KI-Anweisung
+  umformen (Presets: strukturieren, formeller, kürzer, übersetzen, …)
+- **Rekorder** — Langaufnahmen (siehe unten)
+- **Verlauf** — alle Diktate: durchsuchen (`Strg+F`), Volltext aufklappen,
+  kopieren (auch den Rohtext vor der KI), einzeln löschen
+
+Die **Einstellungen** öffnen sich GNOME-typisch als Dialog (`Strg+,` oder
+Menü) und **gelten sofort** — kein Speichern-Knopf. Nur ein Tastenwechsel
+zeigt ein Banner „Daemon-Neustart nötig". Weitere Kürzel: `Strg+R` Aufnahme
+in der Werkbank, `Strg+1–3` Ansichten, `Strg+Q` beenden.
+
+## Wörterbuch, Diktier-Modi & Schnipsel
+
+- **Eigene Begriffe** (Einstellungen → Wörterbuch): Namen/Fachbegriffe, ein
+  Begriff pro Zeile — fließen in die Erkennung ein (Hotwords + Prompt).
+- **Ersetzungen**: hartnäckige Fehlerkennungen automatisch korrigieren,
+  Format `falsch = richtig` (ganze Wörter, Groß-/Kleinschreibung egal).
+- **Sprach-Schnipsel**: Sprich exakt den Auslöser („Grußformel"), und der
+  hinterlegte Text wird eingefügt. Format `auslöser = Text` (`\n` = Umbruch).
+- **Diktier-Modus** (Einstellungen → KI): `Standard`, `E-Mail` (formell, KI
+  immer an), `Chat` (locker, KI immer an) oder `Roh` (KI nie).
+
 ## Dateien
 
 - `dictation/daemon.py` — Hintergrunddienst (Hotkey, Aufnahme, Transkription, Paste)
@@ -118,6 +151,12 @@ journalctl --user -u whisper-dictation -f      # Live-Log
 | `record_device` | ALSA-Gerät, Standard `default` |
 | `ollama_postprocess` | `false` (Standard). LLM-Textverbesserung an/aus |
 | `ollama_model` | `qwen2.5:7b` (Standard) |
+| `dictation_mode` | `standard` (Standard), `email`, `chat`, `raw` |
+| `dictionary` | Liste eigener Begriffe (GUI: Wörterbuch) |
+| `replacements` | `{"falsch": "richtig"}` — Wort-Korrekturen nach der Erkennung |
+| `snippets` | `{"auslöser": "Text"}` — Sprach-Schnipsel |
+| `hotkey_mode` | `double_tap` (Standard) oder `push_to_talk` |
+| `restore_clipboard` | `true`; pausiert automatisch bei laufendem Clipboard-Manager |
 
 ## Textverbesserung (Ollama, optional)
 
