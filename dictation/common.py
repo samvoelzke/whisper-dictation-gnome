@@ -90,6 +90,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ollama_system_prompt": "",
     # Let thinking-capable Ollama models think before answering (slower).
     "ollama_thinking": False,
+    # How long Ollama keeps the model in RAM after a request ("0" = unload
+    # immediately, costs a few seconds reload on the next request; the model
+    # is ~5 GB resident while warm).
+    "ollama_keep_alive": "10m",
     # Double-tap this key to toggle Ollama cleanup on/off ("" = disabled).
     # Must differ from double_tap_key. Same value set as double_tap_key.
     "llm_toggle_key": "",
@@ -424,7 +428,7 @@ def ollama_chat(cfg: dict[str, Any], messages: list[dict[str, str]], *,
         "messages": messages,
         "stream": False,
         "think": think,
-        "keep_alive": "10m",
+        "keep_alive": str(cfg.get("ollama_keep_alive", "10m")),
         "options": {"temperature": temperature},
     }
     req = urllib.request.Request(
