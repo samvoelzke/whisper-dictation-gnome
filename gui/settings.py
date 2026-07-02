@@ -232,7 +232,18 @@ VISUALIZER_OPTIONS = [
     ("bar", "Balken (Pegel)"),
     ("none", "Aus"),
 ]
-ACCENT_RGB = (0.21, 0.52, 0.89)  # GNOME blue #3584e4, readable on light + dark
+_FALLBACK_ACCENT = (0.21, 0.52, 0.89)  # GNOME blue #3584e4
+
+
+def accent_rgb() -> tuple[float, float, float]:
+    """The user's system accent color (GNOME setting), with a blue fallback."""
+    try:
+        rgba = Adw.StyleManager.get_default().get_accent_color_rgba()
+        return (rgba.red, rgba.green, rgba.blue)
+    except Exception:
+        return _FALLBACK_ACCENT
+
+
 _APP_CSS_PROVIDER = None
 
 
@@ -399,7 +410,7 @@ class AudioVisualizer(Gtk.DrawingArea):
         self.queue_draw()
 
     def _draw(self, _area, cr, width, height) -> None:
-        r, g, b = ACCENT_RGB
+        r, g, b = accent_rgb()
         if self._mode == "bar":
             cr.set_source_rgba(r, g, b, 0.16)
             cr.rectangle(0, height * 0.30, width, height * 0.40)
@@ -492,11 +503,16 @@ class WorkbenchView(Gtk.Box):
         clamp.set_child(box)
 
         rec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        self.rec_btn = Gtk.Button(label="🔴 Aufnehmen")
+        self.rec_btn = Gtk.Button()
+        self._rec_btn_content = Adw.ButtonContent(
+            icon_name="media-record-symbolic", label="Aufnehmen")
+        self.rec_btn.set_child(self._rec_btn_content)
         self.rec_btn.add_css_class("pill")
         self.rec_btn.add_css_class("suggested-action")
         self.rec_btn.connect("clicked", self._toggle_record)
         rec_row.append(self.rec_btn)
+        self.spinner = Gtk.Spinner(visible=False)
+        rec_row.append(self.spinner)
         self.status = Gtk.Label(label="Bereit", xalign=0, hexpand=True)
         self.status.add_css_class("dim-label")
         rec_row.append(self.status)
@@ -519,11 +535,16 @@ class WorkbenchView(Gtk.Box):
         scroller.set_child(self.text_view)
         box.append(scroller)
 
-        presets = Gtk.FlowBox(
-            selection_mode=Gtk.SelectionMode.NONE,
-            column_spacing=4, row_spacing=4, max_children_per_line=12,
-            halign=Gtk.Align.START,
-        )
+        # Adw.WrapBox (libadwaita >= 1.7) wraps unevenly sized chips naturally;
+        # FlowBox stays as fallback for older libadwaita.
+        if hasattr(Adw, "WrapBox"):
+            presets = Adw.WrapBox(child_spacing=4, line_spacing=4)
+        else:
+            presets = Gtk.FlowBox(
+                selection_mode=Gtk.SelectionMode.NONE,
+                column_spacing=4, row_spacing=4, max_children_per_line=12,
+                halign=Gtk.Align.START,
+            )
         for label, instruction in WB_PRESETS:
             chip = Gtk.Button(label=label)
             chip.add_css_class("flat")
@@ -537,7 +558,6 @@ class WorkbenchView(Gtk.Box):
         self.instr.connect("activate", self._run_instruction)
         instr_row.append(self.instr)
         self.send_btn = Gtk.Button(label="Ausführen")
-        self.send_btn.add_css_class("suggested-action")
         self.send_btn.connect("clicked", self._run_instruction)
         instr_row.append(self.send_btn)
         box.append(instr_row)
@@ -546,8 +566,8 @@ class WorkbenchView(Gtk.Box):
         clear_btn = Gtk.Button(label="Leeren")
         clear_btn.connect("clicked", lambda *_: self._set_text(""))
         bottom.append(clear_btn)
-        copy_btn = Gtk.Button(label="Kopieren")
-        copy_btn.add_css_class("suggested-action")
+        copy_btn = Gtk.Button()
+        copy_btn.set_child(Adw.ButtonContent(icon_name="edit-copy-symbolic", label="Kopieren"))
         copy_btn.connect("clicked", self._copy)
         bottom.append(copy_btn)
         box.append(bottom)
@@ -574,6 +594,18 @@ class WorkbenchView(Gtk.Box):
     def _set_text(self, text: str) -> None:
         self.text_view.get_buffer().set_text(text)
 
+    def _set_status(self, text: str, error: bool = False, busy: bool = False) -> None:
+        """One status line: gray for state, red for errors, spinner while busy."""
+        self.status.set_text(text)
+        if error:
+            self.status.remove_css_class("dim-label")
+            self.status.add_css_class("error")
+        else:
+            self.status.remove_css_class("error")
+            self.status.add_css_class("dim-label")
+        self.spinner.set_visible(busy)
+        self.spinner.set_spinning(busy)
+
     def _toggle_record(self, *_a) -> None:
         if self.rec_proc is None:
             handle = tempfile.NamedTemporaryFile(
@@ -588,10 +620,13 @@ class WorkbenchView(Gtk.Box):
                     "-r", "16000", "-c", "1", "-t", "wav", self.rec_wav,
                 ])
             except Exception as exc:
-                self.status.set_text(f"arecord-Fehler: {exc}")
+                self._set_status(f"arecord-Fehler: {exc}", error=True)
                 return
-            self.rec_btn.set_label("⏹ Stopp")
-            self.status.set_text("● Aufnahme läuft …")
+            self._rec_btn_content.set_icon_name("media-playback-stop-symbolic")
+            self._rec_btn_content.set_label("Stopp")
+            self.rec_btn.remove_css_class("suggested-action")
+            self.rec_btn.add_css_class("destructive-action")
+            self._set_status("Aufnahme läuft …")
             self._start_viz()
             return
 
@@ -602,8 +637,11 @@ class WorkbenchView(Gtk.Box):
             pass
         self.rec_proc = None
         self._stop_viz()
-        self.rec_btn.set_label("🔴 Aufnehmen")
-        self.status.set_text("Transkribiere …")
+        self._rec_btn_content.set_icon_name("media-record-symbolic")
+        self._rec_btn_content.set_label("Aufnehmen")
+        self.rec_btn.remove_css_class("destructive-action")
+        self.rec_btn.add_css_class("suggested-action")
+        self._set_status("Transkribiere …", busy=True)
         wav = self.rec_wav
 
         def work():
@@ -621,13 +659,13 @@ class WorkbenchView(Gtk.Box):
 
     def _after_transcribe(self, r: dict) -> bool:
         if "error" in r:
-            self.status.set_text(f"Fehler: {r['error']}")
+            self._set_status(f"Fehler: {r['error']}", error=True)
             return False
         text = str(r.get("text", "")).strip()
         cur = self._text()
         joined = (cur + " " + text).strip() if cur else text
         self._set_text(joined)
-        self.status.set_text("Bereit" if text else "Nichts erkannt")
+        self._set_status("Bereit" if text else "Nichts erkannt")
         return False
 
     def _run_instruction(self, *_a) -> None:
@@ -636,12 +674,12 @@ class WorkbenchView(Gtk.Box):
     def _do_instruct(self, instruction: str) -> None:
         text = self._text()
         if not text:
-            self.status.set_text("Erst etwas aufnehmen oder eingeben.")
+            self._set_status("Erst etwas aufnehmen oder eingeben.")
             return
         if not instruction:
             return
         self.send_btn.set_sensitive(False)
-        self.status.set_text("🤖 KI arbeitet …")
+        self._set_status("KI arbeitet …", busy=True)
 
         def work():
             try:
@@ -654,16 +692,17 @@ class WorkbenchView(Gtk.Box):
     def _after_instruct(self, r: dict) -> bool:
         self.send_btn.set_sensitive(True)
         if "error" in r:
-            self.status.set_text(f"Fehler: {r['error']}")
+            self._set_status(f"Fehler: {r['error']}", error=True)
             return False
         self._set_text(str(r.get("text", "")).strip())
         self.instr.set_text("")
-        self.status.set_text("Bereit")
+        self._set_status("Bereit")
         return False
 
     def _copy(self, *_a) -> None:
         subprocess.run(["wl-copy"], input=self._text().encode("utf-8"), check=False)
-        self.status.set_text("In Zwischenablage kopiert ✓")
+        if self._toast_cb:
+            self._toast_cb("In Zwischenablage kopiert ✓")
 
 
 class RecorderView(Gtk.Box):
@@ -738,6 +777,27 @@ class RecorderView(Gtk.Box):
     def _cv(row, options):
         i = row.get_selected()
         return options[i][0] if 0 <= i < len(options) else ""
+
+    def _rec_button_state(self, recording: bool, saving: bool = False) -> None:
+        if saving:
+            self._rec_content.set_icon_name("media-playback-stop-symbolic")
+            self._rec_content.set_label("Speichere …")
+            return
+        if recording:
+            self._rec_content.set_icon_name("media-playback-stop-symbolic")
+            self._rec_content.set_label("Aufnahme stoppen")
+            self.rec_btn.remove_css_class("suggested-action")
+            self.rec_btn.add_css_class("destructive-action")
+        else:
+            self._rec_content.set_icon_name("media-record-symbolic")
+            self._rec_content.set_label("Aufnahme starten")
+            self.rec_btn.remove_css_class("destructive-action")
+            self.rec_btn.add_css_class("suggested-action")
+
+    def _pause_button_state(self, paused: bool) -> None:
+        self._pause_content.set_icon_name(
+            "media-playback-start-symbolic" if paused else "media-playback-pause-symbolic")
+        self._pause_content.set_label("Fortsetzen" if paused else "Pause")
 
     def _toast(self, t):
         if self._toast_cb:
@@ -863,12 +923,18 @@ class RecorderView(Gtk.Box):
         ctlbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12,
                          halign=Gtk.Align.CENTER, margin_top=6)
         outer.append(ctlbox)
-        self.rec_btn = Gtk.Button(label="🔴 Aufnahme starten")
+        self.rec_btn = Gtk.Button()
+        self._rec_content = Adw.ButtonContent(icon_name="media-record-symbolic",
+                                              label="Aufnahme starten")
+        self.rec_btn.set_child(self._rec_content)
         self.rec_btn.add_css_class("pill")
         self.rec_btn.add_css_class("suggested-action")
         self.rec_btn.connect("clicked", self._toggle_record)
         ctlbox.append(self.rec_btn)
-        self.pause_btn = Gtk.Button(label="⏸ Pause")
+        self.pause_btn = Gtk.Button()
+        self._pause_content = Adw.ButtonContent(icon_name="media-playback-pause-symbolic",
+                                                label="Pause")
+        self.pause_btn.set_child(self._pause_content)
         self.pause_btn.add_css_class("pill")
         self.pause_btn.set_visible(False)
         self.pause_btn.connect("clicked", self._toggle_pause)
@@ -885,6 +951,15 @@ class RecorderView(Gtk.Box):
         refresh.connect("clicked", lambda *_: self.refresh())
         self.list_group.set_header_suffix(refresh)
         outer.append(self.list_group)
+
+        self._empty_status = Adw.StatusPage(
+            icon_name="audio-input-microphone-symbolic",
+            title="Noch keine Aufnahmen",
+            description="Starte oben eine Aufnahme — sie wird laufend gespeichert "
+                        "und erscheint dann hier.",
+        )
+        self._empty_status.set_visible(False)
+        outer.append(self._empty_status)
 
         self.refresh()
         return scroller
@@ -1021,12 +1096,9 @@ class RecorderView(Gtk.Box):
         self._recording_base = r.get("base")
         self._rec_start = GLib.get_monotonic_time() / 1e6
         self._paused = False
-        self.rec_btn.set_label("⏹ Aufnahme stoppen")
-        self.rec_btn.remove_css_class("suggested-action")
-        self.rec_btn.add_css_class("destructive-action")
-        self.pause_btn.set_label("⏸ Pause")
+        self._rec_button_state(recording=True)
+        self._pause_button_state(paused=False)
         self.pause_btn.set_visible(True)
-        self._toast("● Aufnahme läuft")
         if self._timer_id is None:
             self._timer_id = GLib.timeout_add(500, self._tick)
         self._start_meters()
@@ -1037,7 +1109,7 @@ class RecorderView(Gtk.Box):
         # run that off the main loop so the window never freezes.
         base = self._recording_base
         self.rec_btn.set_sensitive(False)
-        self.rec_btn.set_label("Speichere …")
+        self._rec_button_state(recording=True, saving=True)
         self._stop_meters()
 
         def work():
@@ -1053,9 +1125,7 @@ class RecorderView(Gtk.Box):
             GLib.source_remove(self._timer_id)
             self._timer_id = None
         self.timer_label.set_label("")
-        self.rec_btn.set_label("🔴 Aufnahme starten")
-        self.rec_btn.remove_css_class("destructive-action")
-        self.rec_btn.add_css_class("suggested-action")
+        self._rec_button_state(recording=False)
         self.pause_btn.set_visible(False)
         self.title_row.set_text("")
         self._toast(f"Aufnahme gespeichert ({fmt_duration(r.get('duration_seconds', 0))})")
@@ -1078,26 +1148,27 @@ class RecorderView(Gtk.Box):
     def _after_toggle_pause(self, paused: bool) -> bool:
         self.pause_btn.set_sensitive(True)
         self._paused = paused
+        self._pause_button_state(paused)
         if paused:
             self._frozen = GLib.get_monotonic_time() / 1e6 - self._rec_start
-            self.pause_btn.set_label("▶ Fortsetzen")
             self._stop_meters()          # no signal is captured while paused → flat
-            self._toast("⏸ Pausiert")
         else:
             self._rec_start = GLib.get_monotonic_time() / 1e6 - self._frozen
-            self.pause_btn.set_label("⏸ Pause")
             self._start_meters()
-            self._toast("● Weiter")
         return False
 
     def _tick(self):
         if self._recording_base is None:
             return False
         if self._paused:
-            dot, el = "<span foreground='#f5c211'>⏸</span>", self._frozen
+            el = self._frozen
+            self.timer_label.remove_css_class("error")
+            self.timer_label.add_css_class("warning")
         else:
-            dot, el = "<span foreground='#e01b24'>●</span>", GLib.get_monotonic_time() / 1e6 - self._rec_start
-        self.timer_label.set_markup(f"{dot} {int(el) // 60}:{int(el) % 60:02d}")
+            el = GLib.get_monotonic_time() / 1e6 - self._rec_start
+            self.timer_label.remove_css_class("warning")
+            self.timer_label.add_css_class("error")
+        self.timer_label.set_text(f"● {int(el) // 60}:{int(el) % 60:02d}")
         return True
 
     def _apply_record_status(self, r: dict):
@@ -1107,10 +1178,8 @@ class RecorderView(Gtk.Box):
             el = float(r.get("elapsed", 0))
             self._rec_start = GLib.get_monotonic_time() / 1e6 - el
             self._frozen = el
-            self.rec_btn.set_label("⏹ Aufnahme stoppen")
-            self.rec_btn.remove_css_class("suggested-action")
-            self.rec_btn.add_css_class("destructive-action")
-            self.pause_btn.set_label("▶ Fortsetzen" if self._paused else "⏸ Pause")
+            self._rec_button_state(recording=True)
+            self._pause_button_state(self._paused)
             self.pause_btn.set_visible(True)
             if self._timer_id is None:
                 self._timer_id = GLib.timeout_add(500, self._tick)
@@ -1138,13 +1207,11 @@ class RecorderView(Gtk.Box):
             self.list_group.remove(row)
         self._rows_by_base = {}
         items = data.get("recordings", []) if isinstance(data, dict) else []
-        if not items:
-            row = Adw.ActionRow(title="Noch keine Aufnahmen",
-                                subtitle="Starte oben eine Aufnahme – sie erscheint dann hier.")
-            row.add_prefix(Gtk.Image(icon_name="audio-input-microphone-symbolic",
-                                     valign=Gtk.Align.CENTER))
-            self.list_group.add(row)
-            self._rows_by_base["__empty__"] = row
+        has_items = bool(items)
+        self.list_group.set_visible(has_items)
+        if hasattr(self, "_empty_status"):
+            self._empty_status.set_visible(not has_items)
+        if not has_items:
             return False
         for item in items:
             self._add_row(item)
@@ -1237,6 +1304,9 @@ class RecorderView(Gtk.Box):
         dlg.set_default_response("go")
         dlg.connect("response", lambda _d, resp, e=entry, x=base:
                     self._summarize(x, e.get_text().strip()) if resp == "go" else None)
+        # Enter in the entry = confirm (instead of doing nothing)
+        entry.connect("activate", lambda *_: (dlg.force_close(),
+                                              self._summarize(base, entry.get_text().strip())))
         dlg.present(self.get_root())
 
     def _summarize(self, base, focus):
@@ -1248,7 +1318,7 @@ class RecorderView(Gtk.Box):
         self.refresh()
         if self._detail_base == base:
             self._load_detail_content(base)
-        self._toast("🤖 Erstelle Zusammenfassung …")
+        self._toast("Erstelle Zusammenfassung …")
 
         def work():
             args = [str(RECORDER_SCRIPT), "summarize", base]
@@ -1320,14 +1390,14 @@ class RecorderView(Gtk.Box):
 
     def _busy_subtitle(self, base):
         if self._busy_action.get(base) == "summarize":
-            return "🤖 Fasse zusammen …"
+            return "Fasse zusammen …"
         d = self._read_progress(base)
         if d.get("status") == "loading":
-            return "⏳ Lädt Modell …"
+            return "Lädt Modell …"
         pct = self._smoothed_pct(base)
         if pct is not None:
-            return f"⏳ Transkribiere … {pct} %{self._eta(base, pct)}"
-        return "⏳ Transkribiere …"
+            return f"Transkribiere … {pct} %{self._eta(base, pct)}"
+        return "Transkribiere …"
 
     def _poll_progress(self):
         for base in list(self._busy):
@@ -1399,7 +1469,9 @@ class RecorderView(Gtk.Box):
             REC_SOURCE_SHORT.get(meta.get("source", ""), meta.get("source", "")),
         ] if p)
         player = Adw.ActionRow(title="Audio", subtitle=meta_line)
-        play_btn = Gtk.Button(label="▶ Abspielen", valign=Gtk.Align.CENTER)
+        play_btn = Gtk.Button(icon_name="media-playback-start-symbolic",
+                              valign=Gtk.Align.CENTER)
+        play_btn.set_tooltip_text("Abspielen")
         play_btn.add_css_class("flat")
         play_lbl = Gtk.Label(label="")
         play_lbl.add_css_class("numeric")
@@ -1583,20 +1655,20 @@ class RecorderView(Gtk.Box):
         bar = self._detail["progress_bar"]
         lbl = self._detail["progress_lbl"]
         if self._busy_action.get(base) == "summarize":
-            lbl.set_label("🤖 Erstelle Zusammenfassung …")
+            lbl.set_label("Erstelle Zusammenfassung …")
             bar.pulse()
             return
         d = self._read_progress(base)
         if d.get("status") == "loading":
-            lbl.set_label("⏳ Lädt Modell …")
+            lbl.set_label("Lädt Modell …")
             bar.pulse()
             return
         pct = self._smoothed_pct(base)
         if pct is not None:
             bar.set_fraction(min(1.0, pct / 100.0))
-            lbl.set_label(f"⏳ Transkribiere … {pct} %{self._eta(base, pct)}")
+            lbl.set_label(f"Transkribiere … {pct} %{self._eta(base, pct)}")
         else:
-            lbl.set_label("⏳ Transkribiere …")
+            lbl.set_label("Transkribiere …")
             bar.pulse()
 
     # ── detail actions ───────────────────────────────────────────────────────
@@ -1644,6 +1716,8 @@ class RecorderView(Gtk.Box):
         dlg.add_response("ok", "Speichern")
         dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
         dlg.set_default_response("ok")
+        # Enter in the entry = confirm
+        entry.connect("activate", lambda *_: (dlg.force_close(), on_resp(dlg, "ok")))
 
         def apply_ui(new: str) -> bool:
             shown = new or base
@@ -1716,7 +1790,8 @@ class RecorderView(Gtk.Box):
             self._toast("ffplay nicht gefunden (ffmpeg installieren).")
             return
         self._play_start = GLib.get_monotonic_time() / 1e6
-        btn.set_label("⏹ Stopp")
+        btn.set_icon_name("media-playback-stop-symbolic")
+        btn.set_tooltip_text("Stopp")
         self._play_timer = GLib.timeout_add(500, self._play_tick, btn, lbl)
 
     def _play_tick(self, btn, lbl):
@@ -1731,7 +1806,8 @@ class RecorderView(Gtk.Box):
 
     def _reset_play_button(self, btn, lbl):
         try:
-            btn.set_label("▶ Abspielen")
+            btn.set_icon_name("media-playback-start-symbolic")
+            btn.set_tooltip_text("Abspielen")
             lbl.set_label("")
         except Exception:
             pass
@@ -1750,130 +1826,102 @@ class RecorderView(Gtk.Box):
             self._reset_play_button(self._detail["play_btn"], self._detail.get("play_lbl"))
 
 
-class SettingsWindow(Adw.ApplicationWindow):
-    def __init__(self, app: Adw.Application):
-        super().__init__(application=app, title="Whisper Dictation")
-        install_app_css()
-        self.set_default_size(940, 720)
-        self.set_size_request(420, 480)
+# Changing these keys re-grabs the evdev listener, which only happens at
+# daemon startup — the dialog shows a restart banner instead of restarting
+# silently mid-session.
+RESTART_KEYS = ("double_tap_key", "llm_toggle_key", "command_key")
+
+
+class PrefsDialog(Adw.PreferencesDialog):
+    """GNOME-style instant-apply settings: every change is saved immediately
+    and live-reloaded into the daemon (debounced). No save button."""
+
+    def __init__(self, win: SettingsWindow):
+        super().__init__(title="Einstellungen")
+        self.win = win
         self.config = load_config()
-        self.device_options = detect_alsa_capture_devices()
-        self._capturing = None          # (combo, opts_attr, button) while learning a key
+        self._reload_id = None
+        self._pending: dict = {}
+        self._debounce_id = None
+        self._updating = False          # guard: programmatic combo rebuilds
+        self._capturing = None
         self._capture_ctrl = None
+        self.device_options = detect_alsa_capture_devices()
 
-        self.toasts = Adw.ToastOverlay()
-        self.set_content(self.toasts)
+        # ── Seite 1: Diktat ──────────────────────────────────────────────
+        page = Adw.PreferencesPage(title="Diktat", icon_name="audio-input-microphone-symbolic")
+        self.add(page)
 
-        toolbar = Adw.ToolbarView()
-        self.toasts.set_child(toolbar)
+        self.banner = Adw.Banner(title="Tasten-Änderung — Daemon-Neustart nötig")
+        self.banner.set_button_label("Neu starten")
+        self.banner.connect("button-clicked", self._restart_for_keys)
+        if hasattr(page, "set_banner"):
+            page.set_banner(self.banner)
 
-        header = Adw.HeaderBar()
-        toolbar.add_top_bar(header)
-
-        self.stack = Adw.ViewStack()
-        switcher = Adw.ViewSwitcher(policy=Adw.ViewSwitcherPolicy.WIDE)
-        switcher.set_stack(self.stack)
-        header.set_title_widget(switcher)
-        toolbar.set_content(self.stack)
-
-        self.save_button = Gtk.Button(label="Speichern")
-        self.save_button.add_css_class("suggested-action")
-        self.save_button.connect("clicked", self._on_save)
-        header.pack_start(self.save_button)
-
-        menu = Gio.Menu()
-        menu.append("Diagnose", "win.diagnose")
-        menu.append("Daemon starten", "win.start")
-        menu.append("Daemon neu starten", "win.restart")
-        menu.append("Daemon stoppen", "win.stop")
-        menu.append("Log oeffnen", "win.log")
-        menu.append("Ueber Whisper Dictation", "win.about")
-        menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
-        header.pack_end(menu_button)
-        for name, handler in (
-            ("start", self._on_start), ("restart", self._on_restart),
-            ("stop", self._on_stop), ("log", self._on_log),
-            ("diagnose", self._on_diagnose), ("about", self._on_about),
-        ):
-            action = Gio.SimpleAction.new(name, None)
-            action.connect("activate", handler)
-            self.add_action(action)
-
-        # ── Werkbank (Hauptansicht) ──────────────────────────────────────────
-        self.workbench = WorkbenchView(toast_cb=self._toast)
-        self.stack.add_titled_with_icon(
-            self.workbench, "werkbank", "Werkbank", "audio-input-microphone-symbolic")
-
-        # ── Rekorder (Langaufnahme: Vorlesungen / Calls) ─────────────────────
-        self.recorder = RecorderView(toast_cb=self._toast)
-        self.stack.add_titled_with_icon(
-            self.recorder, "rekorder", "Rekorder", "media-record-symbolic")
-
-        # ── Verlauf ──────────────────────────────────────────────────────────
-        self._history_rows = []
-        self.stack.add_titled_with_icon(
-            self._build_history_page(), "verlauf", "Verlauf", "document-open-recent-symbolic")
-
-        # ── Einstellungen (zweite Ansicht) ───────────────────────────────────
-        page = Adw.PreferencesPage()
-        self.stack.add_titled_with_icon(
-            page, "settings", "Einstellungen", "applications-system-symbolic")
-
-        # ── Status ───────────────────────────────────────────────────────────
         status_group = Adw.PreferencesGroup()
         page.add(status_group)
         self.status_row = Adw.ActionRow(title="Daemon")
-        status_icon = Gtk.Image(icon_name="audio-input-microphone-symbolic")
-        self.status_row.add_prefix(status_icon)
+        self.status_row.add_prefix(Gtk.Image(icon_name="audio-input-microphone-symbolic"))
+        restart_btn = Gtk.Button(label="Neu starten", valign=Gtk.Align.CENTER)
+        restart_btn.add_css_class("flat")
+        restart_btn.connect("clicked", lambda *_: self.win._on_restart())
+        self.status_row.add_suffix(restart_btn)
         status_group.add(self.status_row)
 
-        # ── Erkennung ────────────────────────────────────────────────────────
         rec = Adw.PreferencesGroup(title="Erkennung")
         page.add(rec)
         self.model_row = self._combo("Modell", MODEL_OPTIONS, str(self.config["model"]))
-        self.model_row.connect("notify::selected", lambda *_: self._update_model_hint())
+        self._update_model_hint()
+        self.model_row.connect("notify::selected", self._on_model_changed)
         rec.add(self.model_row)
         self.language_row = self._combo(
-            "Sprache", LANGUAGE_OPTIONS, str(self.config.get("language", "de")).lower()
-        )
+            "Sprache", LANGUAGE_OPTIONS, str(self.config.get("language", "de")).lower())
+        self._bind_combo(self.language_row, LANGUAGE_OPTIONS, "language")
         rec.add(self.language_row)
         self.hotwords_row = Adw.EntryRow(title="Hotwords (Komma-getrennt)")
         self.hotwords_row.set_text(str(self.config.get("hotwords", "")))
+        self._bind_entry(self.hotwords_row, "hotwords")
         rec.add(self.hotwords_row)
         self.vad_row = Adw.SwitchRow(title="VAD", subtitle="Stille filtern (weniger Halluzinationen)")
         self.vad_row.set_active(bool(self.config.get("vad_filter", True)))
+        self._bind_switch(self.vad_row, "vad_filter")
         rec.add(self.vad_row)
         self.voice_row = Adw.SwitchRow(
             title="Sprachbefehle",
             subtitle="neue Zeile, neuer Absatz, Doppelpunkt, Fragezeichen …",
         )
         self.voice_row.set_active(bool(self.config.get("voice_commands", False)))
+        self._bind_switch(self.voice_row, "voice_commands")
         rec.add(self.voice_row)
 
-        # ── Eingabe ──────────────────────────────────────────────────────────
         inp = Adw.PreferencesGroup(title="Eingabe")
         page.add(inp)
         self.mode_row = self._combo(
-            "Modus", HOTKEY_MODE_OPTIONS, str(self.config.get("hotkey_mode", "double_tap"))
-        )
+            "Modus", HOTKEY_MODE_OPTIONS, str(self.config.get("hotkey_mode", "double_tap")))
+        self._bind_combo(self.mode_row, HOTKEY_MODE_OPTIONS, "hotkey_mode")
         inp.add(self.mode_row)
         hotkey_cur = str(self.config["double_tap_key"])
         self._hotkey_opts = key_options(HOTKEY_OPTIONS, hotkey_cur)
         self.hotkey_row = self._combo("Aufnahme-Taste", self._hotkey_opts, hotkey_cur)
+        self._bind_combo(self.hotkey_row, self._hotkey_opts, "double_tap_key")
         inp.add(self.hotkey_row)
         inp.add(self._make_capture_row("hotkey_row", "_hotkey_opts"))
         self.double_tap_row = Adw.SpinRow.new_with_range(150, 1200, 10)
         self.double_tap_row.set_title("Double-Tap-Fenster (ms)")
         self.double_tap_row.set_value(float(self.config["double_tap_window_ms"]))
+        self._bind_spin(self.double_tap_row, "double_tap_window_ms")
         inp.add(self.double_tap_row)
         self.paste_row = self._combo("Paste-Modus", PASTE_OPTIONS, str(self.config["paste_mode"]))
+        self._bind_combo(self.paste_row, PASTE_OPTIONS, "paste_mode")
         inp.add(self.paste_row)
         self.max_record_row = Adw.SpinRow.new_with_range(15, 900, 5)
         self.max_record_row.set_title("Max. Aufnahme (s)")
         self.max_record_row.set_value(float(self.config["max_record_seconds"]))
+        self._bind_spin(self.max_record_row, "max_record_seconds")
         inp.add(self.max_record_row)
         self.sound_row = Adw.SwitchRow(title="Sound-Feedback", subtitle="Ton bei Start/Fertig")
         self.sound_row.set_active(bool(self.config.get("sound_cue", True)))
+        self._bind_switch(self.sound_row, "sound_cue")
         inp.add(self.sound_row)
         self.clipboard_row = Adw.SwitchRow(
             title="Zwischenablage schonen",
@@ -1882,62 +1930,71 @@ class SettingsWindow(Adw.ApplicationWindow):
                      "Diktat dort an erster Stelle.",
         )
         self.clipboard_row.set_active(bool(self.config.get("restore_clipboard", True)))
+        self._bind_switch(self.clipboard_row, "restore_clipboard")
         inp.add(self.clipboard_row)
         self.history_row = Adw.SwitchRow(
             title="Verlauf speichern",
             subtitle="Diktate im Verlauf-Tab merken",
         )
         self.history_row.set_active(bool(self.config.get("save_history", True)))
+        self._bind_switch(self.history_row, "save_history")
         inp.add(self.history_row)
 
-        # ── Audio + Erweitert ────────────────────────────────────────────────
         audio = Adw.PreferencesGroup(title="Audio")
         page.add(audio)
         self.device_row = self._combo("Mikrofon", self.device_options, str(self.config["record_device"]))
+        self._bind_combo(self.device_row, self.device_options, "record_device")
         audio.add(self.device_row)
         self.viz_row = self._combo("Live-Visualisierung", VISUALIZER_OPTIONS,
                                    str(self.config.get("audio_visualizer", "waves")))
         self.viz_row.set_subtitle("Während der Aufnahme in Werkbank und Rekorder: "
                                   "Wellen (Lautstärke-Verlauf), Balken oder aus.")
-        self.viz_row.connect("notify::selected", self._on_visualizer_changed)
+        self._bind_combo(self.viz_row, VISUALIZER_OPTIONS, "audio_visualizer")
         audio.add(self.viz_row)
 
-        # ── Textverbesserung (Ollama, optional) ──────────────────────────────
+        # ── Seite 2: KI & Kontext ────────────────────────────────────────
+        page2 = Adw.PreferencesPage(title="KI & Kontext", icon_name="text-editor-symbolic")
+        self.add(page2)
         llm = Adw.PreferencesGroup(
             title="Textverbesserung (Ollama)",
-            description="Optionaler LLM-Schritt: entfernt Fuellwoerter, fixt Grammatik. "
-                        "Kostet ~2-4 s extra. Standard: aus.",
+            description="Optionaler LLM-Schritt: entfernt Füllwörter, korrigiert "
+                        "Grammatik. Kostet ~2–4 s extra. Standard: aus.",
         )
-        page.add(llm)
+        page2.add(llm)
         self.ollama_row = Adw.SwitchRow(
             title="Ollama-Nachbearbeitung",
             subtitle="Braucht laufenden Ollama-Server",
         )
         self.ollama_row.set_active(bool(self.config.get("ollama_postprocess", False)))
+        self.ollama_row.connect("notify::active", self._on_ollama_toggled)
         llm.add(self.ollama_row)
         current_model = str(self.config.get("ollama_model", "qwen2.5:7b"))
         self._llm_model_opts = list(LLM_MODEL_OPTIONS)
         if current_model not in [v for v, _ in self._llm_model_opts]:
             self._llm_model_opts.append((current_model, f"{current_model}  (eigenes)"))
         self.ollama_model_row = self._combo("Modell", self._llm_model_opts, current_model)
-        # '✓ installiert'-Markierungen kommen asynchron ('ollama list' braucht
-        # bis zu 3 s und darf den Fensteraufbau nicht blockieren).
-        self._mark_installed_ollama_models()
-        self.ollama_model_row.set_subtitle("Mehr Sterne = stärker, aber langsamer. Muss via 'ollama pull' installiert sein.")
+        self.ollama_model_row.set_subtitle(
+            "Mehr Sterne = stärker, aber langsamer. Muss via 'ollama pull' installiert sein.")
+        self._bind_combo(self.ollama_model_row, self._llm_model_opts, "ollama_model")
         llm.add(self.ollama_model_row)
+        self._mark_installed_ollama_models()
         toggle_cur = str(self.config.get("llm_toggle_key", ""))
         self._llm_toggle_opts = key_options(LLM_TOGGLE_OPTIONS, toggle_cur)
         self.llm_toggle_row = self._combo(
-            "Umschalt-Taste (Doppel-Tap)", self._llm_toggle_opts, toggle_cur,
-        )
-        self.llm_toggle_row.set_subtitle("Schaltet Cleanup an/aus. Muss sich von der Aufnahme-Taste unterscheiden.")
+            "Umschalt-Taste (Doppel-Tap)", self._llm_toggle_opts, toggle_cur)
+        self.llm_toggle_row.set_subtitle(
+            "Schaltet Cleanup an/aus. Muss sich von der Aufnahme-Taste unterscheiden.")
+        self._bind_combo(self.llm_toggle_row, self._llm_toggle_opts, "llm_toggle_key")
         llm.add(self.llm_toggle_row)
         llm.add(self._make_capture_row("llm_toggle_row", "_llm_toggle_opts"))
-
         command_cur = str(self.config.get("command_key", ""))
         self._command_opts = key_options(LLM_TOGGLE_OPTIONS, command_cur)
-        self.command_row = self._combo("Befehl-Taste (markierten Text bearbeiten)", self._command_opts, command_cur)
-        self.command_row.set_subtitle("Doppel-Tap, dann Anweisung sprechen → ersetzt die Markierung. Funktioniert in Textfeldern, nicht im Terminal.")
+        self.command_row = self._combo(
+            "Befehl-Taste (markierten Text bearbeiten)", self._command_opts, command_cur)
+        self.command_row.set_subtitle(
+            "Doppel-Tap, dann Anweisung sprechen → ersetzt die Markierung. "
+            "Funktioniert in Textfeldern, nicht im Terminal.")
+        self._bind_combo(self.command_row, self._command_opts, "command_key")
         llm.add(self.command_row)
         llm.add(self._make_capture_row("command_row", "_command_opts"))
 
@@ -1946,128 +2003,166 @@ class SettingsWindow(Adw.ApplicationWindow):
             description="Lenkt die Erkennung Richtung deiner Begriffe — wird nicht "
                         "mitgeschrieben. Leer lassen = aus.",
         )
-        page.add(adv)
-        prompt_scroller = Gtk.ScrolledWindow(min_content_height=84)
+        page2.add(adv)
+        prompt_scroller = Gtk.ScrolledWindow(min_content_height=110)
         prompt_scroller.add_css_class("card")
+        prompt_scroller.add_css_class("editor-card")
         self.prompt_view = Gtk.TextView(
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
             top_margin=8, bottom_margin=8, left_margin=8, right_margin=8,
         )
         self.prompt_view.get_buffer().set_text(str(self.config.get("initial_prompt", "")))
+        self.prompt_view.get_buffer().connect("changed", self._on_prompt_changed)
         prompt_scroller.set_child(self.prompt_view)
         adv.add(prompt_scroller)
 
-        self._update_model_hint()
-        self._refresh_status()
+        self.refresh_status()
 
-        # Open on the Werkbank; the Speichern button only matters in settings.
-        self.stack.set_visible_child_name("werkbank")
-        self.stack.connect("notify::visible-child-name", self._on_view_changed)
-        self._on_view_changed()
-        # Stop background meter/playback processes when the window is closed.
-        self.connect("close-request", self._on_close)
+    # ── Instant apply ─────────────────────────────────────────────────────
 
-    def _on_close(self, *_a) -> bool:
-        self.recorder.on_hidden()
+    def _apply(self, key: str, value) -> None:
+        # Re-read from disk so keys the Rekorder tab persists are never lost.
+        cfg = load_config()
+        if cfg.get(key) == value:
+            return
+        cfg[key] = value
+        save_config(cfg)
+        self.config = cfg
+        self.win.config = cfg
+        if key == "audio_visualizer":
+            self.win.recorder.set_visualizer_mode(str(value))
+            self.win.workbench._viz.set_mode(str(value))
+        if key in RESTART_KEYS:
+            self.banner.set_revealed(True)
+        else:
+            self._schedule_reload()
+
+    def _bind_combo(self, row: Adw.ComboRow, options: list, key: str) -> None:
+        row.connect(
+            "notify::selected",
+            lambda *_: None if self._updating else self._apply(key, self._cv(row, options)),
+        )
+
+    def _bind_switch(self, row: Adw.SwitchRow, key: str) -> None:
+        row.connect("notify::active", lambda *_: self._apply(key, bool(row.get_active())))
+
+    def _bind_spin(self, row: Adw.SpinRow, key: str) -> None:
+        row.connect("notify::value", lambda *_: self._apply(key, int(row.get_value())))
+
+    def _bind_entry(self, row: Adw.EntryRow, key: str) -> None:
+        row.connect("notify::text",
+                    lambda *_: self._apply_debounced(key, row.get_text().strip()))
+
+    def _on_prompt_changed(self, buf) -> None:
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+        self._apply_debounced("initial_prompt", text)
+
+    def _apply_debounced(self, key: str, value) -> None:
+        """Free-text fields save 800 ms after the last keystroke, not on each."""
+        self._pending[key] = value
+        if self._debounce_id is not None:
+            GLib.source_remove(self._debounce_id)
+        self._debounce_id = GLib.timeout_add(800, self._flush_pending)
+
+    def _flush_pending(self) -> bool:
+        self._debounce_id = None
+        pending, self._pending = self._pending, {}
+        for key, value in pending.items():
+            self._apply(key, value)
         return False
 
-    def _on_visualizer_changed(self, *_a) -> None:
-        mode = self._combo_value(self.viz_row, VISUALIZER_OPTIONS)
-        cfg = load_config()
-        cfg["audio_visualizer"] = mode
-        save_config(cfg)
-        self.config["audio_visualizer"] = mode
-        self.recorder.set_visualizer_mode(mode)        # live in the recorder tab
-        self.workbench._viz.set_mode(mode)             # next dictation uses it
-        self._toast({"waves": "Wellen", "bar": "Balken", "none": "Aus"}.get(mode, mode))
+    def _schedule_reload(self) -> None:
+        if self._reload_id is not None:
+            GLib.source_remove(self._reload_id)
+        self._reload_id = GLib.timeout_add(600, self._do_reload)
 
-    def _on_view_changed(self, *_a) -> None:
-        name = self.stack.get_visible_child_name()
-        self.save_button.set_visible(name == "settings")
-        if name == "verlauf":
-            self._refresh_history()
-        if name == "rekorder":
-            self.recorder.on_shown()
-        else:
-            self.recorder.on_hidden()  # stop live meters / playback when leaving
+    def _do_reload(self) -> bool:
+        self._reload_id = None
 
-    # ── Verlauf (history) ───────────────────────────────────────────────────────
+        def work():
+            subprocess.run([str(DAEMON_SCRIPT), "--reload"], capture_output=True, check=False)
+        threading.Thread(target=work, daemon=True).start()
+        return False
 
-    def _build_history_page(self) -> Adw.PreferencesPage:
-        page = Adw.PreferencesPage()
-        self._history_group = Adw.PreferencesGroup(
-            title="Verlauf der Diktate",
-            description="Zuletzt eingesprochene Texte — kopieren oder in der Werkbank weiterbearbeiten.",
-        )
-        clear = Gtk.Button(label="Leeren", valign=Gtk.Align.CENTER)
-        clear.add_css_class("flat")
-        clear.connect("clicked", self._clear_history)
-        self._history_group.set_header_suffix(clear)
-        page.add(self._history_group)
-        return page
+    def _restart_for_keys(self, *_a) -> None:
+        self.banner.set_revealed(False)
+        self.win._daemon_action(
+            "--restart", "Daemon neu gestartet — neue Taste aktiv.", "Neustart fehlgeschlagen")
 
-    def _refresh_history(self) -> None:
-        for row in self._history_rows:
-            self._history_group.remove(row)
-        self._history_rows = []
-        entries = read_history(100)
-        if not entries:
-            row = Adw.ActionRow(title="Noch keine Diktate")
-            self._history_group.add(row)
-            self._history_rows.append(row)
+    def _on_ollama_toggled(self, *_a) -> None:
+        active = bool(self.ollama_row.get_active())
+        self._apply("ollama_postprocess", active)
+        if not active:
             return
-        for entry in reversed(entries):
-            text = str(entry.get("text", "")).strip()
-            row = Adw.ActionRow(
-                title=(text[:90] + "…") if len(text) > 90 else (text or "(leer)"),
-                subtitle=format_ts(entry.get("ts")),
-            )
-            copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
-            copy.add_css_class("flat")
-            copy.set_tooltip_text("Kopieren")
-            copy.connect("clicked", lambda _b, t=text: self._copy_text(t))
-            load = Gtk.Button(label="In Werkbank", valign=Gtk.Align.CENTER)
-            load.add_css_class("flat")
-            load.connect("clicked", lambda _b, t=text: self._load_to_workbench(t))
-            row.add_suffix(copy)
-            row.add_suffix(load)
-            self._history_group.add(row)
-            self._history_rows.append(row)
+        model = self._cv(self.ollama_model_row, self._llm_model_opts)
 
-    def _copy_text(self, text: str) -> None:
-        subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=False)
-        self._toast("In Zwischenablage kopiert ✓")
+        def work():
+            if self.win._ollama_model_installed(model) is False:
+                GLib.idle_add(self._toast, f"Modell fehlt: ollama pull {model}")
+        threading.Thread(target=work, daemon=True).start()
 
-    def _load_to_workbench(self, text: str) -> None:
-        self.workbench._set_text(text)
-        self.stack.set_visible_child_name("werkbank")
+    def _toast(self, text: str) -> bool:
+        self.add_toast(Adw.Toast.new(text))
+        return False
 
-    def _clear_history(self, *_a) -> None:
-        try:
-            HISTORY_FILE.write_text("", encoding="utf-8")
-        except Exception:
-            pass
-        self._refresh_history()
+    # ── UI helpers ────────────────────────────────────────────────────────
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _combo(self, title: str, options: list[tuple[str, str]], current: str) -> Adw.ComboRow:
+    def _combo(self, title: str, options: list, current: str) -> Adw.ComboRow:
         row = Adw.ComboRow(title=title)
         row.set_model(Gtk.StringList.new([label for _, label in options]))
-        idx = next((i for i, (value, _) in enumerate(options) if value == current), 0)
-        row.set_selected(idx)
+        row.set_selected(next((i for i, (v, _) in enumerate(options) if v == current), 0))
         return row
 
     @staticmethod
-    def _combo_value(row: Adw.ComboRow, options: list[tuple[str, str]]) -> str:
+    def _cv(row: Adw.ComboRow, options: list) -> str:
         i = row.get_selected()
         return options[i][0] if 0 <= i < len(options) else ""
 
-    # ── Key capture (press a key to set it) ─────────────────────────────────────
+    def _on_model_changed(self, *_a) -> None:
+        self._update_model_hint()
+        if not self._updating:
+            self._apply("model", self._cv(self.model_row, MODEL_OPTIONS))
+
+    def _update_model_hint(self) -> None:
+        self.model_row.set_subtitle(
+            MODEL_HINTS.get(self._cv(self.model_row, MODEL_OPTIONS), ""))
+
+    def refresh_status(self) -> None:
+        def work():
+            running = daemon_running()
+            GLib.idle_add(self.status_row.set_subtitle, "läuft" if running else "gestoppt")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _mark_installed_ollama_models(self) -> None:
+        """Prefix installed models with '✓' once `ollama list` answered (async)."""
+        def apply_marks(installed: set) -> bool:
+            if not installed:
+                return False
+            self._updating = True
+            try:
+                selected = self.ollama_model_row.get_selected()
+                self._llm_model_opts[:] = [
+                    (v, ("✓ " + lbl if v in installed and not lbl.startswith("✓ ") else lbl))
+                    for v, lbl in self._llm_model_opts
+                ]
+                self.ollama_model_row.set_model(
+                    Gtk.StringList.new([lbl for _, lbl in self._llm_model_opts]))
+                self.ollama_model_row.set_selected(selected)
+            finally:
+                self._updating = False
+            return False
+
+        def work():
+            GLib.idle_add(apply_marks, self.win._installed_ollama_models())
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── Key capture (press a key to set it) ───────────────────────────────
 
     def _make_capture_row(self, combo_attr: str, opts_attr: str) -> Adw.ActionRow:
         row = Adw.ActionRow(title="… oder Taste drücken zum Festlegen")
-        btn = Gtk.Button(label="🎯 Taste erfassen", valign=Gtk.Align.CENTER)
+        btn = Gtk.Button(valign=Gtk.Align.CENTER)
+        btn.set_child(Adw.ButtonContent(icon_name="input-keyboard-symbolic",
+                                        label="Taste erfassen"))
         btn.add_css_class("flat")
         btn.connect("clicked", lambda *_: self._start_capture(combo_attr, opts_attr, btn))
         row.add_suffix(btn)
@@ -2078,7 +2173,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         if self._capturing is not None:
             return
         self._capturing = (combo_attr, opts_attr, btn)
-        btn.set_label("… drück eine Taste (Esc = Abbruch)")
+        btn.set_child(Adw.ButtonContent(icon_name="input-keyboard-symbolic",
+                                        label="Taste drücken … (Esc bricht ab)"))
         ctrl = Gtk.EventControllerKey()
         ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         ctrl.connect("key-pressed", self._on_capture_key)
@@ -2102,65 +2198,305 @@ class SettingsWindow(Adw.ApplicationWindow):
             opts.append((value, key_label(value)))
             combo.get_model().append(key_label(value))
             vals.append(value)
+        # set_selected fires the bound handler -> the key is applied instantly
+        # and the restart banner appears.
         combo.set_selected(vals.index(value))
         self._end_capture(btn)
-        self._toast(f"Taste erfasst: {key_label(value)} — jetzt Speichern")
+        self._toast(f"Taste erfasst: {key_label(value)}")
         return True
 
     def _end_capture(self, btn: Gtk.Button) -> None:
-        btn.set_label("🎯 Taste erfassen")
+        btn.set_child(Adw.ButtonContent(icon_name="input-keyboard-symbolic",
+                                        label="Taste erfassen"))
         if self._capture_ctrl is not None:
             self.remove_controller(self._capture_ctrl)
             self._capture_ctrl = None
         self._capturing = None
 
-    def _update_model_hint(self) -> None:
-        model = self._combo_value(self.model_row, MODEL_OPTIONS)
-        self.model_row.set_subtitle(MODEL_HINTS.get(model, ""))
+
+class SettingsWindow(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application):
+        super().__init__(application=app, title="Whisper Dictation")
+        install_app_css()
+        self.config = load_config()
+        # Restore the last window geometry (stored in the config on close).
+        self.set_default_size(int(self.config.get("window_width", 940)),
+                              int(self.config.get("window_height", 720)))
+        if self.config.get("window_maximized"):
+            self.maximize()
+        self.set_size_request(360, 480)
+        self._prefs_dialog: PrefsDialog | None = None
+
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+
+        toolbar = Adw.ToolbarView()
+        self.toasts.set_child(toolbar)
+
+        header = Adw.HeaderBar()
+        toolbar.add_top_bar(header)
+
+        self.stack = Adw.ViewStack()
+        switcher = Adw.ViewSwitcher(policy=Adw.ViewSwitcherPolicy.WIDE)
+        switcher.set_stack(self.stack)
+        header.set_title_widget(switcher)
+        toolbar.set_content(self.stack)
+
+        # Narrow windows: the switcher moves into a bottom bar (HIG pattern).
+        self.switcher_bar = Adw.ViewSwitcherBar()
+        self.switcher_bar.set_stack(self.stack)
+        toolbar.add_bottom_bar(self.switcher_bar)
+        try:
+            bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 620sp"))
+            self._narrow_title = Adw.WindowTitle(title="Whisper Dictation")
+            bp.add_setter(header, "title-widget", self._narrow_title)
+            bp.add_setter(self.switcher_bar, "reveal", True)
+            self.add_breakpoint(bp)
+        except Exception:
+            pass  # very old libadwaita: keep the header switcher only
+
+        menu = Gio.Menu()
+        section = Gio.Menu()
+        section.append("Einstellungen", "win.prefs")
+        section.append("Tastenkürzel", "win.shortcuts")
+        menu.append_section(None, section)
+        section = Gio.Menu()
+        section.append("Daemon neu starten", "win.restart")
+        section.append("Daemon stoppen", "win.stop")
+        section.append("Diagnose", "win.diagnose")
+        section.append("Log öffnen", "win.log")
+        menu.append_section(None, section)
+        section = Gio.Menu()
+        section.append("Über Whisper Dictation", "win.about")
+        menu.append_section(None, section)
+        menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
+        menu_button.set_tooltip_text("Hauptmenü")
+        header.pack_end(menu_button)
+        for name, handler in (
+            ("prefs", self._on_prefs), ("shortcuts", self._on_shortcuts),
+            ("restart", self._on_restart), ("stop", self._on_stop),
+            ("log", self._on_log), ("diagnose", self._on_diagnose),
+            ("about", self._on_about), ("search", self._on_search),
+            ("record", self._on_record_accel),
+            ("view1", lambda *_: self.stack.set_visible_child_name("werkbank")),
+            ("view2", lambda *_: self.stack.set_visible_child_name("rekorder")),
+            ("view3", lambda *_: self.stack.set_visible_child_name("verlauf")),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self.add_action(action)
+
+        # ── Werkbank (Hauptansicht) ──────────────────────────────────────────
+        self.workbench = WorkbenchView(toast_cb=self._toast)
+        self.stack.add_titled_with_icon(
+            self.workbench, "werkbank", "Werkbank", "audio-input-microphone-symbolic")
+
+        # ── Rekorder (Langaufnahme: Vorlesungen / Calls) ─────────────────────
+        self.recorder = RecorderView(toast_cb=self._toast)
+        self.stack.add_titled_with_icon(
+            self.recorder, "rekorder", "Rekorder", "media-record-symbolic")
+
+        # ── Verlauf ──────────────────────────────────────────────────────────
+        self._history_rows = []
+        self.stack.add_titled_with_icon(
+            self._build_history_page(), "verlauf", "Verlauf", "document-open-recent-symbolic")
+
+
+        # Open on the Werkbank.
+        self.stack.set_visible_child_name("werkbank")
+        self.stack.connect("notify::visible-child-name", self._on_view_changed)
+        self._on_view_changed()
+        # Stop meter/playback processes and persist the geometry on close.
+        self.connect("close-request", self._on_close)
+
+    def _on_close(self, *_a) -> bool:
+        self.recorder.on_hidden()
+        try:
+            cfg = load_config()
+            cfg["window_width"] = self.get_width()
+            cfg["window_height"] = self.get_height()
+            cfg["window_maximized"] = bool(self.is_maximized())
+            save_config(cfg)
+        except Exception:
+            pass
+        return False
+
+    def _on_prefs(self, *_a) -> None:
+        if self._prefs_dialog is None:
+            self._prefs_dialog = PrefsDialog(self)
+            self._prefs_dialog.connect("closed", self._on_prefs_closed)
+        self._prefs_dialog.present(self)
+
+    def _on_prefs_closed(self, *_a) -> None:
+        self._prefs_dialog = None
+
+    def _on_shortcuts(self, *_a) -> None:
+        entries = (
+            ("<primary>comma", "Einstellungen öffnen"),
+            ("<primary>r", "Aufnahme starten/stoppen (Werkbank)"),
+            ("<primary>f", "Verlauf durchsuchen"),
+            ("<primary>1", "Werkbank"),
+            ("<primary>2", "Rekorder"),
+            ("<primary>3", "Verlauf"),
+            ("<primary>w", "Fenster schließen"),
+            ("<primary>q", "Beenden"),
+        )
+        try:
+            dlg = Adw.ShortcutsDialog()
+            sec = Adw.ShortcutsSection(title="Allgemein")
+            for accel, title in entries:
+                sec.add(Adw.ShortcutsItem.new(title, accel))
+            dlg.add(sec)
+            dlg.present(self)
+        except (AttributeError, TypeError):
+            # libadwaita < 1.8: plain list fallback
+            body = "\n".join(
+                f"{Gtk.accelerator_get_label(*Gtk.accelerator_parse(a)[1:])} — {t}"
+                for a, t in entries
+            )
+            dlg = Adw.AlertDialog(heading="Tastenkürzel", body=body)
+            dlg.add_response("ok", "OK")
+            dlg.present(self)
+
+    def _on_search(self, *_a) -> None:
+        self.stack.set_visible_child_name("verlauf")
+        self._history_search.grab_focus()
+
+    def _on_record_accel(self, *_a) -> None:
+        self.stack.set_visible_child_name("werkbank")
+        self.workbench._toggle_record()
+
+    def _on_view_changed(self, *_a) -> None:
+        name = self.stack.get_visible_child_name()
+        if name == "verlauf":
+            self._refresh_history()
+        if name == "rekorder":
+            self.recorder.on_shown()
+        else:
+            self.recorder.on_hidden()  # stop live meters / playback when leaving
+
+    # ── Verlauf (history) ───────────────────────────────────────────────────────
+
+    def _build_history_page(self) -> Gtk.Box:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        search_clamp = Adw.Clamp(maximum_size=940, tightening_threshold=720,
+                                 margin_top=12, margin_start=12, margin_end=12)
+        self._history_search = Gtk.SearchEntry(placeholder_text="Verlauf durchsuchen …")
+        self._history_search.connect("search-changed", lambda *_: self._filter_history())
+        search_clamp.set_child(self._history_search)
+        box.append(search_clamp)
+
+        self._history_page = Adw.PreferencesPage(vexpand=True)
+        self._history_group = Adw.PreferencesGroup(
+            title="Verlauf der Diktate",
+            description="Zuletzt eingesprochene Texte — kopieren oder in der Werkbank weiterbearbeiten.",
+        )
+        clear = Gtk.Button(label="Alle löschen", valign=Gtk.Align.CENTER)
+        clear.add_css_class("flat")
+        clear.connect("clicked", self._clear_history)
+        self._history_group.set_header_suffix(clear)
+        self._history_page.add(self._history_group)
+        box.append(self._history_page)
+
+        self._history_empty = Adw.StatusPage(
+            icon_name="document-open-recent-symbolic",
+            title="Noch keine Diktate",
+            description="Diktiere irgendwo Text per Hotkey — er erscheint dann hier "
+                        "zum Nachschlagen und Weiterbearbeiten.",
+            vexpand=True,
+        )
+        self._history_empty.set_visible(False)
+        box.append(self._history_empty)
+        return box
+
+    def _refresh_history(self) -> None:
+        for row in self._history_rows:
+            self._history_group.remove(row)
+        self._history_rows = []
+        entries = read_history(100)
+        has_entries = bool(entries)
+        self._history_page.set_visible(has_entries)
+        self._history_search.set_visible(has_entries)
+        self._history_empty.set_visible(not has_entries)
+        if not has_entries:
+            return
+        for entry in reversed(entries):
+            text = str(entry.get("text", "")).strip()
+            ts = entry.get("ts")
+            preview = (text[:90] + "…") if len(text) > 90 else (text or "(leer)")
+            row = Adw.ExpanderRow(subtitle=format_ts(ts))
+            row.set_title(GLib.markup_escape_text(preview))
+            row._search_text = text.lower()
+
+            copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
+            copy.add_css_class("flat")
+            copy.set_tooltip_text("Kopieren")
+            copy.connect("clicked", lambda _b, t=text: self._copy_text(t))
+            row.add_suffix(copy)
+            load = Gtk.Button(label="In Werkbank", valign=Gtk.Align.CENTER)
+            load.add_css_class("flat")
+            load.connect("clicked", lambda _b, t=text: self._load_to_workbench(t))
+            row.add_suffix(load)
+            trash = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
+            trash.add_css_class("flat")
+            trash.set_tooltip_text("Eintrag löschen")
+            trash.connect("clicked", lambda _b, t=ts: self._delete_history_entry(t))
+            row.add_suffix(trash)
+
+            full = Gtk.Label(label=text, wrap=True, xalign=0, selectable=True,
+                             margin_top=8, margin_bottom=10,
+                             margin_start=14, margin_end=14)
+            row.add_row(full)
+
+            self._history_group.add(row)
+            self._history_rows.append(row)
+        self._filter_history()
+
+    def _filter_history(self) -> None:
+        needle = self._history_search.get_text().strip().lower()
+        for row in self._history_rows:
+            row.set_visible(not needle or needle in getattr(row, "_search_text", ""))
+
+    def _delete_history_entry(self, ts) -> None:
+        try:
+            lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+            kept = []
+            for line in lines:
+                try:
+                    if json.loads(line).get("ts") == ts:
+                        continue
+                except Exception:
+                    pass
+                kept.append(line)
+            HISTORY_FILE.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        except Exception:
+            pass
+        self._refresh_history()
+        self._toast("Eintrag gelöscht")
+
+    def _copy_text(self, text: str) -> None:
+        subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=False)
+        self._toast("In Zwischenablage kopiert ✓")
+
+    def _load_to_workbench(self, text: str) -> None:
+        self.workbench._set_text(text)
+        self.stack.set_visible_child_name("werkbank")
+
+    def _clear_history(self, *_a) -> None:
+        try:
+            HISTORY_FILE.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+        self._refresh_history()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _refresh_status(self) -> None:
-        # Off the main thread: the status check spawns a subprocess (~30 ms) and
-        # is called at startup + after every daemon action.
-        def work():
-            running = daemon_running()
-            GLib.idle_add(self.status_row.set_subtitle, "● läuft" if running else "○ gestoppt")
-        threading.Thread(target=work, daemon=True).start()
-
-    def _prompt_text(self) -> str:
-        buf = self.prompt_view.get_buffer()
-        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+        if self._prefs_dialog is not None:
+            self._prefs_dialog.refresh_status()
 
     def _toast(self, text: str) -> None:
         self.toasts.add_toast(Adw.Toast.new(text))
-
-    def _config_from_form(self) -> dict:
-        # Start from the on-disk config so keys edited elsewhere (e.g. the
-        # Rekorder tab's source/auto choice) are preserved on save. The form
-        # fields below overwrite every key this page owns.
-        config = load_config()
-        config.update({
-            "model": self._combo_value(self.model_row, MODEL_OPTIONS),
-            "language": self._combo_value(self.language_row, LANGUAGE_OPTIONS),
-            "hotwords": self.hotwords_row.get_text().strip(),
-            "vad_filter": bool(self.vad_row.get_active()),
-            "voice_commands": bool(self.voice_row.get_active()),
-            "sound_cue": bool(self.sound_row.get_active()),
-            "restore_clipboard": bool(self.clipboard_row.get_active()),
-            "save_history": bool(self.history_row.get_active()),
-            "hotkey_mode": self._combo_value(self.mode_row, HOTKEY_MODE_OPTIONS),
-            "double_tap_key": self._combo_value(self.hotkey_row, self._hotkey_opts),
-            "double_tap_window_ms": int(self.double_tap_row.get_value()),
-            "paste_mode": self._combo_value(self.paste_row, PASTE_OPTIONS),
-            "max_record_seconds": int(self.max_record_row.get_value()),
-            "record_device": self._combo_value(self.device_row, self.device_options),
-            "audio_visualizer": self._combo_value(self.viz_row, VISUALIZER_OPTIONS),
-            "initial_prompt": self._prompt_text(),
-            "ollama_postprocess": bool(self.ollama_row.get_active()),
-            "ollama_model": self._combo_value(self.ollama_model_row, self._llm_model_opts),
-            "llm_toggle_key": self._combo_value(self.llm_toggle_row, self._llm_toggle_opts),
-            "command_key": self._combo_value(self.command_row, self._command_opts),
-        })
-        return config
 
     def _run_daemon(self, arg: str) -> tuple[int, str]:
         result = subprocess.run(
@@ -2197,69 +2533,11 @@ class SettingsWindow(Adw.ApplicationWindow):
     def _installed_ollama_models(self) -> set:
         return self._ollama_list()[1]
 
-    def _mark_installed_ollama_models(self) -> None:
-        """Prefix installed models with '✓' once `ollama list` answered."""
-        def apply_marks(installed: set) -> bool:
-            if not installed:
-                return False
-            selected = self.ollama_model_row.get_selected()
-            self._llm_model_opts = [
-                (v, ("✓ " + lbl if v in installed and not lbl.startswith("✓ ") else lbl))
-                for v, lbl in self._llm_model_opts
-            ]
-            self.ollama_model_row.set_model(
-                Gtk.StringList.new([lbl for _, lbl in self._llm_model_opts])
-            )
-            self.ollama_model_row.set_selected(selected)
-            return False
-
-        def work():
-            GLib.idle_add(apply_marks, self._installed_ollama_models())
-
-        threading.Thread(target=work, daemon=True).start()
-
     def _ollama_model_installed(self, model: str) -> bool | None:
         up, installed = self._ollama_list()
         return (model in installed) if up else None
 
     # ── Actions ────────────────────────────────────────────────────────────────
-
-    # Changing these keys re-grabs the evdev listener, which only happens at
-    # startup -> a full restart is needed. Everything else applies live.
-    RESTART_KEYS = ("double_tap_key", "llm_toggle_key", "command_key")
-
-    def _on_save(self, _button: Gtk.Button) -> None:
-        old, new = self.config, self._config_from_form()
-        self.config = new
-        save_config(new)
-        needs_restart = any(old.get(k) != new.get(k) for k in self.RESTART_KEYS)
-        arg = "--restart" if needs_restart else "--reload"
-        self.save_button.set_sensitive(False)
-
-        def work():
-            code, output = self._run_daemon(arg)
-            ollama_missing = bool(
-                new.get("ollama_postprocess")
-                and self._ollama_model_installed(new.get("ollama_model", "")) is False
-            )
-            GLib.idle_add(done, code, output, ollama_missing)
-
-        def done(code: int, output: str, ollama_missing: bool) -> bool:
-            self.save_button.set_sensitive(True)
-            if needs_restart:
-                msg = "Gespeichert und Daemon neu gestartet." if code == 0 else f"Neustart-Fehler: {output}"
-            else:
-                msg = "Gespeichert — Änderungen sind aktiv." if code == 0 else f"Reload-Fehler: {output}"
-            if ollama_missing:
-                msg += f"  ⚠ Modell nicht installiert: ollama pull {new['ollama_model']}"
-            self._toast(msg)
-            self._refresh_status()
-            return False
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_start(self, *_a) -> None:
-        self._daemon_action("--restart", "Daemon gestartet.", "Start fehlgeschlagen")
 
     def _on_restart(self, *_a) -> None:
         self._daemon_action("--restart", "Daemon neu gestartet.", "Neustart fehlgeschlagen")
@@ -2274,7 +2552,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             self._toast("Noch keine Logdatei vorhanden.")
 
     def _on_diagnose(self, *_a) -> None:
-        model = self._combo_value(self.ollama_model_row, self._llm_model_opts)
+        model = str(load_config().get("ollama_model", ""))
 
         def show(running: bool, backend: str, device: str, up: bool, installed: set) -> bool:
             body = (
@@ -2320,6 +2598,20 @@ class SettingsWindow(Adw.ApplicationWindow):
 class WhisperDictationApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id="io.voelzke.WhisperDictation")
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", lambda *_: self.quit())
+        self.add_action(quit_action)
+        for action, accels in {
+            "app.quit": ["<primary>q"],
+            "window.close": ["<primary>w"],
+            "win.prefs": ["<primary>comma"],
+            "win.search": ["<primary>f"],
+            "win.record": ["<primary>r"],
+            "win.view1": ["<primary>1"],
+            "win.view2": ["<primary>2"],
+            "win.view3": ["<primary>3"],
+        }.items():
+            self.set_accels_for_action(action, accels)
 
     def do_activate(self) -> None:
         window = self.props.active_window
