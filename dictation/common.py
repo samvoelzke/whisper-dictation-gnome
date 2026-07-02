@@ -190,7 +190,17 @@ def apply_replacements(cfg: dict[str, Any], text: str) -> str:
         wrong = str(wrong).strip()
         if not wrong:
             continue
-        text = re.sub(rf"\b{re.escape(wrong)}\b", str(right), text, flags=re.IGNORECASE)
+        # \b only exists next to word chars; terms like "z.B." would never
+        # match with a trailing \b, so boundaries are added conditionally.
+        pattern = re.escape(wrong)
+        if wrong[0].isalnum() or wrong[0] == "_":
+            pattern = r"\b" + pattern
+        if wrong[-1].isalnum() or wrong[-1] == "_":
+            pattern = pattern + r"\b"
+        # Replacement via callable: backslashes in the user's text are taken
+        # literally instead of raising 'bad escape' (which would kill the
+        # whole dictation).
+        text = re.sub(pattern, lambda _m, r=str(right): r, text, flags=re.IGNORECASE)
     return text
 
 
@@ -433,11 +443,22 @@ def ollama_chat(cfg: dict[str, Any], messages: list[dict[str, str]], *,
 # is preserved in the manager's history anyway).
 _CLIPBOARD_MANAGERS = r"vicinae-server|vicinae|copyq|gpaste-daemon|cliphist|clipman|clipse|parcellite"
 
+# (timestamp, result) — whether a manager runs changes ~never within a daemon
+# lifetime, so one pgrep per minute is plenty (instead of one per paste).
+_clip_mgr_cache: tuple[float, bool] | None = None
+
 
 def clipboard_manager_running() -> bool:
+    global _clip_mgr_cache
+    import time
+    now = time.monotonic()
+    if _clip_mgr_cache is not None and now - _clip_mgr_cache[0] < 60.0:
+        return _clip_mgr_cache[1]
     try:
-        return subprocess.run(
+        running = subprocess.run(
             ["pgrep", "-x", _CLIPBOARD_MANAGERS], capture_output=True,
         ).returncode == 0
     except FileNotFoundError:
-        return False
+        running = False
+    _clip_mgr_cache = (now, running)
+    return running

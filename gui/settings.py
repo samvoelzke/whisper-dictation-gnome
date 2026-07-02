@@ -54,8 +54,10 @@ from common import (  # noqa: E402
     DEFAULT_CONFIG,
     DICTATION_MODES,
     HISTORY_FILE,
+    HOTKEY_SPECS,
     IPC_SOCKET,
     LOG_FILE,
+    RECORDINGS_DIR,
     dictionary_terms,
     key_label,
     load_config,
@@ -161,28 +163,13 @@ LANGUAGE_OPTIONS = [
     ("pt", "Português"),
 ]
 
-# Pre-filled context that biases recognition toward DE + common English tech
-# terms (Whisper does not echo this into the output).
-DEFAULT_INITIAL_PROMPT = (
-    "Diktat auf Deutsch, teils mit englischen Fachbegriffen wie Pull Request, "
-    "Deployment, Bug, Backend, Repository, Meeting."
-)
-
 HOTKEY_MODE_OPTIONS = [
     ("double_tap", "Doppel-Tap (start/stopp)"),
     ("push_to_talk", "Push-to-Talk (halten)"),
 ]
 
-HOTKEY_OPTIONS = [
-    ("ctrl_r", "Right Ctrl"),
-    ("ctrl_l", "Left Ctrl"),
-    ("alt_r", "Right Alt"),
-    ("alt_l", "Left Alt"),
-    ("f8", "F8"),
-    ("f9", "F9"),
-    ("f10", "F10"),
-    ("pause", "Pause"),
-]
+# Derived from the daemon's key table so GUI and daemon can never drift.
+HOTKEY_OPTIONS = [(name, spec[0]) for name, spec in HOTKEY_SPECS.items()]
 
 # Key whose double-tap toggles Ollama cleanup on/off ("" = disabled).
 LLM_TOGGLE_OPTIONS = [("", "Aus")] + HOTKEY_OPTIONS
@@ -208,7 +195,6 @@ LLM_MODEL_OPTIONS = [
 
 # ── Long-form recorder (lectures / calls) ────────────────────────────────────
 RECORDER_SCRIPT = PROJECT_ROOT / "bin" / "whisper-recorder.sh"
-RECORDINGS_DIR = Path.home() / ".local" / "share" / "whisper-dictation" / "recordings"
 
 REC_SOURCE_OPTIONS = [
     ("both", "Mikrofon + System-Ton (Meeting)"),
@@ -237,15 +223,56 @@ VISUALIZER_OPTIONS = [
     ("none", "Aus"),
 ]
 _FALLBACK_ACCENT = (0.21, 0.52, 0.89)  # GNOME blue #3584e4
+_accent_cache: tuple[float, float, float] | None = None
+_accent_watching = False
+
+
+def _invalidate_accent(*_a) -> None:
+    global _accent_cache
+    _accent_cache = None
 
 
 def accent_rgb() -> tuple[float, float, float]:
-    """The user's system accent color (GNOME setting), with a blue fallback."""
+    """The user's system accent color (GNOME setting), with a blue fallback.
+
+    Cached: the meters redraw ~40×/s for hours, and the value only changes
+    when the user picks a new accent (invalidated via notify::accent-color).
+    """
+    global _accent_cache, _accent_watching
+    if _accent_cache is not None:
+        return _accent_cache
     try:
-        rgba = Adw.StyleManager.get_default().get_accent_color_rgba()
-        return (rgba.red, rgba.green, rgba.blue)
+        manager = Adw.StyleManager.get_default()
+        rgba = manager.get_accent_color_rgba()
+        _accent_cache = (rgba.red, rgba.green, rgba.blue)
+        if not _accent_watching:
+            manager.connect("notify::accent-color", _invalidate_accent)
+            _accent_watching = True
     except Exception:
-        return _FALLBACK_ACCENT
+        _accent_cache = _FALLBACK_ACCENT
+    return _accent_cache
+
+
+def copy_to_clipboard(text: str) -> bool:
+    """Copy via wl-copy; False if unavailable, so callers never show a false
+    'kopiert ✓' toast."""
+    try:
+        subprocess.run(["wl-copy"], input=(text or "").encode("utf-8"), check=True)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+
+def combo_row(title: str, options: list, current: str) -> Adw.ComboRow:
+    row = Adw.ComboRow(title=title)
+    row.set_model(Gtk.StringList.new([label for _, label in options]))
+    row.set_selected(next((i for i, (v, _) in enumerate(options) if v == current), 0))
+    return row
+
+
+def combo_value(row: Adw.ComboRow, options: list) -> str:
+    i = row.get_selected()
+    return options[i][0] if 0 <= i < len(options) else ""
 
 
 _APP_CSS_PROVIDER = None
@@ -704,9 +731,9 @@ class WorkbenchView(Gtk.Box):
         return False
 
     def _copy(self, *_a) -> None:
-        subprocess.run(["wl-copy"], input=self._text().encode("utf-8"), check=False)
+        ok = copy_to_clipboard(self._text())
         if self._toast_cb:
-            self._toast_cb("In Zwischenablage kopiert ✓")
+            self._toast_cb("In Zwischenablage kopiert ✓" if ok else "Kopieren fehlgeschlagen (wl-copy fehlt?)")
 
 
 class RecorderView(Gtk.Box):
@@ -771,16 +798,8 @@ class RecorderView(Gtk.Box):
         self._stop_play()
 
     # ── small helpers ────────────────────────────────────────────────────────
-    def _combo(self, title, options, current):
-        row = Adw.ComboRow(title=title)
-        row.set_model(Gtk.StringList.new([l for _, l in options]))
-        row.set_selected(next((i for i, (v, _) in enumerate(options) if v == current), 0))
-        return row
-
-    @staticmethod
-    def _cv(row, options):
-        i = row.get_selected()
-        return options[i][0] if 0 <= i < len(options) else ""
+    _combo = staticmethod(combo_row)
+    _cv = staticmethod(combo_value)
 
     def _rec_button_state(self, recording: bool, saving: bool = False) -> None:
         if saving:
@@ -813,8 +832,8 @@ class RecorderView(Gtk.Box):
         save_config(cfg)
 
     def _copy(self, text):
-        subprocess.run(["wl-copy"], input=(text or "").encode("utf-8"), check=False)
-        self._toast("In Zwischenablage kopiert ✓")
+        ok = copy_to_clipboard(text or "")
+        self._toast("In Zwischenablage kopiert ✓" if ok else "Kopieren fehlgeschlagen (wl-copy fehlt?)")
 
     def _load_devices_async(self, then_start_meters: bool = False):
         """Enumerate capture devices off the main thread (the call is ~180 ms),
@@ -1145,12 +1164,17 @@ class RecorderView(Gtk.Box):
         self.pause_btn.set_sensitive(False)
 
         def work():
-            recorder_call("record-pause" if going_paused else "record-resume")
-            GLib.idle_add(self._after_toggle_pause, going_paused)
+            r = recorder_call("record-pause" if going_paused else "record-resume")
+            GLib.idle_add(self._after_toggle_pause, going_paused, r)
         threading.Thread(target=work, daemon=True).start()
 
-    def _after_toggle_pause(self, paused: bool) -> bool:
+    def _after_toggle_pause(self, paused: bool, r: dict) -> bool:
         self.pause_btn.set_sensitive(True)
+        if "error" in r:
+            # Don't fake a paused UI over a recording that kept running.
+            self._toast(f"Pause fehlgeschlagen: {r['error']}")
+            self.refresh()
+            return False
         self._paused = paused
         self._pause_button_state(paused)
         if paused:
@@ -1850,17 +1874,21 @@ class PrefsDialog(Adw.PreferencesDialog):
         self._updating = False          # guard: programmatic combo rebuilds
         self._capturing = None
         self._capture_ctrl = None
-        self.device_options = detect_alsa_capture_devices()
+        self._banners: list[Adw.Banner] = []
+        # Filled asynchronously — arecord probing can stall on some hardware
+        # and must never block opening the dialog.
+        current_dev = str(self.config.get("record_device", "default"))
+        self.device_options = [(
+            current_dev,
+            "default (Systemstandard)" if current_dev == "default" else current_dev,
+        )]
+        # Debounced free-text edits must not be lost when the dialog closes.
+        self.connect("closed", lambda *_: self.flush_now())
 
         # ── Seite 1: Diktat ──────────────────────────────────────────────
         page = Adw.PreferencesPage(title="Diktat", icon_name="audio-input-microphone-symbolic")
         self.add(page)
-
-        self.banner = Adw.Banner(title="Tasten-Änderung — Daemon-Neustart nötig")
-        self.banner.set_button_label("Neu starten")
-        self.banner.connect("button-clicked", self._restart_for_keys)
-        if hasattr(page, "set_banner"):
-            page.set_banner(self.banner)
+        self._attach_banner(page)
 
         status_group = Adw.PreferencesGroup()
         page.add(status_group)
@@ -1955,10 +1983,12 @@ class PrefsDialog(Adw.PreferencesDialog):
                                   "Wellen (Lautstärke-Verlauf), Balken oder aus.")
         self._bind_combo(self.viz_row, VISUALIZER_OPTIONS, "audio_visualizer")
         audio.add(self.viz_row)
+        self._load_devices_async()
 
         # ── Seite 2: KI & Kontext ────────────────────────────────────────
         page2 = Adw.PreferencesPage(title="KI & Kontext", icon_name="text-editor-symbolic")
         self.add(page2)
+        self._attach_banner(page2)
         mode_group = Adw.PreferencesGroup(
             title="Diktier-Modus",
             description="Bestimmt, wie diktierter Text formuliert wird. "
@@ -1989,7 +2019,7 @@ class PrefsDialog(Adw.PreferencesDialog):
         self.ollama_model_row = self._combo("Modell", self._llm_model_opts, current_model)
         self.ollama_model_row.set_subtitle(
             "Mehr Sterne = stärker, aber langsamer. Muss via 'ollama pull' installiert sein.")
-        self._bind_combo(self.ollama_model_row, self._llm_model_opts, "ollama_model")
+        self.ollama_model_row.connect("notify::selected", self._on_ollama_model_changed)
         llm.add(self.ollama_model_row)
         self._mark_installed_ollama_models()
         toggle_cur = str(self.config.get("llm_toggle_key", ""))
@@ -2063,7 +2093,7 @@ class PrefsDialog(Adw.PreferencesDialog):
         page3.add(snip_group)
         snippets = self.config.get("snippets") or {}
         snip_group.add(self._editor_card(
-            "\n".join(f"{k} = {str(v).replace(chr(10), '\\n')}" for k, v in snippets.items()),
+            "\n".join(f"{k} = {self._escape_value(str(v))}" for k, v in snippets.items()),
             self._on_snippets_changed))
 
         self.refresh_status()
@@ -2071,21 +2101,31 @@ class PrefsDialog(Adw.PreferencesDialog):
     # ── Instant apply ─────────────────────────────────────────────────────
 
     def _apply(self, key: str, value) -> None:
-        # Re-read from disk so keys the Rekorder tab persists are never lost.
+        self._apply_many({key: value})
+
+    def _apply_many(self, changes: dict) -> None:
+        # Re-read from disk so keys the Rekorder tab persists are never lost;
+        # one read+write per batch, not per key.
         cfg = load_config()
-        if cfg.get(key) == value:
+        changed = {k: v for k, v in changes.items() if cfg.get(k) != v}
+        if not changed:
             return
-        cfg[key] = value
+        cfg.update(changed)
         save_config(cfg)
         self.config = cfg
         self.win.config = cfg
-        if key == "audio_visualizer":
-            self.win.recorder.set_visualizer_mode(str(value))
-            self.win.workbench._viz.set_mode(str(value))
-        if key in RESTART_KEYS:
-            self.banner.set_revealed(True)
-        else:
-            self._schedule_reload()
+        if "audio_visualizer" in changed:
+            mode = str(changed["audio_visualizer"])
+            self.win.recorder.set_visualizer_mode(mode)
+            self.win.workbench._viz.set_mode(mode)
+        if any(k in RESTART_KEYS for k in changed):
+            self._show_restart_banner()
+        if any(k not in RESTART_KEYS for k in changed):
+            # Model/backend switches make the daemon unload+reload a multi-GB
+            # model — debounce those longer so browsing the combo doesn't
+            # trigger a reload per entry.
+            heavy = any(k in ("model", "backend", "ov_device") for k in changed)
+            self._schedule_reload(2000 if heavy else 600)
 
     def _bind_combo(self, row: Adw.ComboRow, options: list, key: str) -> None:
         row.connect(
@@ -2138,7 +2178,17 @@ class PrefsDialog(Adw.PreferencesDialog):
             "snippets", self._parse_pairs(self._buffer_text(buf), unescape=True))
 
     @staticmethod
-    def _parse_pairs(text: str, unescape: bool) -> dict:
+    def _escape_value(value: str) -> str:
+        # Escape backslashes FIRST, then newlines — otherwise a literal "\n"
+        # in a snippet round-trips into a real newline and corrupts the text.
+        return value.replace("\\", "\\\\").replace("\n", "\\n")
+
+    @staticmethod
+    def _unescape_value(value: str) -> str:
+        return value.replace("\\\\", "\x00").replace("\\n", "\n").replace("\x00", "\\")
+
+    @classmethod
+    def _parse_pairs(cls, text: str, unescape: bool) -> dict:
         pairs: dict[str, str] = {}
         for line in text.splitlines():
             if "=" not in line:
@@ -2146,7 +2196,7 @@ class PrefsDialog(Adw.PreferencesDialog):
             key, _, value = line.partition("=")
             key, value = key.strip(), value.strip()
             if key and value:
-                pairs[key] = value.replace("\\n", "\n") if unescape else value
+                pairs[key] = cls._unescape_value(value) if unescape else value
         return pairs
 
     def _apply_debounced(self, key: str, value) -> None:
@@ -2159,14 +2209,27 @@ class PrefsDialog(Adw.PreferencesDialog):
     def _flush_pending(self) -> bool:
         self._debounce_id = None
         pending, self._pending = self._pending, {}
-        for key, value in pending.items():
-            self._apply(key, value)
+        if pending:
+            self._apply_many(pending)
         return False
 
-    def _schedule_reload(self) -> None:
+    def flush_now(self) -> None:
+        """Write out pending debounced edits + fire a scheduled reload
+        immediately (dialog/window is closing; the timeouts would be lost)."""
+        if self._debounce_id is not None:
+            GLib.source_remove(self._debounce_id)
+            self._debounce_id = None
+        pending, self._pending = self._pending, {}
+        if pending:
+            self._apply_many(pending)
         if self._reload_id is not None:
             GLib.source_remove(self._reload_id)
-        self._reload_id = GLib.timeout_add(600, self._do_reload)
+            self._do_reload()
+
+    def _schedule_reload(self, delay_ms: int = 600) -> None:
+        if self._reload_id is not None:
+            GLib.source_remove(self._reload_id)
+        self._reload_id = GLib.timeout_add(delay_ms, self._do_reload)
 
     def _do_reload(self) -> bool:
         self._reload_id = None
@@ -2176,16 +2239,47 @@ class PrefsDialog(Adw.PreferencesDialog):
         threading.Thread(target=work, daemon=True).start()
         return False
 
+    # ── Restart banner (one per page: two of the three hotkey rows live on
+    # page 2, and a banner widget can only have one parent) ────────────────
+
+    def _attach_banner(self, page: Adw.PreferencesPage) -> None:
+        if not hasattr(page, "set_banner"):
+            return  # libadwaita < 1.7
+        banner = Adw.Banner(title="Tasten-Änderung — Daemon-Neustart nötig")
+        banner.set_button_label("Neu starten")
+        banner.connect("button-clicked", self._restart_for_keys)
+        page.set_banner(banner)
+        self._banners.append(banner)
+
+    def _show_restart_banner(self) -> None:
+        if not self._banners:
+            # No banner support: restart right away (old behavior) instead
+            # of leaving the new key silently inactive.
+            self._restart_for_keys()
+            return
+        for banner in self._banners:
+            banner.set_revealed(True)
+
     def _restart_for_keys(self, *_a) -> None:
-        self.banner.set_revealed(False)
+        for banner in self._banners:
+            banner.set_revealed(False)
         self.win._daemon_action(
             "--restart", "Daemon neu gestartet — neue Taste aktiv.", "Neustart fehlgeschlagen")
 
     def _on_ollama_toggled(self, *_a) -> None:
         active = bool(self.ollama_row.get_active())
         self._apply("ollama_postprocess", active)
-        if not active:
+        if active:
+            self._warn_if_model_missing()
+
+    def _on_ollama_model_changed(self, *_a) -> None:
+        if self._updating:
             return
+        self._apply("ollama_model", self._cv(self.ollama_model_row, self._llm_model_opts))
+        if bool(self.config.get("ollama_postprocess")):
+            self._warn_if_model_missing()
+
+    def _warn_if_model_missing(self) -> None:
         model = self._cv(self.ollama_model_row, self._llm_model_opts)
 
         def work():
@@ -2199,16 +2293,27 @@ class PrefsDialog(Adw.PreferencesDialog):
 
     # ── UI helpers ────────────────────────────────────────────────────────
 
-    def _combo(self, title: str, options: list, current: str) -> Adw.ComboRow:
-        row = Adw.ComboRow(title=title)
-        row.set_model(Gtk.StringList.new([label for _, label in options]))
-        row.set_selected(next((i for i, (v, _) in enumerate(options) if v == current), 0))
-        return row
+    _combo = staticmethod(combo_row)
+    _cv = staticmethod(combo_value)
 
-    @staticmethod
-    def _cv(row: Adw.ComboRow, options: list) -> str:
-        i = row.get_selected()
-        return options[i][0] if 0 <= i < len(options) else ""
+    def _load_devices_async(self) -> None:
+        def apply(devices: list) -> bool:
+            cur = str(load_config().get("record_device", "default"))
+            if cur not in [v for v, _ in devices]:
+                devices = devices + [(cur, cur)]
+            self._updating = True
+            try:
+                self.device_options[:] = devices  # in place: the bind closure holds this list
+                self.device_row.set_model(Gtk.StringList.new([lbl for _, lbl in devices]))
+                self.device_row.set_selected(
+                    next((i for i, (v, _) in enumerate(devices) if v == cur), 0))
+            finally:
+                self._updating = False
+            return False
+
+        def work():
+            GLib.idle_add(apply, detect_alsa_capture_devices())
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_model_changed(self, *_a) -> None:
         self._update_model_hint()
@@ -2403,6 +2508,9 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _on_close(self, *_a) -> bool:
         self.recorder.on_hidden()
+        if self._prefs_dialog is not None:
+            # Debounced edits + scheduled reloads would die with the main loop.
+            self._prefs_dialog.flush_now()
         try:
             cfg = load_config()
             cfg["window_width"] = self.get_width()
@@ -2574,8 +2682,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._toast("Eintrag gelöscht")
 
     def _copy_text(self, text: str) -> None:
-        subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=False)
-        self._toast("In Zwischenablage kopiert ✓")
+        ok = copy_to_clipboard(text)
+        self._toast("In Zwischenablage kopiert ✓" if ok else "Kopieren fehlgeschlagen (wl-copy fehlt?)")
 
     def _load_to_workbench(self, text: str) -> None:
         self.workbench._set_text(text)

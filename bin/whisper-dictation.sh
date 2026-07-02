@@ -4,9 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
 LOG_DIR="${HOME}/.cache/whisper-dictation"
 PID_FILE="${LOG_DIR}/daemon.pid"
-# Match only the real daemon (venv python + full script path) — never an
+# Match only a real daemon (a venv python executing the script) — never an
 # editor/pager that merely has "daemon.py" somewhere on its command line.
-DAEMON_PATTERN="${ROOT}/.venv/bin/python -u ${ROOT}/dictation/daemon.py"
+# No ${ROOT} in the pattern: pgrep -f treats it as a regex (metachars in the
+# path would break matching), and daemons from an older/renamed checkout
+# should be found too so --restart never stacks two daemons.
+DAEMON_PATTERN='\.venv/bin/python[^ ]* -u .*dictation/daemon\.py'
 UNIT="whisper-dictation.service"
 
 mkdir -p "${LOG_DIR}"

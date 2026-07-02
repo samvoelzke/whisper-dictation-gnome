@@ -284,6 +284,7 @@ class WhisperDictationDaemon:
         self.recording_file: Path | None = None
         self.recording_timer: threading.Timer | None = None
         self.last_hotkey_release: float | None = None
+        self._ptt_pressed_at: float | None = None
         self.busy = False
         self.stopping = False
         # Single, in-place-updated status notification for the dictation cycle.
@@ -322,19 +323,26 @@ class WhisperDictationDaemon:
         if not m:
             return
         card = m.group(1)
-        result = subprocess.run(
-            ["amixer", "-c", card, "sget", "Capture"],
-            capture_output=True, text=True, check=False,
-        )
-        if result.returncode != 0:
-            return
-        percents = [int(p) for p in re.findall(r"\[(\d+)%\]", result.stdout)]
-        if percents and min(percents) < 20:
-            subprocess.run(
-                ["amixer", "-c", card, "sset", "Capture", "65%"],
-                check=False, capture_output=True,
+        # Control names vary per card ("Capture" is most common, USB mics
+        # often use "Mic"); try both instead of assuming one.
+        for control in ("Capture", "Mic"):
+            result = subprocess.run(
+                ["amixer", "-c", card, "sget", control],
+                capture_output=True, text=True, check=False,
             )
-            print(f"[whisper-dictation] mic capture volume raised to 65% on card {card}", flush=True)
+            if result.returncode != 0:
+                continue
+            percents = [int(p) for p in re.findall(r"\[(\d+)%\]", result.stdout)]
+            if percents and min(percents) < 20:
+                subprocess.run(
+                    ["amixer", "-c", card, "sset", control, "65%"],
+                    check=False, capture_output=True,
+                )
+                print(
+                    f"[whisper-dictation] {control} volume raised to 65% on card {card}",
+                    flush=True,
+                )
+            return
 
     # -- Startup ----------------------------------------------------------------
 
@@ -733,8 +741,12 @@ class WhisperDictationDaemon:
         with self.lock:
             if not self._is_recording() or self.busy:
                 return
-            held = time.monotonic() - getattr(self, "_ptt_pressed_at", 0.0)
-            if held < self.PTT_MIN_HOLD:
+            # Consume the press timestamp: a recording started elsewhere
+            # (SIGUSR1 toggle) has no fresh press and must never be
+            # silently cancelled by a stale timestamp.
+            pressed = getattr(self, "_ptt_pressed_at", None)
+            self._ptt_pressed_at = None
+            if pressed is not None and time.monotonic() - pressed < self.PTT_MIN_HOLD:
                 self.cancel_recording(quiet=True)
                 return
             self.stop_recording()

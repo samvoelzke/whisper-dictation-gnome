@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
 LOG_DIR="${HOME}/.cache/whisper-dictation"
 PLIST="${HOME}/Library/LaunchAgents/io.whisper-dictation.daemon.plist"
-DAEMON_PATTERN='dictation/daemon.py'
+# Match only a real daemon (python executing the script), never an editor
+# that has "daemon.py" on its command line (pkill -9 would kill it).
+DAEMON_PATTERN='python[^ ]* .*dictation/daemon\.py'
 
 mkdir -p "${LOG_DIR}"
 
