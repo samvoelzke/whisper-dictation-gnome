@@ -15,6 +15,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -47,9 +48,17 @@ def detect_alsa_capture_devices() -> list[tuple[str, str]]:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_DIR = Path.home() / ".config" / "whisper-dictation"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-IPC_SOCKET = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "whisper-dictation.sock"
+# Config schema, load/save (atomic) and hotkey labels live in the shared core.
+sys.path.insert(0, str(PROJECT_ROOT / "dictation"))
+from common import (  # noqa: E402
+    DEFAULT_CONFIG,
+    HISTORY_FILE,
+    IPC_SOCKET,
+    LOG_FILE,
+    key_label,
+    load_config,
+    save_config,
+)
 
 
 def ipc_call(req: dict, timeout: float = 200) -> dict:
@@ -70,8 +79,6 @@ def ipc_call(req: dict, timeout: float = 200) -> dict:
         s.close()
 
 
-LOG_FILE = Path.home() / ".cache" / "whisper-dictation" / "daemon.log"
-HISTORY_FILE = Path.home() / ".cache" / "whisper-dictation" / "history.jsonl"
 DAEMON_SCRIPT = PROJECT_ROOT / "bin" / "whisper-dictation.sh"
 
 
@@ -98,41 +105,6 @@ def format_ts(ts) -> str:
         return datetime.datetime.fromtimestamp(float(ts)).strftime("%d.%m. %H:%M")
     except Exception:
         return ""
-
-DEFAULT_CONFIG = {
-    "double_tap_key": "ctrl_r",
-    "hotkey_mode": "double_tap",
-    "double_tap_window_ms": 400,
-    "language": "de",
-    "model": "turbo",
-    "backend": "auto",
-    "ov_device": "AUTO",
-    "beam_size": 5,
-    "vad_filter": True,
-    "hotwords": "",
-    "voice_commands": False,
-    "sound_cue": True,
-    "restore_clipboard": True,
-    "save_history": True,
-    "paste_mode": "auto",
-    "record_device": "default",
-    "max_record_seconds": 180,
-    "initial_prompt": "",  # filled with DEFAULT_INITIAL_PROMPT in the UI when empty
-    "ollama_postprocess": False,
-    "ollama_model": "qwen2.5:7b",
-    "llm_toggle_key": "",
-    "command_key": "",
-    "recorder_source": "both",
-    "recorder_model": "large-v3",
-    "recorder_bitrate": "32k",
-    "recorder_chunk_seconds": 300,
-    "recorder_language": "",
-    "recorder_mic_device": "",
-    "recorder_monitor_device": "",
-    "recorder_auto_process": False,
-    # Live audio visualization: "waves" | "bar" | "none" (Werkbank + Rekorder).
-    "audio_visualizer": "waves",
-}
 
 # turbo/large-v3/distil-large-v3 run on the OpenVINO backend (Intel GPU/NPU)
 # when available; the others fall back to faster-whisper on CPU. The German
@@ -357,49 +329,12 @@ def fmt_duration(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d} h" if h else f"{m}:{s:02d} min"
 
 
-def key_label(value: str) -> str:
-    """Human label for a stored key (named / KEY_xxx / captured 'code:N[:label]')."""
-    v = str(value or "")
-    if not v:
-        return ""
-    if v.startswith("code:"):
-        parts = v.split(":", 2)
-        return parts[2] if len(parts) > 2 and parts[2] else f"Taste {parts[1] if len(parts) > 1 else '?'}"
-    for code, lbl in HOTKEY_OPTIONS:
-        if code == v.lower():
-            return lbl
-    if v.startswith("KEY_"):
-        return v[4:]
-    return v
-
-
 def key_options(base: list, current: str) -> list:
     """Return base options, appending the current key if it's a captured one."""
     opts = list(base)
     if current and current not in [v for v, _ in opts]:
         opts.append((current, key_label(current)))
     return opts
-
-
-def load_config() -> dict:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    if not CONFIG_FILE.exists():
-        CONFIG_FILE.write_text(
-            json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=True) + "\n",
-            encoding="utf-8",
-        )
-    loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    config = DEFAULT_CONFIG.copy()
-    config.update(loaded)
-    return config
-
-
-def save_config(config: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(
-        json.dumps(config, indent=2, ensure_ascii=True) + "\n",
-        encoding="utf-8",
-    )
 
 
 def daemon_running() -> bool:
@@ -641,7 +576,11 @@ class WorkbenchView(Gtk.Box):
 
     def _toggle_record(self, *_a) -> None:
         if self.rec_proc is None:
-            self.rec_wav = tempfile.mktemp(suffix=".wav")
+            handle = tempfile.NamedTemporaryFile(
+                prefix="whisper-werkbank-", suffix=".wav", delete=False,
+            )
+            handle.close()
+            self.rec_wav = handle.name
             device = str(load_config().get("record_device", "default"))
             try:
                 self.rec_proc = subprocess.Popen([
@@ -672,6 +611,11 @@ class WorkbenchView(Gtk.Box):
                 r = ipc_call({"cmd": "transcribe", "wav": wav})
             except Exception as exc:
                 r = {"error": str(exc)}
+            finally:
+                try:
+                    os.unlink(wav)
+                except OSError:
+                    pass
             GLib.idle_add(self._after_transcribe, r)
         threading.Thread(target=work, daemon=True).start()
 
@@ -1062,10 +1006,18 @@ class RecorderView(Gtk.Box):
             args += ["--mic-device", mic]
         if mon:
             args += ["--monitor-device", mon]
-        r = recorder_call(*args)
+        self.rec_btn.set_sensitive(False)
+
+        def work():
+            r = recorder_call(*args)
+            GLib.idle_add(self._after_start_record, r)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_start_record(self, r: dict) -> bool:
+        self.rec_btn.set_sensitive(True)
         if "error" in r:
             self._toast(f"Aufnahme-Fehler: {r['error']}")
-            return
+            return False
         self._recording_base = r.get("base")
         self._rec_start = GLib.get_monotonic_time() / 1e6
         self._paused = False
@@ -1078,10 +1030,23 @@ class RecorderView(Gtk.Box):
         if self._timer_id is None:
             self._timer_id = GLib.timeout_add(500, self._tick)
         self._start_meters()
+        return False
 
     def _stop_record(self):
+        # ffmpeg needs up to a few seconds to finalise the Opus container;
+        # run that off the main loop so the window never freezes.
         base = self._recording_base
-        r = recorder_call("record-stop", timeout=20)
+        self.rec_btn.set_sensitive(False)
+        self.rec_btn.set_label("Speichere …")
+        self._stop_meters()
+
+        def work():
+            r = recorder_call("record-stop", timeout=20)
+            GLib.idle_add(self._after_stop_record, base, r)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_stop_record(self, base, r: dict) -> bool:
+        self.rec_btn.set_sensitive(True)
         self._recording_base = None
         self._paused = False
         if self._timer_id is not None:
@@ -1093,29 +1058,37 @@ class RecorderView(Gtk.Box):
         self.rec_btn.add_css_class("suggested-action")
         self.pause_btn.set_visible(False)
         self.title_row.set_text("")
-        self._stop_meters()
         self._toast(f"Aufnahme gespeichert ({fmt_duration(r.get('duration_seconds', 0))})")
         self.refresh()
         if base and self.auto_row.get_active():
             self._transcribe(base)
+        return False
 
     def _toggle_pause(self, *_):
         if self._recording_base is None:
             return
-        if not self._paused:
-            recorder_call("record-pause")
-            self._paused = True
+        going_paused = not self._paused
+        self.pause_btn.set_sensitive(False)
+
+        def work():
+            recorder_call("record-pause" if going_paused else "record-resume")
+            GLib.idle_add(self._after_toggle_pause, going_paused)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_toggle_pause(self, paused: bool) -> bool:
+        self.pause_btn.set_sensitive(True)
+        self._paused = paused
+        if paused:
             self._frozen = GLib.get_monotonic_time() / 1e6 - self._rec_start
             self.pause_btn.set_label("▶ Fortsetzen")
             self._stop_meters()          # no signal is captured while paused → flat
             self._toast("⏸ Pausiert")
         else:
-            recorder_call("record-resume")
-            self._paused = False
             self._rec_start = GLib.get_monotonic_time() / 1e6 - self._frozen
             self.pause_btn.set_label("⏸ Pause")
             self._start_meters()
             self._toast("● Weiter")
+        return False
 
     def _tick(self):
         if self._recording_base is None:
@@ -1672,11 +1645,7 @@ class RecorderView(Gtk.Box):
         dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
         dlg.set_default_response("ok")
 
-        def on_resp(_d, resp):
-            if resp != "ok":
-                return
-            new = entry.get_text().strip()
-            recorder_call("rename", base, "--title", new)
+        def apply_ui(new: str) -> bool:
             shown = new or base
             if self._detail.get("title_lbl"):
                 self._detail["title_lbl"].set_label(shown)
@@ -1686,6 +1655,17 @@ class RecorderView(Gtk.Box):
                 self._detail["page"].set_title(shown)
             self.refresh()
             self._toast("Umbenannt ✓")
+            return False
+
+        def on_resp(_d, resp):
+            if resp != "ok":
+                return
+            new = entry.get_text().strip()
+
+            def work():
+                recorder_call("rename", base, "--title", new)
+                GLib.idle_add(apply_ui, new)
+            threading.Thread(target=work, daemon=True).start()
 
         dlg.connect("response", on_resp)
         dlg.present(self.get_root())
@@ -1700,14 +1680,21 @@ class RecorderView(Gtk.Box):
         dlg.add_response("del", "Löschen")
         dlg.set_response_appearance("del", Adw.ResponseAppearance.DESTRUCTIVE)
 
-        def on_resp(_d, resp):
-            if resp != "del":
-                return
-            recorder_call("delete", base)
+        def apply_ui() -> bool:
             if from_detail and self._detail_base == base:
                 self.nav.pop()
             self.refresh()
             self._toast("Gelöscht")
+            return False
+
+        def on_resp(_d, resp):
+            if resp != "del":
+                return
+
+            def work():
+                recorder_call("delete", base)
+                GLib.idle_add(apply_ui)
+            threading.Thread(target=work, daemon=True).start()
 
         dlg.connect("response", on_resp)
         dlg.present(self.get_root())
@@ -1929,13 +1916,13 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.ollama_row.set_active(bool(self.config.get("ollama_postprocess", False)))
         llm.add(self.ollama_row)
         current_model = str(self.config.get("ollama_model", "qwen2.5:7b"))
-        installed = self._installed_ollama_models()
-        self._llm_model_opts = [
-            (v, (("✓ " if v in installed else "") + lbl)) for v, lbl in LLM_MODEL_OPTIONS
-        ]
+        self._llm_model_opts = list(LLM_MODEL_OPTIONS)
         if current_model not in [v for v, _ in self._llm_model_opts]:
             self._llm_model_opts.append((current_model, f"{current_model}  (eigenes)"))
         self.ollama_model_row = self._combo("Modell", self._llm_model_opts, current_model)
+        # '✓ installiert'-Markierungen kommen asynchron ('ollama list' braucht
+        # bis zu 3 s und darf den Fensteraufbau nicht blockieren).
+        self._mark_installed_ollama_models()
         self.ollama_model_row.set_subtitle("Mehr Sterne = stärker, aber langsamer. Muss via 'ollama pull' installiert sein.")
         llm.add(self.ollama_model_row)
         toggle_cur = str(self.config.get("llm_toggle_key", ""))
@@ -2073,7 +2060,8 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     @staticmethod
     def _combo_value(row: Adw.ComboRow, options: list[tuple[str, str]]) -> str:
-        return options[row.get_selected()][0]
+        i = row.get_selected()
+        return options[i][0] if 0 <= i < len(options) else ""
 
     # ── Key capture (press a key to set it) ─────────────────────────────────────
 
@@ -2180,6 +2168,20 @@ class SettingsWindow(Adw.ApplicationWindow):
         )
         return result.returncode, (result.stdout + result.stderr).strip()
 
+    def _daemon_action(self, arg: str, ok_msg: str, err_prefix: str) -> None:
+        """Run a daemon control command off the main loop (restart = model
+        reload = seconds); toast the outcome when done."""
+        def work():
+            code, output = self._run_daemon(arg)
+            GLib.idle_add(done, code, output)
+
+        def done(code: int, output: str) -> bool:
+            self._toast(ok_msg if code == 0 else f"{err_prefix}: {output}")
+            self._refresh_status()
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
+
     @staticmethod
     def _ollama_list() -> tuple[bool, set]:
         """Return (server_up, set_of_installed_model_names)."""
@@ -2194,6 +2196,27 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _installed_ollama_models(self) -> set:
         return self._ollama_list()[1]
+
+    def _mark_installed_ollama_models(self) -> None:
+        """Prefix installed models with '✓' once `ollama list` answered."""
+        def apply_marks(installed: set) -> bool:
+            if not installed:
+                return False
+            selected = self.ollama_model_row.get_selected()
+            self._llm_model_opts = [
+                (v, ("✓ " + lbl if v in installed and not lbl.startswith("✓ ") else lbl))
+                for v, lbl in self._llm_model_opts
+            ]
+            self.ollama_model_row.set_model(
+                Gtk.StringList.new([lbl for _, lbl in self._llm_model_opts])
+            )
+            self.ollama_model_row.set_selected(selected)
+            return False
+
+        def work():
+            GLib.idle_add(apply_marks, self._installed_ollama_models())
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _ollama_model_installed(self, model: str) -> bool | None:
         up, installed = self._ollama_list()
@@ -2210,31 +2233,39 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.config = new
         save_config(new)
         needs_restart = any(old.get(k) != new.get(k) for k in self.RESTART_KEYS)
-        if needs_restart:
-            code, output = self._run_daemon("--restart")
-            msg = "Gespeichert und Daemon neu gestartet." if code == 0 else f"Neustart-Fehler: {output}"
-        else:
-            code, output = self._run_daemon("--reload")
-            msg = "Gespeichert — Aenderungen sind aktiv." if code == 0 else f"Reload-Fehler: {output}"
-        if new.get("ollama_postprocess") and self._ollama_model_installed(new.get("ollama_model", "")) is False:
-            msg += f"  ⚠ Modell nicht installiert: ollama pull {new['ollama_model']}"
-        self._toast(msg)
-        self._refresh_status()
+        arg = "--restart" if needs_restart else "--reload"
+        self.save_button.set_sensitive(False)
+
+        def work():
+            code, output = self._run_daemon(arg)
+            ollama_missing = bool(
+                new.get("ollama_postprocess")
+                and self._ollama_model_installed(new.get("ollama_model", "")) is False
+            )
+            GLib.idle_add(done, code, output, ollama_missing)
+
+        def done(code: int, output: str, ollama_missing: bool) -> bool:
+            self.save_button.set_sensitive(True)
+            if needs_restart:
+                msg = "Gespeichert und Daemon neu gestartet." if code == 0 else f"Neustart-Fehler: {output}"
+            else:
+                msg = "Gespeichert — Änderungen sind aktiv." if code == 0 else f"Reload-Fehler: {output}"
+            if ollama_missing:
+                msg += f"  ⚠ Modell nicht installiert: ollama pull {new['ollama_model']}"
+            self._toast(msg)
+            self._refresh_status()
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_start(self, *_a) -> None:
-        code, output = self._run_daemon("--restart")
-        self._toast("Daemon gestartet." if code == 0 else f"Start fehlgeschlagen: {output}")
-        self._refresh_status()
+        self._daemon_action("--restart", "Daemon gestartet.", "Start fehlgeschlagen")
 
     def _on_restart(self, *_a) -> None:
-        code, output = self._run_daemon("--restart")
-        self._toast("Daemon neu gestartet." if code == 0 else f"Neustart fehlgeschlagen: {output}")
-        self._refresh_status()
+        self._daemon_action("--restart", "Daemon neu gestartet.", "Neustart fehlgeschlagen")
 
     def _on_stop(self, *_a) -> None:
-        code, output = self._run_daemon("--stop")
-        self._toast("Daemon gestoppt." if code == 0 else f"Stop-Fehler: {output}")
-        self._refresh_status()
+        self._daemon_action("--stop", "Daemon gestoppt.", "Stop-Fehler")
 
     def _on_log(self, *_a) -> None:
         if LOG_FILE.exists():
@@ -2243,29 +2274,35 @@ class SettingsWindow(Adw.ApplicationWindow):
             self._toast("Noch keine Logdatei vorhanden.")
 
     def _on_diagnose(self, *_a) -> None:
-        import re
-        device = backend = "?"
-        try:
-            log = LOG_FILE.read_text(errors="ignore")
-            dev = re.findall(r"using device=(\w+)", log)
-            be = re.findall(r"backend=(\w+)", log)
-            device = dev[-1] if dev else "?"
-            backend = be[-1] if be else "?"
-        except Exception:
-            pass
-        up, installed = self._ollama_list()
         model = self._combo_value(self.ollama_model_row, self._llm_model_opts)
-        body = (
-            f"Daemon: {'läuft' if daemon_running() else 'gestoppt'}\n"
-            f"Backend: {backend}\n"
-            f"Gerät: {device}\n"
-            f"Ollama-Server: {'läuft' if up else 'aus'}\n"
-            f"Cleanup-Modell ({model}): "
-            f"{'installiert' if model in installed else ('nicht installiert' if up else '?')}"
-        )
-        dlg = Adw.AlertDialog(heading="Diagnose", body=body)
-        dlg.add_response("ok", "OK")
-        dlg.present(self)
+
+        def show(running: bool, backend: str, device: str, up: bool, installed: set) -> bool:
+            body = (
+                f"Daemon: {'läuft' if running else 'gestoppt'}\n"
+                f"Backend: {backend}\n"
+                f"Gerät: {device}\n"
+                f"Ollama-Server: {'läuft' if up else 'aus'}\n"
+                f"Cleanup-Modell ({model}): "
+                f"{'installiert' if model in installed else ('nicht installiert' if up else '?')}"
+            )
+            dlg = Adw.AlertDialog(heading="Diagnose", body=body)
+            dlg.add_response("ok", "OK")
+            dlg.present(self)
+            return False
+
+        def work():
+            device = backend = "?"
+            try:
+                log = LOG_FILE.read_text(errors="ignore")
+                dev = re.findall(r"using device=(\w+)", log)
+                be = re.findall(r"backend=(\w+)", log)
+                device = dev[-1] if dev else "?"
+                backend = be[-1] if be else "?"
+            except Exception:
+                pass
+            GLib.idle_add(show, daemon_running(), backend, device, *self._ollama_list())
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_about(self, *_a) -> None:
         about = Adw.AboutDialog(

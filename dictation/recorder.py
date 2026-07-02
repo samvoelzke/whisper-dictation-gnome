@@ -31,14 +31,14 @@ from typing import Any
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
-# numpy and the daemon module (which imports numpy) are imported *lazily* inside
-# the transcribe/summarize paths only. That keeps lightweight commands — the
-# ones the GUI calls on every tab switch (record-status, list, devices) — at
-# ~50 ms startup instead of ~300 ms (numpy alone is ~160 ms).
+# numpy is imported *lazily* inside the transcribe path only. That keeps
+# lightweight commands — the ones the GUI calls on every tab switch
+# (record-status, list, devices) — at ~50 ms startup instead of ~300 ms
+# (numpy alone is ~160 ms). common.py is import-cheap (stdlib only).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-CACHE_DIR = Path.home() / ".cache" / "whisper-dictation"
-RECORDINGS_DIR = Path.home() / ".local" / "share" / "whisper-dictation" / "recordings"
+from common import CACHE_DIR, RECORDINGS_DIR, load_config, ollama_chat
+
 STATE_FILE = CACHE_DIR / "recorder-state.json"
 CHUNK_SECONDS = 300  # 5-minute transcription chunks
 SAMPLE_RATE = 16000  # Whisper expects 16 kHz mono
@@ -214,11 +214,11 @@ def cmd_record_start(args: argparse.Namespace) -> int:
         cmd = ["systemd-inhibit", "--what=sleep:idle", "--who=Whisper Dictation",
                "--why=Langaufnahme laeuft", "--mode=block", *cmd]
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    log = open(CACHE_DIR / "recorder-ffmpeg.log", "ab")
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-        start_new_session=True,
-    )
+    with open(CACHE_DIR / "recorder-ffmpeg.log", "ab") as log:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True,
+        )
 
     _write_json(RECORDINGS_DIR / f"{base}.meta.json", {
         "title": title, "source": args.source, "created": datetime.now().isoformat(),
@@ -380,11 +380,12 @@ class _Backend:
         self._load()
 
     def _load(self) -> None:
-        from daemon import OV_MODEL_REPOS
+        from common import OV_MODEL_REPOS
         want_backend = str(self.cfg.get("backend", "auto"))
         if want_backend != "faster" and self.model_name in OV_MODEL_REPOS:
             try:
-                self._load_openvino()
+                from common import load_ov_pipeline
+                self.ov_pipe, _device = load_ov_pipeline(self.cfg, self.model_name, "recorder")
                 self.kind = "openvino"
                 return
             except Exception as exc:  # noqa: BLE001
@@ -393,40 +394,11 @@ class _Backend:
         self._load_faster()
         self.kind = "faster"
 
-    def _load_openvino(self) -> None:
-        import openvino as ov
-        import openvino_genai as ov_genai
-        from huggingface_hub import snapshot_download
-        from daemon import OV_MODEL_REPOS
-
-        repo = OV_MODEL_REPOS[self.model_name]
-        model_dir = snapshot_download(
-            repo, local_dir=str(CACHE_DIR / "ov-models" / repo.replace("/", "__")))
-        available = ov.Core().available_devices
-        want = str(self.cfg.get("ov_device", "AUTO")).upper()
-        order = [want] if want != "AUTO" else []
-        for d in ("GPU", "NPU", "CPU"):
-            if d not in order:
-                order.append(d)
-        order = [d for d in order if d in available]
-        last: Exception | None = None
-        for device in order:
-            kwargs = {"STATIC_PIPELINE": True} if device == "NPU" else {}
-            try:
-                print(f"[recorder] OpenVINO {device}: {repo}", flush=True)
-                self.ov_pipe = ov_genai.WhisperPipeline(model_dir, device, **kwargs)
-                return
-            except Exception as exc:  # noqa: BLE001
-                last = exc
-                print(f"[recorder] OpenVINO {device} failed: {str(exc)[:140]}",
-                      file=sys.stderr, flush=True)
-        raise RuntimeError(f"No usable OpenVINO device (tried {order}): {last}")
-
     def _load_faster(self) -> None:
         from faster_whisper import WhisperModel
-        from daemon import FASTER_MODEL_MAP, _cuda_available
+        from common import FASTER_MODEL_MAP, cuda_available
         fw_name = FASTER_MODEL_MAP.get(self.model_name, self.model_name)
-        device, compute = ("cuda", "float16") if _cuda_available() else ("cpu", "int8")
+        device, compute = ("cuda", "float16") if cuda_available() else ("cpu", "int8")
         print(f"[recorder] faster-whisper {fw_name} on {device}", flush=True)
         self.fw_model = WhisperModel(
             fw_name, device=device, compute_type=compute,
@@ -508,7 +480,6 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     txt_path = RECORDINGS_DIR / f"{base}.txt"
     prog_path = RECORDINGS_DIR / f"{base}.progress.json"
 
-    from daemon import load_config
     cfg = load_config()
     prog = _read_json(prog_path, {})
     # Keep chunk size consistent across resumes: prefer the one stored at the
@@ -586,24 +557,11 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
 # ── phase 3: summarize via Ollama (map-reduce) ───────────────────────────────
 
 def _ollama_chat(cfg: dict[str, Any], system: str, user: str, timeout: int = 300) -> str:
-    import urllib.request
-    host = str(cfg.get("ollama_host", "http://localhost:11434")).rstrip("/")
-    model = str(cfg.get("ollama_model", "qwen2.5:7b"))
-    payload = {
-        "model": model,
-        "messages": [{"role": "system", "content": system},
-                     {"role": "user", "content": user}],
-        "stream": False, "think": False, "keep_alive": "10m",
-        "options": {"temperature": 0.3},
-    }
-    req = urllib.request.Request(
-        f"{host}/api/chat", data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        parsed = json.loads(resp.read())
-    import re
-    raw = str(parsed.get("message", {}).get("content", ""))
-    return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    return ollama_chat(
+        cfg,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.3, timeout=timeout,
+    )
 
 
 def _split_words(text: str, max_words: int) -> list[str]:
@@ -622,7 +580,6 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         print(json.dumps({"error": "empty_transcript", "base": base}))
         return 1
     focus = (args.focus or "").strip() or "die wichtigsten Inhalte, Kernaussagen und Action-Items"
-    from daemon import load_config
     cfg = load_config()
 
     # ~3000 words (~4k tokens) per map block: well within qwen2.5's 32k context,

@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
 LOG_DIR="${HOME}/.cache/whisper-dictation"
 PID_FILE="${LOG_DIR}/daemon.pid"
-DAEMON_PATTERN='dictation/daemon.py'
+# Match only the real daemon (venv python + full script path) — never an
+# editor/pager that merely has "daemon.py" somewhere on its command line.
+DAEMON_PATTERN="${ROOT}/.venv/bin/python -u ${ROOT}/dictation/daemon.py"
 UNIT="whisper-dictation.service"
 
 mkdir -p "${LOG_DIR}"

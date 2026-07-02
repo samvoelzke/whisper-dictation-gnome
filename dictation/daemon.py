@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -20,11 +21,28 @@ import numpy as np
 # hf-xet transfers can stall on some networks; force plain HTTPS downloads.
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import (
+    CACHE_DIR,
+    HISTORY_FILE,
+    HOTKEY_SPECS,
+    IPC_SOCKET,
+    IS_LINUX,
+    IS_MACOS,
+    FASTER_MODEL_MAP,
+    OV_MODEL_REPOS,
+    clipboard_manager_running,
+    cuda_available,
+    evdev_code_for,
+    key_label,
+    load_config,
+    load_ov_pipeline,
+    ollama_chat,
+    save_config,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WHISPER_REPO_ROOT = PROJECT_ROOT / "whisper"
-
-IS_MACOS = platform.system() == "Darwin"
-IS_LINUX = platform.system() == "Linux"
 
 # macOS records via sounddevice; Linux records via arecord (PipeWire/ALSA).
 if IS_MACOS:
@@ -34,142 +52,6 @@ if IS_MACOS:
         sd = None  # type: ignore[assignment]
 else:
     sd = None  # type: ignore[assignment]
-
-CONFIG_DIR = Path.home() / ".config" / "whisper-dictation"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-CACHE_DIR = Path.home() / ".cache" / "whisper-dictation"
-# Unix socket for the GUI "workbench" to drive transcription + LLM on the
-# already-loaded model in the running daemon.
-IPC_SOCKET = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "whisper-dictation.sock"
-# Append-only history of dictations (JSON lines), read by the GUI "Verlauf" tab.
-HISTORY_FILE = CACHE_DIR / "history.jsonl"
-
-DEFAULT_CONFIG: dict[str, Any] = {
-    "double_tap_key": "ctrl_r",
-    # "double_tap": double-tap to start/stop. "push_to_talk": hold to record.
-    "hotkey_mode": "double_tap",
-    "double_tap_window_ms": 400,
-    "language": "de",
-    "model": "turbo",
-    # "auto": openvino on Linux when available, else faster-whisper; openai on macOS.
-    "backend": "auto",
-    # OpenVINO device: AUTO prefers GPU > NPU > CPU (GPU is fastest + reliable
-    # for dictation; NPU is opt-in via "NPU" and falls back to GPU if it can't
-    # compile the Whisper graph).
-    "ov_device": "AUTO",
-    "beam_size": 5,
-    # VAD trims silence before transcription: fewer hallucinations + less compute.
-    "vad_filter": True,
-    # Comma-separated domain words to bias recognition (names, jargon).
-    "hotwords": "",
-    # Audible feedback on record start / text inserted (no tray on GNOME).
-    "sound_cue": True,
-    # Replace spoken formatting commands ("neue Zeile" -> newline). Off by default.
-    "voice_commands": False,
-    # Save & restore the clipboard around paste so dictation doesn't clobber it.
-    "restore_clipboard": True,
-    # Keep a history of dictations (for the GUI "Verlauf" tab).
-    "save_history": True,
-    "paste_mode": "auto",
-    "record_device": "default",
-    "max_record_seconds": 180,
-    "initial_prompt": (
-        "Diktat auf Deutsch, teils mit englischen Fachbegriffen wie Pull Request, "
-        "Deployment, Bug, Backend, Repository, Meeting."
-    ),
-    "ollama_postprocess": False,
-    "ollama_model": "qwen2.5:7b",
-    "ollama_host": "http://localhost:11434",
-    # Double-tap this key to toggle Ollama cleanup on/off ("" = disabled).
-    # Must differ from double_tap_key. Same value set as double_tap_key.
-    "llm_toggle_key": "",
-    # Command mode: double-tap this key, speak an instruction, and the AI
-    # rewrites the currently selected text in place ("" = disabled).
-    "command_key": "",
-    # Long-form recorder (lectures/calls) — separate from live dictation.
-    # Default audio source: "both" (mic + system) | "system" | "mic".
-    "recorder_source": "both",
-    # Whisper model for recordings (large-v3 = most accurate, slower).
-    "recorder_model": "large-v3",
-    # Transcription chunk length in seconds (crash-safe partial saves).
-    "recorder_chunk_seconds": 300,
-    # Recorder language ("" = fall back to the global `language`).
-    "recorder_language": "",
-    # Preferred capture devices for the recorder ("" = system default).
-    "recorder_mic_device": "",
-    "recorder_monitor_device": "",
-    # GUI live audio visualization: "waves" | "bar" | "none".
-    "audio_visualizer": "waves",
-    # Opus bitrate; 32k mono is plenty for speech and tiny for hour-long files.
-    "recorder_bitrate": "32k",
-    # When on, stopping a recording auto-runs transcription (+ summary if a
-    # focus prompt is set in the GUI).
-    "recorder_auto_process": False,
-}
-
-# Hotkey spec per logical name:
-#   (label, pynput_attr, pynput_fallback_attrs, evdev_ecode_name)
-# pynput_* are used on macOS, evdev_ecode_name on Linux/Wayland.
-HOTKEY_SPECS: dict[str, tuple[str, str, list[str], str]] = {
-    "ctrl_r": ("Right Ctrl", "ctrl_r", ["ctrl"], "KEY_RIGHTCTRL"),
-    "ctrl_l": ("Left Ctrl", "ctrl_l", ["ctrl"], "KEY_LEFTCTRL"),
-    "alt_r": ("Right Alt", "alt_r", ["alt"], "KEY_RIGHTALT"),
-    "alt_l": ("Left Alt", "alt_l", ["alt"], "KEY_LEFTALT"),
-    "f8": ("F8", "f8", [], "KEY_F8"),
-    "f9": ("F9", "f9", [], "KEY_F9"),
-    "f10": ("F10", "f10", [], "KEY_F10"),
-    "pause": ("Pause", "pause", [], "KEY_PAUSE"),
-}
-
-
-def key_label(value: str) -> str:
-    """Human label for a stored key (logical name / KEY_xxx / 'code:N[:label]')."""
-    v = str(value or "")
-    if not v:
-        return ""
-    if v.startswith("code:"):
-        parts = v.split(":", 2)
-        return parts[2] if len(parts) > 2 and parts[2] else f"Taste {parts[1] if len(parts) > 1 else '?'}"
-    if v.lower() in HOTKEY_SPECS:
-        return HOTKEY_SPECS[v.lower()][0]
-    if v.startswith("KEY_"):
-        return v[4:]
-    return v
-
-
-def evdev_code_for(value: str, ecodes: Any) -> int | None:
-    """Map a stored key to its evdev code. Supports logical names from
-    HOTKEY_SPECS, raw 'KEY_xxx' ecode names, and 'code:N[:label]' (captured)."""
-    v = str(value or "")
-    if not v:
-        return None
-    if v.startswith("code:"):
-        try:
-            return int(v.split(":")[1])
-        except (IndexError, ValueError):
-            return None
-    if v.lower() in HOTKEY_SPECS:
-        return getattr(ecodes, HOTKEY_SPECS[v.lower()][3], None)
-    if v.startswith("KEY_"):
-        return getattr(ecodes, v, None)
-    return None
-
-
-# faster-whisper model id mapping (openai short names -> CTranslate2 ids).
-FASTER_MODEL_MAP = {
-    "turbo": "large-v3-turbo",
-}
-
-# Official, openvino-genai-2026-compatible pre-converted Whisper models.
-# (Community exports often lack the `beam_idx` input and fail to load.)
-# Only models listed here can use the OpenVINO backend; others fall back to
-# faster-whisper. No torch/optimum needed at runtime.
-OV_MODEL_REPOS = {
-    "turbo": "OpenVINO/whisper-large-v3-turbo-fp16-ov",
-    "large-v3-turbo": "OpenVINO/whisper-large-v3-turbo-fp16-ov",
-    "large-v3": "OpenVINO/whisper-large-v3-int8-ov",
-    "distil-large-v3": "OpenVINO/distil-whisper-large-v3-int8-ov",
-}
 
 # Optional Ollama text cleanup. Chat-style prompt with few-shot examples (the
 # pattern competitor dictation tools use) so a mid-size model edits the text
@@ -226,23 +108,6 @@ def apply_voice_commands(text: str) -> str:
     out = _re.sub(r"[ \t]+([:?!-])", r"\1", out)   # no space before inserted symbol
     out = _re.sub(r"[ \t]*\n[ \t]*", "\n", out)      # trim spaces around newlines
     return out.strip()
-
-# Clipboard managers with their own history (process names, matched whole).
-# Restoring the previous clipboard after a paste would land as the newest
-# entry in their history and push the fresh dictation down to slot 2 — so
-# the restore is skipped while one of these is running (the previous content
-# is preserved in the manager's history anyway).
-_CLIPBOARD_MANAGERS = r"vicinae-server|vicinae|copyq|gpaste-daemon|cliphist|clipman|clipse|parcellite"
-
-
-def clipboard_manager_running() -> bool:
-    try:
-        return subprocess.run(
-            ["pgrep", "-x", _CLIPBOARD_MANAGERS], capture_output=True,
-        ).returncode == 0
-    except FileNotFoundError:
-        return False
-
 
 # Linux input event codes for ydotool paste injection.
 _YDOTOOL_KEYS = {
@@ -344,25 +209,6 @@ def check_macos_accessibility() -> None:
     sys.exit(1)
 
 
-def load_config() -> dict[str, Any]:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    if not CONFIG_FILE.exists():
-        defaults = DEFAULT_CONFIG.copy()
-        if IS_MACOS:
-            defaults["record_device"] = "default"
-            defaults["paste_mode"] = "cmd_v"
-        CONFIG_FILE.write_text(
-            json.dumps(defaults, indent=2, ensure_ascii=True) + "\n",
-            encoding="utf-8",
-        )
-
-    loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    config = DEFAULT_CONFIG.copy()
-    config.update(loaded)
-    return config
-
-
 def read_wav_mono(path: Path) -> np.ndarray:
     with wave.open(str(path), "rb") as wav_file:
         channels = wav_file.getnchannels()
@@ -384,18 +230,6 @@ def read_wav_mono(path: Path) -> np.ndarray:
         )
 
     return audio
-
-
-def _cuda_available() -> bool:
-    try:
-        import torch
-        return bool(torch.cuda.is_available())
-    except Exception:
-        try:
-            import ctranslate2
-            return ctranslate2.get_cuda_device_count() > 0
-        except Exception:
-            return False
 
 
 class WhisperDictationDaemon:
@@ -472,31 +306,31 @@ class WhisperDictationDaemon:
     # -- Linux: ALSA mic volume -------------------------------------------------
 
     def _init_mic_volume(self) -> None:
+        """Raise a near-muted capture volume so recordings aren't silent.
+
+        Resolved by control name ('Capture') — numeric control ids are
+        card-specific and would hit a random control on other hardware.
+        """
         if not IS_LINUX:
             return
         device = str(self.config.get("record_device", "default"))
-        import re as _re
-        m = _re.match(r"(?:plug)?hw:(\d+)", device)
+        m = re.match(r"(?:plug)?hw:(\d+)", device)
         if not m:
             return
         card = m.group(1)
         result = subprocess.run(
-            ["amixer", "-c", card, "cget", "numid=6"],
+            ["amixer", "-c", card, "sget", "Capture"],
             capture_output=True, text=True, check=False,
         )
         if result.returncode != 0:
             return
-        current_line = next((l for l in result.stdout.splitlines() if ": values=" in l), "")
-        try:
-            current_vol = int(current_line.split("values=")[1].split()[0])
-        except (IndexError, ValueError):
-            current_vol = -1
-        if current_vol < 20:
+        percents = [int(p) for p in re.findall(r"\[(\d+)%\]", result.stdout)]
+        if percents and min(percents) < 20:
             subprocess.run(
-                ["amixer", "-c", card, "cset", "numid=6", "26"],
+                ["amixer", "-c", card, "sset", "Capture", "65%"],
                 check=False, capture_output=True,
             )
-            print(f"[whisper-dictation] mic volume set to 26 on card {card}", flush=True)
+            print(f"[whisper-dictation] mic capture volume raised to 65% on card {card}", flush=True)
 
     # -- Startup ----------------------------------------------------------------
 
@@ -538,7 +372,7 @@ class WhisperDictationDaemon:
             from faster_whisper import WhisperModel
 
             fw_name = FASTER_MODEL_MAP.get(model_name, model_name)
-            if _cuda_available():
+            if cuda_available():
                 device, compute_type = "cuda", "float16"
             else:
                 device, compute_type = "cpu", "int8"
@@ -558,7 +392,7 @@ class WhisperDictationDaemon:
                 sys.path.insert(0, str(WHISPER_REPO_ROOT))
             import whisper
 
-            device = "cuda" if _cuda_available() else (
+            device = "cuda" if cuda_available() else (
                 "mps" if (IS_MACOS and self._mps_available()) else "cpu"
             )
             print(f"[whisper-dictation] openai-whisper device={device}", flush=True)
@@ -573,45 +407,9 @@ class WhisperDictationDaemon:
         notify("Bereit", f"Doppelt {self.hotkey_label} startet oder stoppt die Aufnahme")
 
     def _load_openvino(self, model_name: str) -> None:
-        import openvino as ov
-        import openvino_genai as ov_genai
-        from huggingface_hub import snapshot_download
-
-        repo = OV_MODEL_REPOS[model_name]
-        model_dir = snapshot_download(
-            repo,
-            local_dir=str(CACHE_DIR / "ov-models" / repo.replace("/", "__")),
+        self.ov_pipe, self._ov_device = load_ov_pipeline(
+            self.config, model_name, "whisper-dictation", notify=notify,
         )
-
-        # Build the device try-order. AUTO prefers the iGPU: it is the fastest
-        # for short dictation and compiles reliably. The NPU is more power
-        # efficient but its compiler may reject the Whisper graph on some
-        # drivers, so we fall back to GPU/CPU rather than to slow CPU whisper.
-        available = ov.Core().available_devices
-        want = str(self.config.get("ov_device", "AUTO")).upper()
-        order = [want] if want != "AUTO" else []
-        for d in ("GPU", "NPU", "CPU"):
-            if d not in order:
-                order.append(d)
-        order = [d for d in order if d in available]
-
-        last_err: Exception | None = None
-        for device in order:
-            kwargs: dict[str, Any] = {"STATIC_PIPELINE": True} if device == "NPU" else {}
-            try:
-                print(f"[whisper-dictation] OpenVINO try device={device} model={repo}", flush=True)
-                notify("Lade Modell", f"OpenVINO {device}: {model_name}")
-                self.ov_pipe = ov_genai.WhisperPipeline(model_dir, device, **kwargs)
-                self._ov_device = device
-                print(f"[whisper-dictation] OpenVINO using device={device}", flush=True)
-                return
-            except Exception as exc:
-                last_err = exc
-                print(
-                    f"[whisper-dictation] OpenVINO device={device} failed: {str(exc)[:160]}",
-                    file=sys.stderr, flush=True,
-                )
-        raise RuntimeError(f"No usable OpenVINO device (tried {order}): {last_err}")
 
     @staticmethod
     def _mps_available() -> bool:
@@ -879,10 +677,7 @@ class WhisperDictationDaemon:
 
     def _save_config(self) -> None:
         try:
-            CONFIG_FILE.write_text(
-                json.dumps(self.config, indent=2, ensure_ascii=True) + "\n",
-                encoding="utf-8",
-            )
+            save_config(self.config)
         except Exception as exc:
             print(f"[whisper-dictation] could not save config: {exc}", file=sys.stderr, flush=True)
 
@@ -898,17 +693,19 @@ class WhisperDictationDaemon:
         except Exception as exc:
             print(f"[whisper-dictation] history write failed: {exc}", file=sys.stderr, flush=True)
 
+    # Shorter presses of the push-to-talk key are treated as normal shortcut
+    # use (Ctrl+C etc.) and cancel silently instead of transcribing.
+    PTT_MIN_HOLD = 0.25
+
     def toggle_recording(self) -> None:
-        if self.busy:
-            self._status("Noch beschäftigt", "Letzte Aufnahme wird verarbeitet.", timeout_ms=3000)
-            return
-        is_recording = (
-            self.recording_process is not None or self.recording_sd_thread is not None
-        )
-        if not is_recording:
-            self.start_recording()
-        else:
-            self.stop_recording()
+        with self.lock:
+            if self.busy:
+                self._status("Noch beschäftigt", "Letzte Aufnahme wird verarbeitet.", timeout_ms=3000)
+                return
+            if not self._is_recording():
+                self.start_recording()
+            else:
+                self.stop_recording()
 
     def _is_recording(self) -> bool:
         return self.recording_process is not None or self.recording_sd_thread is not None
@@ -918,16 +715,24 @@ class WhisperDictationDaemon:
         with self.lock:
             if self.busy or self._is_recording():
                 return
-        self.start_recording()
+            self._ptt_pressed_at = time.monotonic()
+            # Audio is captured from the very first moment; only the status
+            # bubble/sound wait out the grace period so a plain shortcut
+            # press doesn't flash a recording notification.
+            self.start_recording(ui_delay=self.PTT_MIN_HOLD)
 
     def _ptt_stop(self) -> None:
-        """Push-to-talk: key released -> stop + transcribe."""
+        """Push-to-talk: key released -> stop + transcribe (or silent cancel)."""
         with self.lock:
-            if not self._is_recording():
+            if not self._is_recording() or self.busy:
                 return
-        self.stop_recording()
+            held = time.monotonic() - getattr(self, "_ptt_pressed_at", 0.0)
+            if held < self.PTT_MIN_HOLD:
+                self.cancel_recording(quiet=True)
+                return
+            self.stop_recording()
 
-    def cancel_recording(self) -> None:
+    def cancel_recording(self, quiet: bool = False) -> None:
         """Abort an in-progress recording without transcribing (Esc)."""
         with self.lock:
             if not self._is_recording() or self.busy:
@@ -952,7 +757,8 @@ class WhisperDictationDaemon:
         self._command_active = False
         self._command_selection = ""
         print("[whisper-dictation] recording cancelled", flush=True)
-        self._status("✖ Abgebrochen", "Aufnahme verworfen.", timeout_ms=2500)
+        if not quiet:
+            self._status("✖ Abgebrochen", "Aufnahme verworfen.", timeout_ms=2500)
 
     # -- Recording: Linux (arecord) ---------------------------------------------
 
@@ -1031,7 +837,7 @@ class WhisperDictationDaemon:
 
     # -- Recording: common ------------------------------------------------------
 
-    def start_recording(self) -> None:
+    def start_recording(self, ui_delay: float = 0.0) -> None:
         handle = tempfile.NamedTemporaryFile(
             prefix="whisper-dictation-", suffix=".wav", delete=False,
         )
@@ -1051,6 +857,20 @@ class WhisperDictationDaemon:
         )
         self.recording_timer.daemon = True
         self.recording_timer.start()
+        if ui_delay > 0:
+            # Push-to-talk grace: show the recording UI only if the key is
+            # still held after the grace period (a quick tap cancels quietly).
+            def _deferred() -> None:
+                with self.lock:
+                    if self._is_recording() and not self.busy:
+                        self._recording_ui()
+            t = threading.Timer(ui_delay, _deferred)
+            t.daemon = True
+            t.start()
+        else:
+            self._recording_ui()
+
+    def _recording_ui(self) -> None:
         if self._command_active:
             self._status("🎙 Befehl sprechen…",
                          f"Doppelt {self.command_label} = auf Auswahl anwenden",
@@ -1066,39 +886,37 @@ class WhisperDictationDaemon:
 
     def auto_stop_recording(self) -> None:
         with self.lock:
-            is_recording = (
-                self.recording_process is not None or self.recording_sd_thread is not None
-            )
-            if not is_recording or self.busy:
+            if not self._is_recording() or self.busy:
                 return
             self.stop_recording()
 
     def stop_recording(self) -> None:
-        output_path = self.recording_file
-        if output_path is None:
-            return
+        with self.lock:
+            output_path = self.recording_file
+            if output_path is None:
+                return
 
-        self.recording_file = None
-        self.busy = True
-        print(f"[whisper-dictation] recording stopped file={output_path}", flush=True)
+            self.recording_file = None
+            self.busy = True
+            print(f"[whisper-dictation] recording stopped file={output_path}", flush=True)
 
-        if self.recording_timer is not None:
-            self.recording_timer.cancel()
-            self.recording_timer = None
+            if self.recording_timer is not None:
+                self.recording_timer.cancel()
+                self.recording_timer = None
 
-        if IS_MACOS:
-            worker = threading.Thread(
-                target=self._stop_and_transcribe_macos,
-                args=(output_path,),
-                daemon=True,
-            )
-        else:
-            process = self._stop_recording_linux()
-            worker = threading.Thread(
-                target=self._stop_and_transcribe_linux,
-                args=(process, output_path),
-                daemon=True,
-            )
+            if IS_MACOS:
+                worker = threading.Thread(
+                    target=self._stop_and_transcribe_macos,
+                    args=(output_path,),
+                    daemon=True,
+                )
+            else:
+                process = self._stop_recording_linux()
+                worker = threading.Thread(
+                    target=self._stop_and_transcribe_linux,
+                    args=(process, output_path),
+                    daemon=True,
+                )
 
         worker.start()
         self._status("✍️ Transkribiere…", "Aufnahme wird erkannt", urgency="critical", timeout_ms=0)
@@ -1248,10 +1066,6 @@ class WhisperDictationDaemon:
         return str(result["text"])
 
     def _ollama_postprocess(self, text: str) -> str:
-        import urllib.request, json as _json, re as _re
-        host = str(self.config.get("ollama_host", "http://localhost:11434")).rstrip("/")
-        model = str(self.config.get("ollama_model", "qwen2.5:7b"))
-
         # A custom system prompt (if set) overrides the default cleanup rules.
         system = str(self.config.get("ollama_system_prompt", "")).strip() or OLLAMA_CLEANUP_SYSTEM
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
@@ -1260,27 +1074,14 @@ class WhisperDictationDaemon:
             messages.append({"role": "assistant", "content": example_out})
         messages.append({"role": "user", "content": text})
 
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "think": bool(self.config.get("ollama_thinking", False)),
-            "keep_alive": "10m",
-            "options": {"temperature": 0.1},
-        }
-
-        print(f"[whisper-dictation] ollama chat model={model} input_chars={len(text)}", flush=True)
-        req = urllib.request.Request(
-            f"{host}/api/chat",
-            data=_json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        print(
+            f"[whisper-dictation] ollama chat model={self.config.get('ollama_model')} "
+            f"input_chars={len(text)}", flush=True,
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            parsed = _json.loads(resp.read())
-
-        raw = str(parsed.get("message", {}).get("content", ""))
-        cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+        cleaned = ollama_chat(
+            self.config, messages, temperature=0.1, timeout=120,
+            think=bool(self.config.get("ollama_thinking", False)),
+        )
         # If the model refuses or returns nothing, fall back to the raw text.
         refusal_hints = ("ich kann", "i cannot", "i'm unable", "tut mir leid", "sorry", "als ki", "as an ai")
         if not cleaned or any(h in cleaned.lower() for h in refusal_hints):
@@ -1292,30 +1093,17 @@ class WhisperDictationDaemon:
 
     def _ollama_instruct(self, text: str, instruction: str) -> str:
         """Run a free-form user instruction over the text via Ollama."""
-        import urllib.request, json as _json, re as _re
-        host = str(self.config.get("ollama_host", "http://localhost:11434")).rstrip("/")
-        model = str(self.config.get("ollama_model", "qwen2.5:7b"))
         system = (
             "Du bist ein Schreibassistent. Fuehre die Anweisung des Nutzers auf dem "
             "gegebenen Text aus und gib AUSSCHLIESSLICH den ueberarbeiteten Text zurueck "
             "- keine Erklaerungen, keine Vorrede. Behalte englische Fachbegriffe bei."
         )
         user = f"Anweisung: {instruction}\n\nText:\n{text}"
-        payload = {
-            "model": model,
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": user}],
-            "stream": False, "think": False, "keep_alive": "10m",
-            "options": {"temperature": 0.3},
-        }
-        req = urllib.request.Request(
-            f"{host}/api/chat", data=_json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"}, method="POST",
+        return ollama_chat(
+            self.config,
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.3, timeout=180,
         )
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            parsed = _json.loads(resp.read())
-        raw = str(parsed.get("message", {}).get("content", ""))
-        return _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
 
     # -- IPC server (GUI workbench) ---------------------------------------------
 
@@ -1529,12 +1317,15 @@ class WhisperDictationDaemon:
         old_keys = (old.get("model"), old.get("backend"), old.get("ov_device"))
         if model_keys != old_keys:
             print("[whisper-dictation] reloading model after config change", flush=True)
-            with self.lock:
-                self.backend = self._resolve_backend()
-                self.fw_model = None
-                self.model = None
-                self.ov_pipe = None
-            self._load_model()
+            # _infer_lock: never swap models under a transcription that is
+            # still running; the reload waits until inference finishes.
+            with self._infer_lock:
+                with self.lock:
+                    self.backend = self._resolve_backend()
+                    self.fw_model = None
+                    self.model = None
+                    self.ov_pipe = None
+                self._load_model()
         elif (new.get("double_tap_key") != old.get("double_tap_key")
               or new.get("llm_toggle_key") != old.get("llm_toggle_key")
               or new.get("command_key") != old.get("command_key")):
