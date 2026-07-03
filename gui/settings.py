@@ -2373,6 +2373,7 @@ class RecorderView(Gtk.Box):
         for name, callback in (
             ("ask", lambda: self._open_qa(base)),
             ("chapters", lambda: self._make_chapters(base)),
+            ("speakers", lambda: self._make_speakers(base)),
             ("export-obsidian", lambda: self._export_obsidian(base)),
             ("export-srt", lambda: self._export_subtitles(base, "srt")),
             ("export-vtt", lambda: self._export_subtitles(base, "vtt")),
@@ -2388,6 +2389,7 @@ class RecorderView(Gtk.Box):
         section = Gio.Menu()
         section.append("Frag die Aufnahme …", "detail.ask")
         section.append("Kapitel erkennen", "detail.chapters")
+        section.append("Sprecher erkennen", "detail.speakers")
         menu.append_section(None, section)
         export = Gio.Menu()
         export.append("Nach Obsidian exportieren", "detail.export-obsidian")
@@ -2462,8 +2464,8 @@ class RecorderView(Gtk.Box):
                 return
 
     def _decorate_transcript(self) -> None:
-        """Timestamps get accent color + bold — the transcript reads as
-        structured paragraphs instead of a gray wall of text."""
+        """Timestamps get accent color + bold; 'Sprecher:' prefixes get bold —
+        the transcript reads as structured paragraphs, not a gray wall."""
         view = self._detail.get("tr_view")
         if view is None:
             return
@@ -2475,13 +2477,20 @@ class RecorderView(Gtk.Box):
             rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
             tag = buf.create_tag("ts-marker", weight=700, scale=0.85)
             tag.set_property("foreground-rgba", rgba)
+        spk = buf.get_tag_table().lookup("spk-marker")
+        if spk is None:
+            spk = buf.create_tag("spk-marker", weight=800)
         start, end = buf.get_bounds()
         buf.remove_tag(tag, start, end)
+        buf.remove_tag(spk, start, end)
         text = buf.get_text(start, end, False)
         for m in self._TS_RE.finditer(text):
-            buf.apply_tag(tag,
-                          buf.get_iter_at_offset(m.start()),
+            buf.apply_tag(tag, buf.get_iter_at_offset(m.start()),
                           buf.get_iter_at_offset(m.end()))
+        # Speaker prefix: "[mm:ss] Name: …" -> bold the "Name:" part.
+        for m in re.finditer(r"\]\s([^:\n]{1,20}):", text):
+            buf.apply_tag(spk, buf.get_iter_at_offset(m.start(1)),
+                          buf.get_iter_at_offset(m.end(1) + 1))
 
     def _load_chapters(self, base) -> None:
         row = self._detail.get("chapters_row")
@@ -2534,6 +2543,33 @@ class RecorderView(Gtk.Box):
 
         def work():
             r = recorder_call("chapters", base, timeout=300)
+            GLib.idle_add(done, r)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _make_speakers(self, base) -> None:
+        if not load_config().get("speaker_enabled"):
+            self._toast("Aktiviere erst „Sprechererkennung“ in den Einstellungen.")
+            return
+        if not (RECORDINGS_DIR / f"{base}.txt").exists():
+            self._toast("Erst transkribieren.")
+            return
+        self._toast("Erkenne Sprecher … (kann etwas dauern)")
+
+        def done(r: dict) -> bool:
+            if "error" in r:
+                hint = {"speaker_models_missing": "Sprecher-Modelle fehlen (Einstellungen → aktivieren).",
+                        "no_speakers": "Keine Sprecher erkannt."}.get(r["error"], r["error"])
+                self._toast(f"Sprecher: {hint}")
+            else:
+                n = r.get("speakers", 0)
+                me = " (inkl. dir)" if r.get("has_me") else ""
+                self._toast(f"{n} Sprecher erkannt{me} ✓")
+                if self._detail_base == base:
+                    self._load_detail_content(base)  # reload transcript with prefixes
+            return False
+
+        def work():
+            r = recorder_call("diarize", base, timeout=900)
             GLib.idle_add(done, r)
         threading.Thread(target=work, daemon=True).start()
 
@@ -3488,6 +3524,26 @@ class PrefsDialog(Adw.PreferencesDialog):
         self.learn_row.set_active(bool(self.config.get("learn_corrections", True)))
         self._bind_switch(self.learn_row, "learn_corrections")
         mode_group.add(self.learn_row)
+
+        # Speaker recognition (learns your voice from dictations).
+        spk_group = Adw.PreferencesGroup(
+            title="Sprechererkennung",
+            description="Lernt deine Stimme aus jedem Diktat. In Aufnahmen wird dann "
+                        "„Ich“ von anderen Sprechern unterschieden. Alles lokal.")
+        page2.add(spk_group)
+        self.speaker_row = Adw.SwitchRow(
+            title="Sprechererkennung aktivieren",
+            subtitle="Einmaliger Modell-Download (~34 MB).")
+        self.speaker_row.set_active(bool(self.config.get("speaker_enabled", False)))
+        self.speaker_row.connect("notify::active", self._on_speaker_toggled)
+        spk_group.add(self.speaker_row)
+        self.speaker_profile_row = Adw.ActionRow(title="Stimmprofil")
+        reset_btn = Gtk.Button(label="Zurücksetzen", valign=Gtk.Align.CENTER)
+        reset_btn.add_css_class("flat")
+        reset_btn.connect("clicked", lambda *_: self._reset_voice_profile())
+        self.speaker_profile_row.add_suffix(reset_btn)
+        spk_group.add(self.speaker_profile_row)
+        self._refresh_profile_row()
         llm = Adw.PreferencesGroup(
             title="Textverbesserung (Ollama)",
             description="Optionaler LLM-Schritt: entfernt Füllwörter, korrigiert "
@@ -3750,6 +3806,69 @@ class PrefsDialog(Adw.PreferencesDialog):
             banner.set_revealed(False)
         self.win._daemon_action(
             "--restart", "Daemon neu gestartet — neue Taste aktiv.", "Neustart fehlgeschlagen")
+
+    def _refresh_profile_row(self) -> None:
+        def work():
+            import sys as _sys
+            _sys.path.insert(0, str(PROJECT_ROOT / "dictation"))
+            try:
+                import speaker
+                prof = speaker.load_profile()
+                count = int(prof.get("count", 0))
+            except Exception:
+                count = 0
+            sub = (f"Aus {count} Diktat(en) gelernt" if count
+                   else "Noch nichts gelernt — diktiere ein paar Sätze.")
+            GLib.idle_add(self.speaker_profile_row.set_subtitle, sub)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _reset_voice_profile(self) -> None:
+        def work():
+            import sys as _sys
+            _sys.path.insert(0, str(PROJECT_ROOT / "dictation"))
+            try:
+                import speaker
+                speaker.reset_profile()
+            except Exception:
+                pass
+            GLib.idle_add(self._refresh_profile_row)
+            GLib.idle_add(self._toast, "Stimmprofil zurückgesetzt")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_speaker_toggled(self, *_a) -> None:
+        active = bool(self.speaker_row.get_active())
+        if not active:
+            self._apply("speaker_enabled", False)
+            return
+        # Ensure the models exist before enabling; download once if needed.
+        import sys as _sys
+        _sys.path.insert(0, str(PROJECT_ROOT / "dictation"))
+        try:
+            import speaker
+        except Exception:
+            self._toast("sherpa-onnx fehlt — bitte im venv installieren.")
+            self.speaker_row.set_active(False)
+            return
+        if speaker.models_present():
+            self._apply("speaker_enabled", True)
+            return
+        self.speaker_row.set_sensitive(False)
+        self._toast("Lade Sprecher-Modelle …")
+
+        def work():
+            ok = speaker.download_models()
+            GLib.idle_add(done, ok)
+
+        def done(ok: bool) -> bool:
+            self.speaker_row.set_sensitive(True)
+            if ok:
+                self._apply("speaker_enabled", True)
+                self._toast("Sprechererkennung aktiv ✓")
+            else:
+                self.speaker_row.set_active(False)
+                self._toast("Modell-Download fehlgeschlagen (Internet?).")
+            return False
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_per_app_toggled(self, *_a) -> None:
         active = bool(self.per_app_row.get_active())

@@ -52,6 +52,13 @@ if ! "${VENV}/bin/python" -c "import openvino_genai, huggingface_hub" >/dev/null
   echo "Installiere openvino-genai (Intel GPU/NPU) ..."
   "${VENV}/bin/python" -m pip install openvino openvino-genai huggingface_hub
 fi
+# sherpa-onnx: optional speaker recognition (no torch, ~4 MB). Models are
+# downloaded on first activation in the app.
+if ! "${VENV}/bin/python" -c "import sherpa_onnx" >/dev/null 2>&1; then
+  echo "Installiere sherpa-onnx (Sprechererkennung, optional) ..."
+  "${VENV}/bin/python" -m pip install sherpa-onnx || \
+    echo "  (sherpa-onnx optional — Sprechererkennung bleibt sonst deaktiviert)"
+fi
 
 # Report which OpenVINO devices are available (GPU = Intel Arc; NPU needs the
 # Intel NPU userspace runtime, see README-GNOME.md).

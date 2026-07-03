@@ -135,6 +135,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "per_app_modes": {},
     # Offer to learn recurring word corrections from Werkbank edits.
     "learn_corrections": True,
+    # Speaker recognition: learn the user's voice from dictations, then label
+    # "Ich" vs other speakers in recordings. Opt-in (needs the embedder model).
+    "speaker_enabled": False,
+    # Enroll the user's voice automatically from dictation audio.
+    "speaker_autolearn": True,
     # Personal dictionary: names/jargon (list of strings). Biases recognition
     # via hotwords + initial prompt so custom terms are spelled correctly.
     "dictionary": [],

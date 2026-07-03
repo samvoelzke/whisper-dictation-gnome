@@ -815,6 +815,82 @@ def cmd_chapters(args: argparse.Namespace) -> int:
     return 0
 
 
+def _speaker_at(labels: list, t: float) -> str:
+    """Speaker label whose [start,end] interval contains time t (else '')."""
+    for start, end, label in labels:
+        if start <= t <= end:
+            return label
+    # nearest by start if no exact containment (paragraph starts land in gaps)
+    best, best_d = "", 1e9
+    for start, end, label in labels:
+        d = abs(start - t)
+        if d < best_d:
+            best, best_d = label, d
+    return best if best_d < 8.0 else ""
+
+
+def cmd_diarize(args: argparse.Namespace) -> int:
+    """Detect speakers, label the enrolled user as 'Ich', store speakers.json
+    and rewrite the transcript with 'Sprecher:' prefixes per paragraph."""
+    import numpy as np
+    base = args.base
+    audio_path = RECORDINGS_DIR / f"{base}.opus"
+    txt_path = RECORDINGS_DIR / f"{base}.txt"
+    if not audio_path.exists():
+        print(json.dumps({"error": "audio_not_found", "base": base}))
+        return 1
+    try:
+        import speaker
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"error": f"speaker module: {exc}", "base": base}))
+        return 1
+    if not speaker.available():
+        print(json.dumps({"error": "speaker_models_missing", "base": base}))
+        return 1
+
+    samples = _decode_chunk(audio_path, 0.0, 10 * 3600)  # whole file, 16k mono
+    if samples.size < 16000:
+        print(json.dumps({"error": "audio_too_short", "base": base}))
+        return 1
+    labels = speaker.diarize_and_label(samples, 16000)
+    if not labels:
+        print(json.dumps({"error": "no_speakers", "base": base}))
+        return 1
+    _write_json(RECORDINGS_DIR / f"{base}.speakers.json",
+                [{"start": round(s, 2), "end": round(e, 2), "label": l}
+                 for s, e, l in labels])
+
+    # Rewrite transcript paragraphs with a speaker prefix (idempotent: strip
+    # any existing 'Name: ' after the [mm:ss] marker first).
+    if txt_path.exists():
+        import re
+        out_lines = []
+        for para in txt_path.read_text(encoding="utf-8").split("\n\n"):
+            p = para.strip()
+            if not p:
+                continue
+            m = re.match(r"^(\[\d+:\d{2}(?::\d{2})?\])\s*(?:[^:\n]{1,20}:\s*)?(.*)$", p, re.DOTALL)
+            if m:
+                stamp, body = m.group(1), m.group(2)
+                secs = 0
+                mm = re.match(r"\[(\d+):(\d{2})(?::(\d{2}))?\]", stamp)
+                if mm:
+                    g = mm.groups()
+                    secs = (int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2])) if g[2] else (int(g[0]) * 60 + int(g[1]))
+                who = _speaker_at(labels, secs)
+                out_lines.append(f"{stamp} {who + ': ' if who else ''}{body}".rstrip())
+            else:
+                out_lines.append(p)
+        from common import atomic_write
+        atomic_write(txt_path, "\n\n".join(out_lines) + "\n")
+
+    n_speakers = len({l for _, _, l in labels})
+    _notify("Sprecher erkannt", f"{base}: {n_speakers} Sprecher")
+    print(json.dumps({"base": base, "speakers": n_speakers,
+                      "has_me": any(l == "Ich" for _, _, l in labels)}))
+    return 0
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     """Answer a content question strictly from the transcript (Q&A)."""
     base = args.base
@@ -899,7 +975,7 @@ def cmd_list(_args: argparse.Namespace) -> int:
 def cmd_delete(args: argparse.Namespace) -> int:
     base = args.base
     for suffix in (".opus", ".meta.json", ".txt", ".progress.json",
-                   ".summary.md", ".notes.json", ".chapters.json"):
+                   ".summary.md", ".notes.json", ".chapters.json", ".speakers.json"):
         (RECORDINGS_DIR / f"{base}{suffix}").unlink(missing_ok=True)
     print(json.dumps({"base": base, "status": "deleted"}))
     return 0
@@ -954,6 +1030,10 @@ def main() -> int:
     s = sub.add_parser("chapters")
     s.add_argument("base")
     s.set_defaults(func=cmd_chapters)
+
+    s = sub.add_parser("diarize")
+    s.add_argument("base")
+    s.set_defaults(func=cmd_diarize)
 
     s = sub.add_parser("delete")
     s.add_argument("base")

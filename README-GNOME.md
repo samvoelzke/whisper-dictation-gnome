@@ -129,6 +129,12 @@ in der Werkbank, `Strg+1–3` Ansichten, `Strg+Q` beenden.
   Ohne die Erweiterung bleibt der globale Modus aktiv.
 - **Aus Korrekturen lernen**: Bearbeitest du ein Werkbank-Diktat und kopierst
   es, schlägt die App wiederkehrende Wort-Korrekturen fürs Wörterbuch vor.
+- **Sprechererkennung** (Einstellungen → KI, optional, ~34 MB Modell-Download):
+  Die App lernt deine Stimme **automatisch aus jedem Diktat** (du sprichst ja
+  ohnehin). In Rekorder-Aufnahmen unterscheidet sie dann per ⋮ → „Sprecher
+  erkennen“ **„Ich“ von anderen Sprechern** und schreibt die Namen ins
+  Transkript. Komplett lokal via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
+  (CAM++-Embeddings, kein PyTorch).
 
 ## Dateien
 

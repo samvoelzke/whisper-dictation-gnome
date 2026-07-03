@@ -115,6 +115,25 @@ class TestPerApp(unittest.TestCase):
                                                "per_app_modes": {"x": "raw"}}))
 
 
+class TestSpeakerModule(unittest.TestCase):
+    """The speaker module must import and degrade gracefully with no models."""
+    def setUp(self):
+        import importlib
+        try:
+            self.speaker = importlib.import_module("speaker")
+        except Exception as exc:
+            self.skipTest(f"speaker import: {exc}")
+
+    def test_graceful_without_models(self):
+        # available() must never raise; embed of tiny audio returns None.
+        self.assertIn(self.speaker.available(), (True, False))
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy")
+        self.assertIsNone(self.speaker.embed(np.zeros(100, dtype=np.float32), 16000))
+
+
 class TestSubtitles(unittest.TestCase):
     def setUp(self):
         import importlib.util

@@ -738,6 +738,28 @@ class WhisperDictationDaemon:
         except Exception as exc:
             print(f"[whisper-dictation] could not save config: {exc}", file=sys.stderr, flush=True)
 
+    def _maybe_enroll_voice(self, audio: np.ndarray) -> None:
+        """Fold this dictation into the user's voice profile (background).
+
+        You always speak your own dictations, so they are perfect enrollment
+        clips — the profile improves silently with every use. Best effort.
+        """
+        if not (self.config.get("speaker_enabled") and self.config.get("speaker_autolearn", True)):
+            return
+        if audio is None or len(audio) < 16000 * 2:  # need ~2 s of speech
+            return
+        clip = audio.copy()
+
+        def work():
+            try:
+                import speaker
+                if speaker.available():
+                    speaker.enroll_samples(clip, 16000)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[whisper-dictation] voice enroll skipped: {exc}",
+                      file=sys.stderr, flush=True)
+        threading.Thread(target=work, daemon=True).start()
+
     def _append_history(self, text: str, raw: str | None = None) -> None:
         if not self.config.get("save_history", True) or not text.strip():
             return
@@ -1077,6 +1099,7 @@ class WhisperDictationDaemon:
                         return
 
             self._append_history(text, raw_text)
+            self._maybe_enroll_voice(audio)
             pasted = self._paste_text(text)
             if pasted:
                 self._status("✓ Eingefügt", text[:120], timeout_ms=4000)
