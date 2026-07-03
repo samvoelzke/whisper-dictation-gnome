@@ -331,6 +331,15 @@ def install_app_css() -> None:
         .record-idle:active {
           background: alpha(@error_color, 0.26);
         }
+        /* Document-style reading views: no visible box, larger comfortable
+           text - Transkript/Notizen read like an article, not a form field */
+        textview.doc-view,
+        textview.doc-view text {
+          background: transparent;
+        }
+        textview.doc-view {
+          font-size: 1.08em;
+        }
         /* Ghost title entry in the hero: no gray box until it's used */
         entry.inline-title {
           background: transparent;
@@ -1774,11 +1783,11 @@ class RecorderView(Gtk.Box):
         except Exception:
             meta = {}
         self._detail = {}
-        scroller = Gtk.ScrolledWindow(vexpand=True)
+        # No page-level scroller: player + chapters stay fixed on top, the
+        # Transkript/Notizen views below get the full remaining height.
         clamp = Adw.Clamp(maximum_size=920, tightening_threshold=720,
-                          margin_top=12, margin_bottom=18, margin_start=12, margin_end=12)
-        scroller.set_child(clamp)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+                          margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         clamp.set_child(box)
 
         current_title = meta.get("title", base)
@@ -1896,74 +1905,92 @@ class RecorderView(Gtk.Box):
         prog_box.append(bar)
         box.append(prog_box)
 
-        # transcript section (search + copy in the header; [mm:ss] markers in
-        # the text are clickable and seek the player)
-        tr_group = Adw.PreferencesGroup(title="Transkript")
-        tr_suffix = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        # ── Transkript | Notizen as full-height views (no stacked mini boxes)
+        content_stack = Adw.ViewStack(vexpand=True)
+        self._detail["content_stack"] = content_stack
+        if hasattr(Adw, "InlineViewSwitcher"):
+            switcher = Adw.InlineViewSwitcher(stack=content_stack,
+                                              halign=Gtk.Align.CENTER)
+        else:
+            switcher = Adw.ViewSwitcher(stack=content_stack,
+                                        policy=Adw.ViewSwitcherPolicy.WIDE,
+                                        halign=Gtk.Align.CENTER)
+        box.append(switcher)
+        box.append(content_stack)
+
+        # — Transkript view: toolbar (search/copy/save) + full-height editor
+        tr_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        tr_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self._tr_search = Gtk.SearchEntry(placeholder_text="Im Transkript suchen …")
-        self._tr_search.set_max_width_chars(22)
+        self._tr_search.set_hexpand(True)
         self._tr_search.connect("search-changed", lambda *_: self._tr_do_search(reset=True))
         self._tr_search.connect("activate", lambda *_: self._tr_do_search(reset=False))
-        tr_suffix.append(self._tr_search)
+        tr_bar.append(self._tr_search)
         tr_copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
         tr_copy.add_css_class("flat")
         tr_copy.set_tooltip_text("Transkript kopieren")
         tr_copy.connect("clicked", lambda *_: self._copy(self._transcript_text()))
-        tr_suffix.append(tr_copy)
-        tr_group.set_header_suffix(tr_suffix)
-        box.append(tr_group)
-        tr_scroller = Gtk.ScrolledWindow(min_content_height=220)
-        tr_scroller.add_css_class("card")
-        tr_scroller.add_css_class("editor-card")
-        tr_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=10, bottom_margin=10,
-                               left_margin=10, right_margin=10)
-        tr_view.add_css_class("editor-view")
+        tr_bar.append(tr_copy)
+        save_btn = Gtk.Button(label="Speichern", valign=Gtk.Align.CENTER)
+        save_btn.add_css_class("flat")
+        save_btn.set_tooltip_text("Änderungen am Transkript speichern")
+        save_btn.connect("clicked", lambda *_: self._save_transcript(base))
+        tr_bar.append(save_btn)
+        self._detail["tr_actions"] = tr_bar
+        tr_page.append(tr_bar)
+        tr_scroller = Gtk.ScrolledWindow(vexpand=True)
+        tr_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                               top_margin=12, bottom_margin=24,
+                               left_margin=4, right_margin=4,
+                               pixels_above_lines=3, pixels_inside_wrap=5)
+        tr_view.add_css_class("doc-view")
         click = Gtk.GestureClick()
         click.connect("released", self._on_transcript_click)
         tr_view.add_controller(click)
         tr_scroller.set_child(tr_view)
         self._detail["tr_view"] = tr_view
         self._detail["tr_scroller"] = tr_scroller
-        tr_group.add(self._row_wrap(tr_scroller))
-        tr_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.END, margin_top=6)
-        save_btn = Gtk.Button(label="Speichern")
-        save_btn.connect("clicked", lambda *_: self._save_transcript(base))
-        tr_actions.append(save_btn)
-        self._detail["tr_actions"] = tr_actions
-        tr_group.add(self._row_wrap(tr_actions))
+        tr_page.append(tr_scroller)
         # empty-state
-        tr_empty = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        tr_empty_lbl = Gtk.Label(label="Noch nicht transkribiert.", xalign=0, hexpand=True)
+        tr_empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                           valign=Gtk.Align.CENTER, vexpand=True)
+        tr_empty_lbl = Gtk.Label(label="Noch nicht transkribiert.")
         tr_empty_lbl.add_css_class("dim-label")
         tr_empty.append(tr_empty_lbl)
-        tr_btn = Gtk.Button(label="Transkribieren")
+        tr_btn = Gtk.Button(label="Transkribieren", halign=Gtk.Align.CENTER)
+        tr_btn.add_css_class("pill")
         tr_btn.add_css_class("suggested-action")
         tr_btn.connect("clicked", lambda *_: self._transcribe(base))
         tr_empty.append(tr_btn)
         self._detail["tr_empty"] = tr_empty
-        tr_group.add(self._row_wrap(tr_empty))
+        tr_page.append(tr_empty)
+        content_stack.add_titled(tr_page, "transkript", "Transkript")
 
-        # notes section: one card per summary — several can coexist
-        nt_group = Adw.PreferencesGroup(title="Notizen")
-        nt_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        # — Notizen view: toolbar + full-height scrolling card list
+        nt_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        nt_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                         halign=Gtk.Align.END)
         nt_btn = Gtk.Button(label="Zusammenfassen …", valign=Gtk.Align.CENTER)
         nt_btn.add_css_class("flat")
         nt_btn.set_tooltip_text("Weitere Zusammenfassung mit eigenem Fokus erstellen")
         nt_btn.connect("clicked", lambda *_: self._ask_focus(base))
         self._detail["nt_btn"] = nt_btn
-        nt_head.append(nt_btn)
+        nt_bar.append(nt_btn)
         nt_copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
         nt_copy.add_css_class("flat")
         nt_copy.set_tooltip_text("Alle Notizen kopieren (Markdown)")
         nt_copy.connect("clicked", lambda *_: self._copy(self._notes_text()))
-        nt_head.append(nt_copy)
-        nt_group.set_header_suffix(nt_head)
-        box.append(nt_group)
+        nt_bar.append(nt_copy)
+        nt_page.append(nt_bar)
+        nt_scroll = Gtk.ScrolledWindow(vexpand=True)
         nt_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self._detail["nt_container"] = nt_container
-        nt_group.add(self._row_wrap(nt_container))
+        nt_scroll.set_child(nt_container)
+        nt_page.append(nt_scroll)
+        nt_stack_page = content_stack.add_titled(nt_page, "notizen", "Notizen")
+        self._detail["nt_stack_page"] = nt_stack_page
 
-        page = Adw.NavigationPage(title=current_title, child=scroller)
+        page = Adw.NavigationPage(title=current_title, child=clamp)
         self._detail["page"] = page
         self.nav.push(page)
         self._load_detail_content(base)
@@ -2470,6 +2497,9 @@ class RecorderView(Gtk.Box):
             return
         for note in notes:
             container.append(self._build_note_card(base, note))
+        page = self._detail.get("nt_stack_page")
+        if page is not None:
+            page.set_title(f"Notizen ({len(notes)})" if notes else "Notizen")
 
     def _build_note_card(self, base, note) -> Gtk.Box:
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -2492,17 +2522,18 @@ class RecorderView(Gtk.Box):
         trash.connect("clicked", lambda _b, n=note: self._delete_note(base, n))
         head.append(trash)
         card.append(head)
-        scroller = Gtk.ScrolledWindow(min_content_height=100, max_content_height=340,
-                                      propagate_natural_height=True)
-        scroller.add_css_class("card")
-        scroller.add_css_class("editor-card")
+        # Document style: no box around the text — it reads like an article.
         view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, editable=False,
-                            top_margin=10, bottom_margin=10,
-                            left_margin=10, right_margin=10)
-        view.add_css_class("editor-view")
+                            cursor_visible=False,
+                            top_margin=4, bottom_margin=8,
+                            left_margin=4, right_margin=4,
+                            pixels_above_lines=3, pixels_inside_wrap=5)
+        view.add_css_class("doc-view")
         render_markdown(view, str(note.get("text", "")))
-        scroller.set_child(view)
-        card.append(scroller)
+        card.append(view)
+        sep = Gtk.Separator(margin_top=10)
+        sep.add_css_class("spacer")
+        card.append(sep)
         return card
 
     def _delete_note(self, base, note) -> None:
