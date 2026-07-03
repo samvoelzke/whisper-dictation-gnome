@@ -43,6 +43,7 @@ from common import (
     load_ov_pipeline,
     match_snippet,
     ollama_chat,
+    per_app_mode,
     save_config,
 )
 
@@ -1051,7 +1052,10 @@ class WhisperDictationDaemon:
             else:
                 text = apply_replacements(self.config, text)
 
-                mode = str(self.config.get("dictation_mode", "standard"))
+                # Per-app mode override: the focused app (Terminal/Mail/Chat)
+                # can pick the dictation mode automatically; falls back to the
+                # global mode when detection is unavailable.
+                mode = per_app_mode(self.config) or str(self.config.get("dictation_mode", "standard"))
                 _label, mode_prompt = DICTATION_MODES.get(mode, DICTATION_MODES["standard"])
                 # standard: follow the ollama_postprocess switch; email/chat:
                 # always post-process; raw: never.

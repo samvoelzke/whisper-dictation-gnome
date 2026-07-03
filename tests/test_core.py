@@ -91,6 +91,52 @@ class TestDictationModes(unittest.TestCase):
         self.assertEqual(set(common.DICTATION_MODES), {"standard", "email", "chat", "raw"})
 
 
+class TestSnippetVars(unittest.TestCase):
+    def test_known_and_unknown(self):
+        import datetime
+        out = common.expand_snippet_vars("am {{date}} um {{time}}, und {{unknown}}")
+        self.assertIn(datetime.datetime.now().strftime("%d.%m.%Y"), out)
+        self.assertIn("{{unknown}}", out)
+
+
+class TestLearnCorrections(unittest.TestCase):
+    def test_word_swaps_only(self):
+        pairs = common.learn_corrections("das fita modell hier", "das Vita modell hier")
+        self.assertEqual(pairs, {"fita": "Vita"})
+
+    def test_ignores_insertions_and_short(self):
+        self.assertEqual(common.learn_corrections("a b", "a b c"), {})
+        self.assertEqual(common.learn_corrections("hi du", "ho du"), {})  # <3 chars
+
+
+class TestPerApp(unittest.TestCase):
+    def test_disabled_returns_none(self):
+        self.assertIsNone(common.per_app_mode({"per_app_enabled": False,
+                                               "per_app_modes": {"x": "raw"}}))
+
+
+class TestSubtitles(unittest.TestCase):
+    def setUp(self):
+        import importlib.util
+        try:
+            import gi
+            gi.require_version("Gtk", "4.0")
+        except Exception:
+            self.skipTest("GTK not available")
+        spec = importlib.util.spec_from_file_location(
+            "settings", str(ROOT / "gui" / "settings.py"))
+        self.settings = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.settings)
+
+    def test_srt_and_vtt(self):
+        t = "[00:00] Eins.\n\n[00:05] Zwei."
+        srt = self.settings.build_subtitles(t, "srt")
+        self.assertTrue(srt.startswith("1\n00:00:00,000 --> 00:00:04,950\nEins."))
+        vtt = self.settings.build_subtitles(t, "vtt")
+        self.assertTrue(vtt.startswith("WEBVTT"))
+        self.assertEqual(self.settings.build_subtitles("", "srt"), "")
+
+
 class TestParagraphs(unittest.TestCase):
     def setUp(self):
         try:

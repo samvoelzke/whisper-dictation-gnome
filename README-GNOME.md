@@ -121,8 +121,14 @@ in der Werkbank, `Strg+1–3` Ansichten, `Strg+Q` beenden.
   Format `falsch = richtig` (ganze Wörter, Groß-/Kleinschreibung egal).
 - **Sprach-Schnipsel**: Sprich exakt den Auslöser („Grußformel"), und der
   hinterlegte Text wird eingefügt. Format `auslöser = Text` (`\n` = Umbruch).
+  Variablen: `{{date}}`, `{{time}}`, `{{datetime}}`, `{{name}}`, `{{clipboard}}`.
 - **Diktier-Modus** (Einstellungen → KI): `Standard`, `E-Mail` (formell, KI
   immer an), `Chat` (locker, KI immer an) oder `Roh` (KI nie).
+- **Modus je App** (optional): Terminal → Roh, Mail → formell usw. — braucht
+  die GNOME-Erweiterung [„Focused Window D-Bus"](https://extensions.gnome.org/extension/5592/focused-window-d-bus/).
+  Ohne die Erweiterung bleibt der globale Modus aktiv.
+- **Aus Korrekturen lernen**: Bearbeitest du ein Werkbank-Diktat und kopierst
+  es, schlägt die App wiederkehrende Wort-Korrekturen fürs Wörterbuch vor.
 
 ## Dateien
 
@@ -216,7 +222,8 @@ Toggle-Gruppe. Pro Aufnahme gibt es eine **Detail-Seite** mit richtigem
 **Audio-Player (Spulen, ±10 s, Pause, Lautstärke)**, klickbaren
 Zeitmarken, **Suche im Transkript** (mit Treffer-Hervorhebung), editierbarem
 Transkript, Notizen und **„Frag die Aufnahme"** (inhaltliche Fragen, von der
-KI nur aus dem Transkript beantwortet). Über das ⋮-Menü: Obsidian-Export, erneut
+KI nur aus dem Transkript beantwortet). Über das ⋮-Menü: Obsidian-Export,
+**Untertitel-Export (.srt / .vtt)** aus den Zeitmarken, erneut
 transkribieren, **„Audio entfernen, Transkript behalten"** (spart bei
 Vorlesungen ~40 MB pro Stunde) und Löschen. Die Visualisierung ist in den
 Einstellungen umschaltbar: **Wellen / Balken / Aus**.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -128,6 +129,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "recorder_auto_chapters": True,
     # Obsidian vault folder for exporting transcripts/notes ("" = ask once).
     "obsidian_vault": "",
+    # Per-app dictation modes: auto-pick the mode by focused app (needs the
+    # 'Focused Window D-Bus' GNOME extension). {"wm_class_substring": mode}.
+    "per_app_enabled": False,
+    "per_app_modes": {},
+    # Offer to learn recurring word corrections from Werkbank edits.
+    "learn_corrections": True,
     # Personal dictionary: names/jargon (list of strings). Biases recognition
     # via hotwords + initial prompt so custom terms are spelled correctly.
     "dictionary": [],
@@ -224,8 +231,63 @@ def normalize_utterance(text: str) -> str:
     return text.strip().strip(".,!?;: ").lower()
 
 
+def expand_snippet_vars(text: str) -> str:
+    """Expand {{date}}, {{time}}, {{datetime}}, {{name}}, {{clipboard}} in a
+    snippet expansion. Unknown placeholders are left untouched."""
+    import datetime as _dt
+
+    def var(match: "re.Match") -> str:
+        key = match.group(1).strip().lower()
+        now = _dt.datetime.now()
+        if key == "date":
+            return now.strftime("%d.%m.%Y")
+        if key == "time":
+            return now.strftime("%H:%M")
+        if key == "datetime":
+            return now.strftime("%d.%m.%Y %H:%M")
+        if key == "name":
+            import os as _os
+            return _os.environ.get("USER", "")
+        if key == "clipboard":
+            try:
+                return subprocess.run(["wl-paste", "-n"], capture_output=True,
+                                      timeout=2).stdout.decode("utf-8", "replace")
+            except Exception:
+                return ""
+        return match.group(0)  # leave unknown placeholders as-is
+
+    return re.sub(r"\{\{\s*([a-zA-Z_]+)\s*\}\}", var, text)
+
+
+def learn_corrections(original: str, edited: str, max_pairs: int = 5) -> dict[str, str]:
+    """Mine single-word substitutions from an original dictation vs. the
+    user's edited version → replacement suggestions {wrong: right}.
+
+    Only 1:1 word swaps of alphabetic tokens are kept (not insertions,
+    deletions or punctuation churn), so it captures 'Fita→Vita' style
+    recognition fixes without noise. Pure — unit-testable.
+    """
+    import difflib
+    tok = re.compile(r"\w+", re.UNICODE)
+    a = tok.findall(original)
+    b = tok.findall(edited)
+    pairs: dict[str, str] = {}
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "replace" and (i2 - i1) == (j2 - j1):
+            for wrong, right in zip(a[i1:i2], b[j1:j2]):
+                if (wrong.lower() != right.lower()
+                        and wrong.isalpha() and right.isalpha()
+                        and len(wrong) >= 3 and len(right) >= 3):
+                    pairs[wrong] = right
+                    if len(pairs) >= max_pairs:
+                        return pairs
+    return pairs
+
+
 def match_snippet(cfg: dict[str, Any], text: str) -> str | None:
-    """If the whole utterance equals a snippet trigger, return its expansion."""
+    """If the whole utterance equals a snippet trigger, return its expansion
+    with variables ({{date}}, {{clipboard}}, …) resolved."""
     snippets = cfg.get("snippets") or {}
     if not isinstance(snippets, dict):
         return None
@@ -234,7 +296,7 @@ def match_snippet(cfg: dict[str, Any], text: str) -> str | None:
         return None
     for trigger, expansion in snippets.items():
         if normalize_utterance(str(trigger)) == spoken:
-            return str(expansion)
+            return expand_snippet_vars(str(expansion))
     return None
 
 
@@ -507,6 +569,75 @@ _CLIPBOARD_MANAGERS = r"vicinae-server|vicinae|copyq|gpaste-daemon|cliphist|clip
 # (timestamp, result) — whether a manager runs changes ~never within a daemon
 # lifetime, so one pgrep per minute is plenty (instead of one per paste).
 _clip_mgr_cache: tuple[float, bool] | None = None
+
+
+# ── Focused window (per-app dictation modes, Wayland) ────────────────────────
+
+# The only portable way to read the focused window's app id on GNOME Wayland
+# is a shell extension. We support the common "Focused Window D-Bus" one; if
+# it isn't installed, detection returns None and per-app modes stay inactive.
+_FOCUSED_WINDOW_UNAVAILABLE = False
+
+
+def focused_window_class() -> str | None:
+    """Best-effort WM_CLASS/app-id of the focused window, or None.
+
+    Uses the 'Focused Window D-Bus' GNOME extension when present. Cached-off:
+    once it errors we stop calling gdbus so a missing extension costs nothing.
+    """
+    global _FOCUSED_WINDOW_UNAVAILABLE
+    if _FOCUSED_WINDOW_UNAVAILABLE or IS_MACOS:
+        return None
+    try:
+        out = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.gnome.Shell",
+             "--object-path", "/org/gnome/Shell/Extensions/FocusedWindow",
+             "--method", "org.gnome.Shell.Extensions.FocusedWindow.Get"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        _FOCUSED_WINDOW_UNAVAILABLE = True
+        return None
+    if out.returncode != 0:
+        _FOCUSED_WINDOW_UNAVAILABLE = True
+        return None
+    # Returns a JSON string wrapped in a GVariant tuple: ('{"wm_class":...}',)
+    m = re.search(r'"wm_class"\s*:\s*"([^"]*)"', out.stdout)
+    if m:
+        return m.group(1)
+    m = re.search(r'"wm_class_instance"\s*:\s*"([^"]*)"', out.stdout)
+    return m.group(1) if m else None
+
+
+def per_app_mode(cfg: dict[str, Any]) -> str | None:
+    """Dictation mode to force based on the focused app, or None.
+
+    Matching is case-insensitive substring on the WM_CLASS, so 'kitty' or
+    'org.gnome.Console' map via a short key like 'console'/'kitty'.
+    """
+    if not cfg.get("per_app_enabled"):
+        return None
+    mapping = cfg.get("per_app_modes") or {}
+    if not isinstance(mapping, dict) or not mapping:
+        return None
+    wm = focused_window_class()
+    if not wm:
+        return None
+    wm_l = wm.lower()
+    for needle, mode in mapping.items():
+        if str(needle).strip().lower() in wm_l and str(mode) in DICTATION_MODES:
+            return str(mode)
+    return None
+
+
+# Sensible starter table for the GUI (terminals=raw, mail=email, chat=chat).
+DEFAULT_PER_APP_MODES = {
+    "console": "raw", "kitty": "raw", "alacritty": "raw", "wezterm": "raw",
+    "ptyxis": "raw", "foot": "raw", "code": "raw", "jetbrains": "raw",
+    "thunderbird": "email", "geary": "email", "evolution": "email",
+    "signal": "chat", "telegram": "chat", "discord": "chat", "element": "chat",
+    "slack": "chat",
+}
 
 
 def clipboard_manager_running() -> bool:

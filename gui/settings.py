@@ -52,6 +52,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "dictation"))
 from common import (  # noqa: E402
     DEFAULT_CONFIG,
+    DEFAULT_PER_APP_MODES,
     DICTATION_MODES,
     HISTORY_FILE,
     HOTKEY_SPECS,
@@ -61,6 +62,7 @@ from common import (  # noqa: E402
     atomic_write,
     dictionary_terms,
     key_label,
+    learn_corrections,
     load_config,
     rewrite_history,
     save_config,
@@ -198,6 +200,65 @@ def model_display_name(model_id: str) -> str:
     if model_id == DE_FINETUNE:
         return "Deutsch-Finetune (turbo)"
     return model_id
+
+
+_TS_MARKER_RE = re.compile(r"^\[(\d+):(\d{2})(?::(\d{2}))?\]\s*(.*)$")
+
+
+def _stamp_seconds(h_or_m: str, m_or_s: str, s: str | None) -> float:
+    if s is not None:
+        return int(h_or_m) * 3600 + int(m_or_s) * 60 + int(s)
+    return int(h_or_m) * 60 + int(m_or_s)
+
+
+def build_subtitles(transcript: str, fmt: str = "srt",
+                    total_duration: float | None = None) -> str:
+    """Turn a [mm:ss]-marked transcript into SRT or WebVTT. Each marked
+    paragraph is one cue, running until the next paragraph's start (last cue
+    to total_duration, or +5 s). Pure function — unit-testable."""
+    cues: list[tuple[float, str]] = []
+    for para in transcript.split("\n\n"):
+        line = para.strip()
+        if not line:
+            continue
+        m = _TS_MARKER_RE.match(line)
+        if m:
+            start = _stamp_seconds(m.group(1), m.group(2), m.group(3))
+            text = m.group(4).strip()
+        elif cues:
+            # continuation without its own stamp: append to the last cue
+            cues[-1] = (cues[-1][0], (cues[-1][1] + " " + line).strip())
+            continue
+        else:
+            start, text = 0.0, line
+        # strip any inline markers that survived
+        text = re.sub(r"\[\d+:\d{2}(?::\d{2})?\]", "", text).strip()
+        if text:
+            cues.append((start, text))
+    if not cues:
+        return ""
+
+    def fmt_time(sec: float, comma: bool) -> str:
+        ms = int(round((sec - int(sec)) * 1000))
+        s = int(sec)
+        h, rem = divmod(s, 3600)
+        mm, ss = divmod(rem, 60)
+        sep = "," if comma else "."
+        return f"{h:02d}:{mm:02d}:{ss:02d}{sep}{ms:03d}"
+
+    comma = fmt == "srt"
+    out: list[str] = [] if comma else ["WEBVTT", ""]
+    for i, (start, text) in enumerate(cues):
+        if i + 1 < len(cues):
+            end = max(start + 1.2, cues[i + 1][0] - 0.05)
+        else:
+            end = start + 5.0 if total_duration is None else max(start + 1.2, total_duration)
+        if comma:
+            out.append(str(i + 1))
+        out.append(f"{fmt_time(start, comma)} --> {fmt_time(end, comma)}")
+        out.append(text)
+        out.append("")
+    return "\n".join(out) + "\n"
 
 
 def apply_document_style(view: Gtk.TextView) -> None:
@@ -880,6 +941,7 @@ class WorkbenchView(Gtk.Box):
         self.rec_proc: subprocess.Popen | None = None
         self.rec_wav: str | None = None
         self._toast_cb = toast_cb
+        self._dictated_original = ""  # last raw dictation, for auto-learning
 
         clamp = Adw.Clamp(maximum_size=1100, tightening_threshold=900)
         clamp.set_vexpand(True)
@@ -1084,6 +1146,8 @@ class WorkbenchView(Gtk.Box):
         cur = self._text()
         joined = (cur + " " + text).strip() if cur else text
         self._set_text(joined)
+        # Remember this dictation so edits before copying can be learned.
+        self._dictated_original = joined
         self._set_status("Bereit" if text else "Nichts erkannt")
         return False
 
@@ -1122,6 +1186,49 @@ class WorkbenchView(Gtk.Box):
         ok = copy_to_clipboard(self._text())
         if self._toast_cb:
             self._toast_cb("In Zwischenablage kopiert ✓" if ok else "Kopieren fehlgeschlagen (wl-copy fehlt?)")
+        self._maybe_learn()
+
+    def _maybe_learn(self) -> None:
+        """Copy is the 'this is final' signal: diff the edited text against
+        the original dictation and offer to remember recurring word fixes."""
+        if not load_config().get("learn_corrections", True):
+            return
+        original, final = self._dictated_original, self._text()
+        self._dictated_original = final  # don't re-offer the same diff
+        if not original or original == final:
+            return
+        pairs = learn_corrections(original, final)
+        # Skip pairs already in the replacement table.
+        existing = {str(k).lower() for k in (load_config().get("replacements") or {})}
+        pairs = {w: r for w, r in pairs.items() if w.lower() not in existing}
+        if pairs:
+            self._offer_corrections(pairs)
+
+    def _offer_corrections(self, pairs: dict) -> None:
+        listing = "\n".join(f"•  {w}  →  {r}" for w, r in pairs.items())
+        dlg = Adw.AlertDialog(
+            heading="Korrekturen ins Wörterbuch übernehmen?",
+            body=f"Diese Änderungen könnten wiederkehrende Fehlerkennungen sein:\n\n{listing}")
+        dlg.add_response("no", "Nein")
+        dlg.add_response("yes", "Übernehmen")
+        dlg.set_response_appearance("yes", Adw.ResponseAppearance.SUGGESTED)
+
+        def on_resp(_d, resp):
+            if resp != "yes":
+                return
+            cfg = load_config()
+            repl = dict(cfg.get("replacements") or {})
+            repl.update(pairs)
+            cfg["replacements"] = repl
+            save_config(cfg)
+            subprocess.run([str(DAEMON_SCRIPT), "--reload"], capture_output=True, check=False)
+            if self._toast_cb:
+                self._toast_cb(f"{len(pairs)} Korrektur(en) gelernt ✓")
+
+        dlg.connect("response", on_resp)
+        root = self.get_root()
+        if root is not None:
+            dlg.present(root)
 
 
 class RecorderView(Gtk.Box):
@@ -2267,6 +2374,8 @@ class RecorderView(Gtk.Box):
             ("ask", lambda: self._open_qa(base)),
             ("chapters", lambda: self._make_chapters(base)),
             ("export-obsidian", lambda: self._export_obsidian(base)),
+            ("export-srt", lambda: self._export_subtitles(base, "srt")),
+            ("export-vtt", lambda: self._export_subtitles(base, "vtt")),
             ("retranscribe", lambda: self._confirm_retranscribe(base)),
             ("open-folder", self._open_folder),
             ("drop-audio", lambda: self._drop_audio(base)),
@@ -2279,7 +2388,13 @@ class RecorderView(Gtk.Box):
         section = Gio.Menu()
         section.append("Frag die Aufnahme …", "detail.ask")
         section.append("Kapitel erkennen", "detail.chapters")
-        section.append("Nach Obsidian exportieren", "detail.export-obsidian")
+        menu.append_section(None, section)
+        export = Gio.Menu()
+        export.append("Nach Obsidian exportieren", "detail.export-obsidian")
+        export.append("Untertitel (.srt)", "detail.export-srt")
+        export.append("Untertitel (.vtt)", "detail.export-vtt")
+        menu.append_section("Export", export)
+        section = Gio.Menu()
         section.append("Erneut transkribieren", "detail.retranscribe")
         section.append("Ordner öffnen", "detail.open-folder")
         menu.append_section(None, section)
@@ -2619,6 +2734,42 @@ class RecorderView(Gtk.Box):
             r = recorder_call("ask", base, "--question", question, timeout=600)
             GLib.idle_add(done, r)
         threading.Thread(target=work, daemon=True).start()
+
+    # ── detail: subtitle export (SRT / VTT) ──────────────────────────────────
+
+    def _export_subtitles(self, base, fmt: str) -> None:
+        try:
+            transcript = (RECORDINGS_DIR / f"{base}.txt").read_text(encoding="utf-8")
+        except OSError:
+            self._toast("Kein Transkript zum Exportieren.")
+            return
+        try:
+            meta = json.loads((RECORDINGS_DIR / f"{base}.meta.json").read_text())
+            dur = float(meta.get("duration_seconds", 0)) or None
+        except Exception:
+            dur = None
+        content = build_subtitles(transcript, fmt, dur)
+        if not content.strip():
+            self._toast("Keine Zeitmarken im Transkript — bitte neu transkribieren.")
+            return
+        dialog = Gtk.FileDialog(title=f"Untertitel speichern (.{fmt})")
+        dialog.set_initial_name(f"{base}.{fmt}")
+
+        def done(dlg, result):
+            try:
+                gfile = dlg.save_finish(result)
+            except Exception:
+                return
+            path = gfile.get_path() if gfile else None
+            if not path:
+                return
+            try:
+                atomic_write(Path(path), content)
+                self._toast(f"Exportiert: {Path(path).name}")
+            except OSError as exc:
+                self._toast(f"Export fehlgeschlagen: {exc}")
+
+        dialog.save(self.get_root(), None, done)
 
     # ── detail: Obsidian export ──────────────────────────────────────────────
 
@@ -3317,6 +3468,26 @@ class PrefsDialog(Adw.PreferencesDialog):
             "Modus", DICT_MODE_OPTIONS, str(self.config.get("dictation_mode", "standard")))
         self._bind_combo(self.dict_mode_row, DICT_MODE_OPTIONS, "dictation_mode")
         mode_group.add(self.dict_mode_row)
+        # Per-app mode: auto-pick the mode by focused app.
+        self.per_app_row = Adw.SwitchRow(
+            title="Modus je nach App wählen",
+            subtitle="Terminal → Roh, Mail → formell usw. Braucht die GNOME-"
+                     "Erweiterung „Focused Window D-Bus“.")
+        self.per_app_row.set_active(bool(self.config.get("per_app_enabled", False)))
+        self.per_app_row.connect("notify::active", self._on_per_app_toggled)
+        mode_group.add(self.per_app_row)
+        self.per_app_edit = Adw.ActionRow(
+            title="App-Zuordnung bearbeiten", activatable=True)
+        self.per_app_edit.add_prefix(Gtk.Image(icon_name="view-list-symbolic"))
+        self.per_app_edit.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+        self.per_app_edit.connect("activated", lambda *_: self._open_per_app_editor())
+        mode_group.add(self.per_app_edit)
+        self.learn_row = Adw.SwitchRow(
+            title="Aus Korrekturen lernen",
+            subtitle="Nach dem Kopieren in der Werkbank Wörterbuch-Vorschläge anbieten.")
+        self.learn_row.set_active(bool(self.config.get("learn_corrections", True)))
+        self._bind_switch(self.learn_row, "learn_corrections")
+        mode_group.add(self.learn_row)
         llm = Adw.PreferencesGroup(
             title="Textverbesserung (Ollama)",
             description="Optionaler LLM-Schritt: entfernt Füllwörter, korrigiert "
@@ -3401,7 +3572,8 @@ class PrefsDialog(Adw.PreferencesDialog):
             title="Sprach-Schnipsel",
             description="Sprich exakt den Auslöser, und der hinterlegte Text wird "
                         "eingefügt — z. B. für Grußformeln oder Adressen. "
-                        "Eine pro Zeile: auslöser = Text (\\n = Zeilenumbruch)",
+                        "Eine pro Zeile: auslöser = Text (\\n = Zeilenumbruch). "
+                        "Variablen: {{date}}, {{time}}, {{datetime}}, {{name}}, {{clipboard}}.",
         )
         page3.add(snip_group)
         snippets = self.config.get("snippets") or {}
@@ -3578,6 +3750,63 @@ class PrefsDialog(Adw.PreferencesDialog):
             banner.set_revealed(False)
         self.win._daemon_action(
             "--restart", "Daemon neu gestartet — neue Taste aktiv.", "Neustart fehlgeschlagen")
+
+    def _on_per_app_toggled(self, *_a) -> None:
+        active = bool(self.per_app_row.get_active())
+        # Seed a sensible default table on first enable.
+        cfg = load_config()
+        if active and not (cfg.get("per_app_modes") or {}):
+            cfg["per_app_modes"] = dict(DEFAULT_PER_APP_MODES)
+            save_config(cfg)
+        self._apply("per_app_enabled", active)
+        if active:
+            def check():
+                from common import focused_window_class
+                if focused_window_class() is None:
+                    GLib.idle_add(self._toast,
+                                  "Hinweis: GNOME-Erweiterung „Focused Window D-Bus“ nicht gefunden.")
+            threading.Thread(target=check, daemon=True).start()
+
+    def _open_per_app_editor(self) -> None:
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(
+            title="App → Modus",
+            description="Ein Eintrag pro Zeile: teil-des-App-Namens = modus "
+                        "(standard, email, chat, raw). Groß/klein egal.")
+        page.add(group)
+        mapping = load_config().get("per_app_modes") or {}
+        text = "\n".join(f"{k} = {v}" for k, v in mapping.items())
+        scroller = Gtk.ScrolledWindow(min_content_height=220, margin_top=8,
+                                      margin_bottom=8, margin_start=8, margin_end=8)
+        scroller.add_css_class("card")
+        view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=8,
+                            bottom_margin=8, left_margin=8, right_margin=8)
+        view.get_buffer().set_text(text)
+        scroller.set_child(view)
+        group.add(scroller)
+
+        def save_and_pop(*_a):
+            buf = view.get_buffer()
+            raw = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+            result = {}
+            for line in raw.splitlines():
+                if "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().lower()
+                if k and v in DICTATION_MODES:
+                    result[k] = v
+            cfg = load_config()
+            cfg["per_app_modes"] = result
+            save_config(cfg)
+            self._schedule_reload()
+            self.pop_subpage()
+
+        save_btn = Adw.ButtonRow(title="Speichern")
+        save_btn.add_css_class("suggested-action")
+        save_btn.connect("activated", save_and_pop)
+        group.add(save_btn)
+        self.push_subpage(Adw.NavigationPage(title="App-Zuordnung", child=page))
 
     def _on_ollama_toggled(self, *_a) -> None:
         active = bool(self.ollama_row.get_active())
