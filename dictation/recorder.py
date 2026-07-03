@@ -1035,6 +1035,8 @@ def cmd_diarize(args: argparse.Namespace) -> int:
         "segments": [{"start": round(s, 2), "end": round(e, 2), "label": l}
                      for s, e, l in labels],
         "voices": voices,
+        # embeddings are only comparable within one model's vector space
+        "model": speaker.model_key(),
     })
 
     # Rewrite transcript paragraphs with a speaker prefix (idempotent: strip
@@ -1114,7 +1116,8 @@ def cmd_rename_speaker(args: argparse.Namespace) -> int:
     if voices.get(new):
         try:
             import speaker
-            voice_saved = speaker.save_named_voice(new, voices[new])
+            if str(data.get("model", "campplus")) == speaker.model_key():
+                voice_saved = speaker.save_named_voice(new, voices[new])
         except Exception as exc:  # noqa: BLE001 — renaming still succeeded
             print(f"[recorder] voice registry skipped: {exc}",
                   file=sys.stderr, flush=True)
@@ -1212,6 +1215,12 @@ def cmd_mark_me(args: argparse.Namespace) -> int:
         return 1
     try:
         import speaker
+        # embeddings from another model's run live in a different vector
+        # space — enrolling them would poison the profile.
+        stored = str(data.get("model", "campplus"))
+        if stored != speaker.model_key():
+            print(json.dumps({"error": "model_mismatch", "base": base}))
+            return 1
         if not speaker.enroll_vector(voices[label]):
             print(json.dumps({"error": "enroll_failed", "base": base}))
             return 1

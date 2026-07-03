@@ -12,27 +12,67 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from common import CACHE_DIR, atomic_write
+from common import CACHE_DIR, atomic_write, load_config
 
 MODELS_DIR = CACHE_DIR / "speaker-models"
-EMBED_MODEL = MODELS_DIR / "campplus.onnx"
 SEG_MODEL = MODELS_DIR / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
 PROFILE_FILE = CACHE_DIR / "voice-profile.json"
+NAMED_FILE = CACHE_DIR / "named-voices.json"
 
 # Download sources (sherpa-onnx release assets; offline after the one-time pull).
-EMBED_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
-             "speaker-recongition-models/"
-             "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx")
+_EMBED_BASE = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+               "speaker-recongition-models/")
 SEG_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
            "speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2")
 
+# Selectable embedding models (config key 'speaker_embed_model'). Each lives
+# in its own vector space, so voice profile + named registry are stored PER
+# model — switching back and forth never corrupts either.
+EMBED_MODELS = {
+    "campplus": ("campplus.onnx",
+                 _EMBED_BASE + "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+                 "27 MB"),
+    "eres2netv2": ("eres2netv2.onnx",
+                   _EMBED_BASE + "3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
+                   "68 MB"),
+    "resnet293": ("resnet293.onnx",
+                  _EMBED_BASE + "wespeaker_en_voxceleb_resnet293_LM.onnx",
+                  "109 MB"),
+}
+
 SAMPLE_RATE = 16000
 _extractor = None
+_extractor_key = None
 _diarizer = None
+_diarizer_key = None
+
+
+def model_key() -> str:
+    try:
+        key = str(load_config().get("speaker_embed_model", "campplus"))
+    except Exception:  # noqa: BLE001
+        key = "campplus"
+    return key if key in EMBED_MODELS else "campplus"
+
+
+def embed_model_path() -> Path:
+    return MODELS_DIR / EMBED_MODELS[model_key()][0]
+
+
+def profile_path() -> Path:
+    key = model_key()
+    return PROFILE_FILE if key == "campplus" \
+        else CACHE_DIR / f"voice-profile-{key}.json"
+
+
+def named_path() -> Path:
+    key = model_key()
+    return NAMED_FILE if key == "campplus" \
+        else CACHE_DIR / f"named-voices-{key}.json"
 
 
 def models_present() -> bool:
-    return EMBED_MODEL.exists() and SEG_MODEL.exists()
+    return embed_model_path().exists() and SEG_MODEL.exists()
 
 
 def available() -> bool:
@@ -58,12 +98,14 @@ def download_models(progress=None) -> bool:
         if progress:
             progress(msg)
 
+    embed_file = embed_model_path()
+    _name, url, size = EMBED_MODELS[model_key()]
     try:
-        if not EMBED_MODEL.exists():
-            say("Lade Stimm-Modell (28 MB) …")
-            tmp = EMBED_MODEL.with_suffix(".part")
-            urllib.request.urlretrieve(EMBED_URL, tmp)
-            tmp.replace(EMBED_MODEL)
+        if not embed_file.exists():
+            say(f"Lade Stimm-Modell ({size}) …")
+            tmp = embed_file.with_suffix(".part")
+            urllib.request.urlretrieve(url, tmp)
+            tmp.replace(embed_file)
         if not SEG_MODEL.exists():
             say("Lade Segmentierungs-Modell (6 MB) …")
             tar_path = MODELS_DIR / "seg.tar.bz2"
@@ -79,12 +121,14 @@ def download_models(progress=None) -> bool:
 
 
 def _get_extractor():
-    global _extractor
-    if _extractor is None:
+    global _extractor, _extractor_key
+    key = model_key()
+    if _extractor is None or _extractor_key != key:
         import sherpa_onnx
         _extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
             sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                model=str(EMBED_MODEL), num_threads=4, provider="cpu"))
+                model=str(embed_model_path()), num_threads=4, provider="cpu"))
+        _extractor_key = key
     return _extractor
 
 
@@ -115,7 +159,7 @@ def embed(samples, sr: int = SAMPLE_RATE):
 
 def load_profile() -> dict[str, Any]:
     try:
-        return json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+        return json.loads(profile_path().read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -148,7 +192,7 @@ def enroll_vector(vector) -> bool:
         merged = vec
     n = float(np.linalg.norm(merged))
     merged = merged / n if n > 1e-9 else merged
-    atomic_write(PROFILE_FILE, json.dumps({
+    atomic_write(profile_path(), json.dumps({
         "vector": merged.tolist(), "count": count + 1,
     }))
     return True
@@ -162,19 +206,16 @@ def enroll_samples(samples, sr: int = SAMPLE_RATE) -> bool:
 
 
 def reset_profile() -> None:
-    PROFILE_FILE.unlink(missing_ok=True)
+    profile_path().unlink(missing_ok=True)
 
 
 # ── Named voices: a global registry of people you renamed once ───────────────
 # {"Anna": {"vector": [...], "count": 3}, ...} — future diarizations match
 # clusters against these, so Anna is recognized automatically next time.
 
-NAMED_FILE = CACHE_DIR / "named-voices.json"
-
-
 def named_voices() -> dict[str, Any]:
     try:
-        data = json.loads(NAMED_FILE.read_text(encoding="utf-8"))
+        data = json.loads(named_path().read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -197,21 +238,22 @@ def save_named_voice(name: str, vector) -> bool:
     n = float(np.linalg.norm(merged))
     merged = merged / n if n > 1e-9 else merged
     data[name] = {"vector": merged.tolist(), "count": count + 1}
-    atomic_write(NAMED_FILE, json.dumps(data))
+    atomic_write(named_path(), json.dumps(data))
     return True
 
 
 def delete_named_voice(name: str) -> None:
     data = named_voices()
     if data.pop(name, None) is not None:
-        atomic_write(NAMED_FILE, json.dumps(data))
+        atomic_write(named_path(), json.dumps(data))
 
 
 # ── Diarization + labeling ───────────────────────────────────────────────────
 
 def _get_diarizer():
-    global _diarizer
-    if _diarizer is None:
+    global _diarizer, _diarizer_key
+    key = model_key()
+    if _diarizer is None or _diarizer_key != key:
         import sherpa_onnx
         _diarizer = sherpa_onnx.OfflineSpeakerDiarization(
             sherpa_onnx.OfflineSpeakerDiarizationConfig(
@@ -219,9 +261,10 @@ def _get_diarizer():
                     pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
                         model=str(SEG_MODEL))),
                 embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                    model=str(EMBED_MODEL), num_threads=4, provider="cpu"),
+                    model=str(embed_model_path()), num_threads=4, provider="cpu"),
                 clustering=sherpa_onnx.FastClusteringConfig(num_clusters=-1, threshold=0.5),
                 min_duration_on=0.3, min_duration_off=0.5))
+        _diarizer_key = key
     return _diarizer
 
 

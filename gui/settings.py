@@ -338,6 +338,13 @@ REC_SOURCE_OPTIONS = [
 REC_SOURCE_SHORT = {"both": "Mic+System", "system": "System", "mic": "Mic",
                     "import": "Importiert"}
 
+# Speaker-embedding models (see dictation/speaker.py EMBED_MODELS).
+SPK_MODEL_OPTIONS = [
+    ("campplus", "CAM++ · 27 MB — schnell (Standard)"),
+    ("eres2netv2", "ERes2NetV2 · 68 MB — genauer, ~3× Rechenzeit"),
+    ("resnet293", "ResNet293 · 109 MB — maximal, ~5× Rechenzeit"),
+]
+
 # Recorder-specific model / quality choices, surfaced directly in the tab.
 REC_MODEL_OPTIONS = [
     ("large-v3", "large-v3 — genau (empfohlen)"),
@@ -3040,7 +3047,9 @@ class RecorderView(Gtk.Box):
         def done_me(r: dict) -> bool:
             if "error" in r:
                 hint = {"no_voice_data": "Keine Stimmdaten — einmal „Sprecher "
-                                         "neu erkennen“ ausführen."}.get(
+                                         "neu erkennen“ ausführen.",
+                        "model_mismatch": "Mit anderem Stimm-Modell erkannt — "
+                                          "einmal „Sprecher neu erkennen“."}.get(
                     r["error"], r["error"])
                 self._toast(f"Fehlgeschlagen: {hint}")
             else:
@@ -4050,6 +4059,14 @@ class PrefsDialog(Adw.PreferencesDialog):
         self.speaker_row.set_active(bool(self.config.get("speaker_enabled", False)))
         self.speaker_row.connect("notify::active", self._on_speaker_toggled)
         spk_group.add(self.speaker_row)
+        self.spk_model_row = combo_row(
+            "Stimm-Modell", SPK_MODEL_OPTIONS,
+            str(self.config.get("speaker_embed_model", "campplus")))
+        self.spk_model_row.set_subtitle(
+            "Stimmprofil und bekannte Stimmen werden pro Modell getrennt "
+            "gespeichert — Wechsel heißt neu anlernen.")
+        self.spk_model_row.connect("notify::selected", self._on_spk_model_changed)
+        spk_group.add(self.spk_model_row)
         self.speaker_profile_row = Adw.ActionRow(title="Stimmprofil")
         reset_btn = Gtk.Button(label="Zurücksetzen", valign=Gtk.Align.CENTER)
         reset_btn.add_css_class("flat")
@@ -4359,14 +4376,52 @@ class PrefsDialog(Adw.PreferencesDialog):
 
     # Named-voice registry (plain JSON next to the voice profile — the GUI
     # can list/delete it without the venv, only diarization needs sherpa).
-    NAMED_VOICES_FILE = CACHE_DIR / "named-voices.json"
+    # The path depends on the selected embedding model.
+    @staticmethod
+    def _named_voices_file():
+        import sys as _sys
+        _sys.path.insert(0, str(PROJECT_ROOT / "dictation"))
+        import speaker
+        return speaker.named_path()
 
     def _named_voices(self) -> dict:
         try:
-            data = json.loads(self.NAMED_VOICES_FILE.read_text(encoding="utf-8"))
+            data = json.loads(self._named_voices_file().read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}
+
+    def _on_spk_model_changed(self, *_a) -> None:
+        if self._updating:
+            return
+        key = self._cv(self.spk_model_row, SPK_MODEL_OPTIONS)
+        if key == str(self.config.get("speaker_embed_model", "campplus")):
+            return
+        self._apply("speaker_embed_model", key)
+        # profile + registry are per model — the rows now show that model's state
+        self._refresh_profile_row()
+        self._refresh_voices_row()
+        if not bool(self.config.get("speaker_enabled")):
+            return
+        import sys as _sys
+        _sys.path.insert(0, str(PROJECT_ROOT / "dictation"))
+        import speaker
+        if speaker.models_present():
+            self._toast("Stimm-Modell gewechselt ✓")
+            return
+        self.spk_model_row.set_sensitive(False)
+        self._toast("Lade Stimm-Modell …")
+
+        def work():
+            ok = speaker.download_models()
+            GLib.idle_add(done, ok)
+
+        def done(ok: bool) -> bool:
+            self.spk_model_row.set_sensitive(True)
+            self._toast("Stimm-Modell bereit ✓" if ok
+                        else "Download fehlgeschlagen (Internet?).")
+            return False
+        threading.Thread(target=work, daemon=True).start()
 
     def _refresh_voices_row(self) -> None:
         names = sorted(self._named_voices())
@@ -4408,7 +4463,7 @@ class PrefsDialog(Adw.PreferencesDialog):
     def _delete_named_voice(self, name: str) -> None:
         data = self._named_voices()
         if data.pop(name, None) is not None:
-            atomic_write(self.NAMED_VOICES_FILE, json.dumps(data))
+            atomic_write(self._named_voices_file(), json.dumps(data))
         self._refresh_voices_row()
         self._toast(f"Stimme „{name}“ vergessen")
 
