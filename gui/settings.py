@@ -359,6 +359,24 @@ def install_app_css() -> None:
         .chip:hover {
           background: alpha(@window_fg_color, 0.13);
         }
+        /* Accent-tinted chips: everything that jumps in the audio
+           (chapters, cited timestamps) shares the accent color */
+        .chip-accent {
+          color: @accent_color;
+          background: alpha(@accent_bg_color, 0.12);
+        }
+        .chip-accent:hover {
+          background: alpha(@accent_bg_color, 0.22);
+        }
+        /* Note tab label chip (accent pill above each note) */
+        .note-chip {
+          border-radius: 9999px;
+          padding: 2px 10px;
+          color: @accent_color;
+          background: alpha(@accent_bg_color, 0.12);
+          font-weight: 600;
+          font-size: 0.85em;
+        }
         .hero-timer {
           font-size: 1.5em;
           font-weight: 300;
@@ -429,12 +447,19 @@ _MD_INLINE_RE = re.compile(r"(\*\*.+?\*\*|\*[^*\n]+?\*|`[^`\n]+?`)")
 def _md_ensure_tags(buf: Gtk.TextBuffer) -> None:
     if buf.get_tag_table().lookup("md-h1") is not None:
         return
+    r, g, b = accent_rgb()
+    rgba = Gdk.RGBA()
+    rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
     buf.create_tag("md-h1", weight=700, scale=1.4)
-    buf.create_tag("md-h2", weight=700, scale=1.25)
-    buf.create_tag("md-h3", weight=700, scale=1.1)
+    h2 = buf.create_tag("md-h2", weight=700, scale=1.25)
+    h2.set_property("foreground-rgba", rgba)
+    h3 = buf.create_tag("md-h3", weight=700, scale=1.1)
+    h3.set_property("foreground-rgba", rgba)
     buf.create_tag("md-bold", weight=700)
     buf.create_tag("md-italic", style=Pango.Style.ITALIC)
     buf.create_tag("md-code", family="monospace")
+    bullet = buf.create_tag("md-bullet", weight=700)
+    bullet.set_property("foreground-rgba", rgba)
 
 
 def _md_insert(buf: Gtk.TextBuffer, text: str, tags: tuple = ()) -> None:
@@ -478,7 +503,8 @@ def render_markdown(view: Gtk.TextView, text: str) -> None:
             insert_inline(stripped.lstrip("#").strip(), (tag,))
         elif re.match(r"^[-*+]\s+", stripped):
             indent = (len(line) - len(line.lstrip())) // 2
-            _md_insert(buf, "    " * indent + "•  ")
+            _md_insert(buf, "    " * indent)
+            _md_insert(buf, "•  ", ("md-bullet",))
             insert_inline(re.sub(r"^[-*+]\s+", "", stripped))
         else:
             insert_inline(line)
@@ -1637,8 +1663,9 @@ class RecorderView(Gtk.Box):
     FOCUS_PRESETS = (
         ("Vorlesungsnotizen",
          "prüfungsrelevante Inhalte, Definitionen und Beispiele — als strukturierte Lernnotizen"),
-        ("Meeting-Protokoll",
-         "besprochene Themen, Argumente und getroffene Entscheidungen — als Protokoll"),
+        ("Protokoll",
+         "besprochene Themen und getroffene Entscheidungen — als Protokoll, mit einem "
+         "Abschnitt 'Nächste Schritte' für die daraus resultierenden Aufgaben"),
         ("Action-Items",
          "Aufgaben, Verantwortliche und Fristen — als kompakte Action-Item-Liste"),
     )
@@ -1653,8 +1680,8 @@ class RecorderView(Gtk.Box):
         for label, focus in self.FOCUS_PRESETS:
             chip = Gtk.Button(label=label)
             chip.add_css_class("pill")
-            chip.connect("clicked", lambda _b, f=focus: (dlg.force_close(),
-                                                         self._summarize(base, f)))
+            chip.connect("clicked", lambda _b, f=focus, l=label: (dlg.force_close(),
+                                                                  self._summarize(base, f, l)))
             chips.append(chip)
         content.append(chips)
         entry = Gtk.Entry(hexpand=True)
@@ -1672,7 +1699,7 @@ class RecorderView(Gtk.Box):
                                               self._summarize(base, entry.get_text().strip())))
         dlg.present(self.get_root())
 
-    def _summarize(self, base, focus):
+    def _summarize(self, base, focus, label: str = "Notiz"):
         if base in self._busy:
             return
         self._busy.add(base)
@@ -1684,7 +1711,7 @@ class RecorderView(Gtk.Box):
         self._toast("Erstelle Zusammenfassung …")
 
         def work():
-            args = [str(RECORDER_SCRIPT), "summarize", base]
+            args = [str(RECORDER_SCRIPT), "summarize", base, "--label", label]
             if focus:
                 args += ["--focus", focus]
             try:
@@ -1966,29 +1993,9 @@ class RecorderView(Gtk.Box):
         tr_page.append(tr_empty)
         content_stack.add_titled(tr_page, "transkript", "Transkript")
 
-        # — Notizen view: toolbar + full-height scrolling card list
-        nt_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        nt_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
-                         halign=Gtk.Align.END)
-        nt_btn = Gtk.Button(label="Zusammenfassen …", valign=Gtk.Align.CENTER)
-        nt_btn.add_css_class("flat")
-        nt_btn.set_tooltip_text("Weitere Zusammenfassung mit eigenem Fokus erstellen")
-        nt_btn.connect("clicked", lambda *_: self._ask_focus(base))
-        self._detail["nt_btn"] = nt_btn
-        nt_bar.append(nt_btn)
-        nt_copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
-        nt_copy.add_css_class("flat")
-        nt_copy.set_tooltip_text("Alle Notizen kopieren (Markdown)")
-        nt_copy.connect("clicked", lambda *_: self._copy(self._notes_text()))
-        nt_bar.append(nt_copy)
-        nt_page.append(nt_bar)
-        nt_scroll = Gtk.ScrolledWindow(vexpand=True)
-        nt_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self._detail["nt_container"] = nt_container
-        nt_scroll.set_child(nt_container)
-        nt_page.append(nt_scroll)
-        nt_stack_page = content_stack.add_titled(nt_page, "notizen", "Notizen")
-        self._detail["nt_stack_page"] = nt_stack_page
+        # — Notizen: one own tab per summary, created dynamically by
+        # _load_notes ("Transkript | Protokoll | Action-Items | …").
+        self._detail["note_pages"] = []
 
         page = Adw.NavigationPage(title=current_title, child=clamp)
         self._detail["page"] = page
@@ -2138,6 +2145,7 @@ class RecorderView(Gtk.Box):
             btn = Gtk.Button(label=f"{stamp} · {title}")
             btn.add_css_class("flat")
             btn.add_css_class("chip")
+            btn.add_css_class("chip-accent")
             btn.set_tooltip_text("Im Audio dorthin springen")
             btn.connect("clicked", lambda _b, s=seconds: self._seek_to(s))
             box.append(btn)
@@ -2345,6 +2353,7 @@ class RecorderView(Gtk.Box):
                             jump = Gtk.Button(label=f"▶ {stamp.strip('[]')}")
                             jump.add_css_class("flat")
                             jump.add_css_class("chip")
+                            jump.add_css_class("chip-accent")
                             jump.set_tooltip_text("Im Audio dorthin springen")
                             jump.connect("clicked",
                                          lambda _b, s=seconds: self._seek_to(s))
@@ -2479,62 +2488,133 @@ class RecorderView(Gtk.Box):
             parts.append(str(note.get("text", "")).strip())
         return "\n\n".join(parts)
 
+    def _note_label(self, note) -> str:
+        label = str(note.get("label", "")).strip()
+        if label:
+            return label
+        focus = str(note.get("focus", "")).strip()
+        for preset_label, preset_focus in self.FOCUS_PRESETS:
+            if focus == preset_focus:
+                return preset_label
+        return "Notiz"
+
     def _load_notes(self, base) -> None:
-        container = self._detail.get("nt_container")
-        if container is None:
+        """One tab per note next to 'Transkript' (rebuilt on every change)."""
+        stack = self._detail.get("content_stack")
+        if stack is None:
             return
-        child = container.get_first_child()
-        while child is not None:
-            nxt = child.get_next_sibling()
-            container.remove(child)
-            child = nxt
+        remembered = stack.get_visible_child_name()
+        for name in self._detail.get("note_pages", []):
+            child = stack.get_child_by_name(name)
+            if child is not None:
+                stack.remove(child)
+        self._detail["note_pages"] = []
         notes = self._read_notes(base)
         if not notes:
-            empty = Gtk.Label(label="Noch keine Notizen — „Zusammenfassen …“ erstellt welche.",
-                              xalign=0)
-            empty.add_css_class("dim-label")
-            container.append(empty)
-            return
-        for note in notes:
-            container.append(self._build_note_card(base, note))
-        page = self._detail.get("nt_stack_page")
-        if page is not None:
-            page.set_title(f"Notizen ({len(notes)})" if notes else "Notizen")
+            empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                            valign=Gtk.Align.CENTER, vexpand=True)
+            lbl = Gtk.Label(label="Noch keine Notizen.")
+            lbl.add_css_class("dim-label")
+            empty.append(lbl)
+            btn = Gtk.Button(label="Zusammenfassen …", halign=Gtk.Align.CENTER)
+            btn.add_css_class("pill")
+            btn.connect("clicked", lambda *_: self._ask_focus(base))
+            empty.append(btn)
+            stack.add_titled(empty, "note-empty", "Notizen")
+            self._detail["note_pages"].append("note-empty")
+        seen: dict[str, int] = {}
+        for i, note in enumerate(notes):
+            title = self._note_label(note)
+            seen[title] = seen.get(title, 0) + 1
+            if seen[title] > 1:
+                title = f"{title} {seen[title]}"
+            name = f"note-{i}"
+            stack.add_titled(self._build_note_page(base, note), name, title)
+            self._detail["note_pages"].append(name)
+        if remembered and stack.get_child_by_name(remembered) is not None:
+            stack.set_visible_child_name(remembered)
 
-    def _build_note_card(self, base, note) -> Gtk.Box:
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+    def _build_note_page(self, base, note) -> Gtk.Box:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        chip = Gtk.Label(label=self._note_label(note), valign=Gtk.Align.CENTER)
+        chip.add_css_class("note-chip")
+        bar.append(chip)
         created = str(note.get("created", ""))[:16].replace("T", " ")
-        caption_text = " · ".join(p for p in (str(note.get("focus", "")), created) if p)
-        caption = Gtk.Label(label=caption_text or "Notiz", xalign=0, hexpand=True)
+        caption = Gtk.Label(
+            label=" · ".join(p for p in (str(note.get("focus", "")), created) if p),
+            xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
         caption.add_css_class("dim-label")
         caption.add_css_class("caption")
-        head.append(caption)
+        bar.append(caption)
+        add_btn = Gtk.Button(label="Zusammenfassen …", valign=Gtk.Align.CENTER)
+        add_btn.add_css_class("flat")
+        add_btn.set_tooltip_text("Weitere Zusammenfassung mit eigenem Fokus erstellen")
+        add_btn.connect("clicked", lambda *_: self._ask_focus(base))
+        bar.append(add_btn)
         copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
         copy.add_css_class("flat")
         copy.set_tooltip_text("Diese Notiz kopieren (Markdown)")
         copy.connect("clicked",
-                     lambda _b, t=str(note.get("text", "")): self._copy(t))
-        head.append(copy)
+                     lambda _b, n=note: self._copy(str(n.get("text", ""))))
+        bar.append(copy)
         trash = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
         trash.add_css_class("flat")
         trash.set_tooltip_text("Diese Notiz löschen")
         trash.connect("clicked", lambda _b, n=note: self._delete_note(base, n))
-        head.append(trash)
-        card.append(head)
-        # Document style: no box around the text — it reads like an article.
-        view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, editable=False,
-                            cursor_visible=False,
-                            top_margin=4, bottom_margin=8,
+        bar.append(trash)
+        page.append(bar)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, editable=True,
+                            top_margin=8, bottom_margin=24,
                             left_margin=4, right_margin=4,
                             pixels_above_lines=3, pixels_inside_wrap=5)
         view.add_css_class("doc-view")
+        # Direct in-place editing like the transcript: click in = raw
+        # Markdown source, click out = auto-save + pretty rendering.
         render_markdown(view, str(note.get("text", "")))
-        card.append(view)
-        sep = Gtk.Separator(margin_top=10)
-        sep.add_css_class("spacer")
-        card.append(sep)
-        return card
+        focus_ctrl = Gtk.EventControllerFocus()
+        focus_ctrl.connect("enter", lambda *_: self._note_edit_enter(view, note))
+        focus_ctrl.connect("leave", lambda *_: self._note_edit_leave(base, view, note))
+        view.add_controller(focus_ctrl)
+        scroll.set_child(view)
+        page.append(scroll)
+        return page
+
+    def _note_edit_enter(self, view, note) -> None:
+        if getattr(view, "_editing", False):
+            return
+        view._editing = True
+        view.get_buffer().set_text(str(note.get("text", "")))
+
+    def _note_edit_leave(self, base, view, note) -> None:
+        if not getattr(view, "_editing", False):
+            return
+        view._editing = False
+        buf = view.get_buffer()
+        new = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+        if new and new != str(note.get("text", "")).strip():
+            note["text"] = new
+            self._save_note_text(base, note)
+            self._toast("Notiz gespeichert ✓")
+        render_markdown(view, str(note.get("text", "")))
+
+    def _save_note_text(self, base, note) -> None:
+        if note.get("_legacy"):
+            (RECORDINGS_DIR / f"{base}.summary.md").write_text(
+                str(note.get("text", "")) + "\n", encoding="utf-8")
+            return
+        path = RECORDINGS_DIR / f"{base}.notes.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        idx = note.get("_index")
+        if isinstance(data, list) and isinstance(idx, int) and 0 <= idx < len(data):
+            data[idx]["text"] = str(note.get("text", ""))
+            path.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                            encoding="utf-8")
 
     def _delete_note(self, base, note) -> None:
         dlg = Adw.AlertDialog(heading="Notiz löschen?",
@@ -2586,9 +2666,7 @@ class RecorderView(Gtk.Box):
         self._load_chapters(base)
 
         self._load_notes(base)
-        # can only summarize/ask once a transcript exists
-        if self._detail.get("nt_btn") is not None:
-            self._detail["nt_btn"].set_sensitive(has_txt)
+        # can only ask once a transcript exists
         if self._detail.get("qa_btn") is not None:
             self._detail["qa_btn"].set_sensitive(has_txt)
         self._update_detail_progress(base)
