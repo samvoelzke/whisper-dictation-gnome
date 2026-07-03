@@ -331,6 +331,16 @@ def install_app_css() -> None:
         .record-idle:active {
           background: alpha(@error_color, 0.26);
         }
+        /* Ghost title entry in the hero: no gray box until it's used */
+        entry.inline-title {
+          background: transparent;
+          border: none;
+          box-shadow: none;
+        }
+        entry.inline-title:focus-within {
+          background: alpha(@window_fg_color, 0.05);
+          border-radius: 8px;
+        }
         /* Preset chips: quiet pills instead of naked text */
         .chip {
           border-radius: 9999px;
@@ -1018,6 +1028,8 @@ class RecorderView(Gtk.Box):
         if hasattr(Adw, "ToggleGroup"):
             # One-click switching between call (Mic+System) and lecture (Mic).
             self._source_toggle = Adw.ToggleGroup(halign=Gtk.Align.CENTER)
+            self._source_toggle.add_css_class("flat")
+            self._source_toggle.add_css_class("round")
             for value, label in (("both", "Mic + System"), ("system", "System"), ("mic", "Mic")):
                 toggle = Adw.Toggle(label=label)
                 toggle.set_name(value)
@@ -1028,7 +1040,9 @@ class RecorderView(Gtk.Box):
             self.source_row = None
         else:
             self._source_toggle = None
-        self.title_row = Gtk.Entry(halign=Gtk.Align.CENTER, width_chars=30)
+        # Ghost entry: reads as a dim caption, becomes a field on focus.
+        self.title_row = Gtk.Entry(halign=Gtk.Align.CENTER, width_chars=30, xalign=0.5)
+        self.title_row.add_css_class("inline-title")
         self.title_row.set_placeholder_text("Titel (optional)")
         self.title_row.set_tooltip_text(
             "Wird laufend gespeichert — ein Absturz kostet höchstens Sekunden.")
