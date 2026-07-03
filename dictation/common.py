@@ -136,6 +136,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Voice snippets: speak exactly the trigger phrase -> the stored text is
     # inserted verbatim ({"trigger": "text", ...}).
     "snippets": {},
+    # User-defined AI-tool templates for recordings: [{"label", "focus"}].
+    "note_presets": [],
     # Dictation mode: "standard" (cleanup follows ollama_postprocess),
     # "email" (formal, LLM always on), "chat" (casual, LLM always on),
     # "raw" (never run the LLM).

@@ -511,6 +511,81 @@ def render_markdown(view: Gtk.TextView, text: str) -> None:
         _md_insert(buf, "\n")
 
 
+_LIVE_MD_TAGS = ("md-h1", "md-h2", "md-h3", "md-bold", "md-italic",
+                 "md-code", "md-bullet", "md-hidden")
+
+
+def apply_live_markdown(view: Gtk.TextView) -> None:
+    """Obsidian-style live preview on a raw-Markdown buffer: syntax tokens
+    (#, **, `) are styled AND hidden — except on the line the cursor is on,
+    where the source shows for editing. The buffer always holds the raw
+    Markdown, so saving/copying loses nothing."""
+    buf = view.get_buffer()
+    _md_ensure_tags(buf)
+    if buf.get_tag_table().lookup("md-hidden") is None:
+        buf.create_tag("md-hidden", invisible=True)
+    start, end = buf.get_bounds()
+    table = buf.get_tag_table()
+    for name in _LIVE_MD_TAGS:
+        buf.remove_tag(table.lookup(name), start, end)
+    text = buf.get_text(start, end, True)
+    cursor = buf.get_iter_at_mark(buf.get_insert()).get_offset()
+
+    def apply(tag: str, s: int, e: int) -> None:
+        buf.apply_tag_by_name(tag, buf.get_iter_at_offset(s), buf.get_iter_at_offset(e))
+
+    offset = 0
+    for line in text.split("\n"):
+        line_end = offset + len(line)
+        on_cursor_line = offset <= cursor <= line_end
+        m = re.match(r"^(#{1,6})\s+", line)
+        if m:
+            level = len(m.group(1))
+            tag = "md-h1" if level == 1 else ("md-h2" if level == 2 else "md-h3")
+            apply(tag, offset, line_end)
+            if not on_cursor_line:
+                apply("md-hidden", offset, offset + m.end())
+        else:
+            mb = re.match(r"^(\s*)[-*+]\s", line)
+            if mb:
+                apply("md-bullet", offset + len(mb.group(1)), offset + len(mb.group(1)) + 1)
+        offset = line_end + 1
+
+    for m in _MD_INLINE_RE.finditer(text):
+        s, e = m.span()
+        token = m.group(0)
+        if token.startswith("**"):
+            inner, width, tag = (s + 2, e - 2), 2, "md-bold"
+        elif token.startswith("`"):
+            inner, width, tag = (s + 1, e - 1), 1, "md-code"
+        else:
+            inner, width, tag = (s + 1, e - 1), 1, "md-italic"
+        apply(tag, *inner)
+        if not (s <= cursor <= e):
+            apply("md-hidden", s, s + width)
+            apply("md-hidden", e - width, e)
+
+
+def attach_live_markdown(view: Gtk.TextView) -> None:
+    """Re-decorate (debounced via idle) on every edit or cursor move."""
+    buf = view.get_buffer()
+    pending: dict = {"queued": False}
+
+    def run() -> bool:
+        pending["queued"] = False
+        apply_live_markdown(view)
+        return False
+
+    def queue(*_a) -> None:
+        if not pending["queued"]:
+            pending["queued"] = True
+            GLib.idle_add(run)
+
+    buf.connect("changed", queue)
+    buf.connect("notify::cursor-position", queue)
+    queue()
+
+
 def pw_record_cmd(device: str) -> list[str]:
     """Build the pw-record command for a capture target.
 
@@ -1667,38 +1742,99 @@ class RecorderView(Gtk.Box):
          "Abschnitt 'Nächste Schritte' für die daraus resultierenden Aufgaben"),
         ("Vorlesungsnotizen",
          "prüfungsrelevante Inhalte, Definitionen und Beispiele — als strukturierte Lernnotizen"),
-        ("Action-Items",
-         "Aufgaben, Verantwortliche und Fristen — als kompakte Action-Item-Liste"),
+        ("Aufgaben",
+         "Aufgaben, Verantwortliche und Fristen — als kompakte Aufgabenliste"),
     )
 
-    def _ask_focus(self, base):
+    def _open_ai_tools(self, base):
+        """One entry point on the transcript: pick a template (built-in or
+        own, deletable) or run a one-off custom instruction — each result
+        becomes its own tab named after the chosen category."""
+        if not (RECORDINGS_DIR / f"{base}.txt").exists():
+            self._toast("Erst transkribieren — die KI arbeitet auf dem Transkript.")
+            return
         dlg = Adw.AlertDialog(
-            heading="Wie soll zusammengefasst werden?",
-            body="Preset wählen — oder eigenen Fokus beschreiben.")
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        chips = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
-                        halign=Gtk.Align.CENTER)
+            heading="KI-Tools",
+            body="Was soll aus dem Transkript erstellt werden?")
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+
+        if hasattr(Adw, "WrapBox"):
+            chips = Adw.WrapBox(child_spacing=6, line_spacing=6)
+        else:
+            chips = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        def run(focus: str, label: str) -> None:
+            dlg.force_close()
+            self._summarize(base, focus, label)
+
         for label, focus in self.FOCUS_PRESETS:
             chip = Gtk.Button(label=label)
             chip.add_css_class("pill")
-            chip.connect("clicked", lambda _b, f=focus, l=label: (dlg.force_close(),
-                                                                  self._summarize(base, f, l)))
+            chip.connect("clicked", lambda _b, f=focus, l=label: run(f, l))
             chips.append(chip)
+        # user templates: runnable + deletable
+        for preset in list(load_config().get("note_presets") or []):
+            p_label = str(preset.get("label", "")).strip()
+            p_focus = str(preset.get("focus", "")).strip()
+            if not p_label or not p_focus:
+                continue
+            group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            chip = Gtk.Button(label=p_label)
+            chip.add_css_class("pill")
+            chip.add_css_class("chip-accent")
+            chip.set_tooltip_text(p_focus)
+            chip.connect("clicked", lambda _b, f=p_focus, l=p_label: run(f, l))
+            group.append(chip)
+            remove = Gtk.Button(icon_name="window-close-symbolic", valign=Gtk.Align.CENTER)
+            remove.add_css_class("flat")
+            remove.set_tooltip_text("Vorlage löschen")
+            remove.connect("clicked",
+                           lambda _b, l=p_label, g=group: self._delete_note_preset(l, g))
+            group.append(remove)
+            chips.append(group)
         content.append(chips)
-        entry = Gtk.Entry(hexpand=True)
-        entry.set_placeholder_text("Eigener Fokus (leer = wichtigste Inhalte und Action-Items)")
-        content.append(entry)
+
+        label_entry = Gtk.Entry()
+        label_entry.set_placeholder_text("Oberkategorie / Tab-Name (z. B. Q&A-Liste)")
+        content.append(label_entry)
+        focus_entry = Gtk.Entry()
+        focus_entry.set_placeholder_text("Eigener Auftrag an die KI …")
+        content.append(focus_entry)
+        save_check = Gtk.CheckButton(label="Als Vorlage speichern (wiederverwendbar)")
+        content.append(save_check)
         dlg.set_extra_child(content)
         dlg.add_response("cancel", "Abbrechen")
-        dlg.add_response("go", "Zusammenfassen")
+        dlg.add_response("go", "Ausführen")
         dlg.set_response_appearance("go", Adw.ResponseAppearance.SUGGESTED)
         dlg.set_default_response("go")
-        dlg.connect("response", lambda _d, resp, e=entry, x=base:
-                    self._summarize(x, e.get_text().strip()) if resp == "go" else None)
-        # Enter in the entry = confirm (instead of doing nothing)
-        entry.connect("activate", lambda *_: (dlg.force_close(),
-                                              self._summarize(base, entry.get_text().strip())))
+
+        def run_custom() -> None:
+            focus = focus_entry.get_text().strip()
+            label = label_entry.get_text().strip() or "Zusammenfassung"
+            if save_check.get_active() and focus:
+                cfg = load_config()
+                presets = [p for p in (cfg.get("note_presets") or [])
+                           if str(p.get("label", "")) != label]
+                presets.append({"label": label[:30], "focus": focus})
+                cfg["note_presets"] = presets
+                save_config(cfg)
+                self._toast(f"Vorlage „{label}“ gespeichert ✓")
+            self._summarize(base, focus, label)
+
+        dlg.connect("response",
+                    lambda _d, resp: run_custom() if resp == "go" else None)
+        focus_entry.connect("activate", lambda *_: (dlg.force_close(), run_custom()))
         dlg.present(self.get_root())
+
+    def _delete_note_preset(self, label: str, widget) -> None:
+        cfg = load_config()
+        cfg["note_presets"] = [p for p in (cfg.get("note_presets") or [])
+                               if str(p.get("label", "")) != label]
+        save_config(cfg)
+        parent = widget.get_parent()
+        if parent is not None:
+            parent.remove(widget)
+        self._toast(f"Vorlage „{label}“ gelöscht")
 
     def _summarize(self, base, focus, label: str = "Zusammenfassung"):
         if base in self._busy:
@@ -1959,11 +2095,12 @@ class RecorderView(Gtk.Box):
         tr_copy.set_tooltip_text("Transkript kopieren")
         tr_copy.connect("clicked", lambda *_: self._copy(self._transcript_text()))
         tr_bar.append(tr_copy)
-        save_btn = Gtk.Button(label="Speichern", valign=Gtk.Align.CENTER)
-        save_btn.add_css_class("flat")
-        save_btn.set_tooltip_text("Änderungen am Transkript speichern")
-        save_btn.connect("clicked", lambda *_: self._save_transcript(base))
-        tr_bar.append(save_btn)
+        ai_btn = Gtk.Button(valign=Gtk.Align.CENTER)
+        ai_btn.set_child(Adw.ButtonContent(icon_name="starred-symbolic", label="KI-Tools"))
+        ai_btn.add_css_class("flat")
+        ai_btn.set_tooltip_text("Protokoll, Notizen, Aufgaben oder eigenen Auftrag erstellen")
+        ai_btn.connect("clicked", lambda *_: self._open_ai_tools(base))
+        tr_bar.append(ai_btn)
         self._detail["tr_actions"] = tr_bar
         tr_page.append(tr_bar)
         tr_scroller = Gtk.ScrolledWindow(vexpand=True)
@@ -1975,6 +2112,10 @@ class RecorderView(Gtk.Box):
         click = Gtk.GestureClick()
         click.connect("released", self._on_transcript_click)
         tr_view.add_controller(click)
+        # Auto-save: leaving the editor persists changes (no save button).
+        tr_focus = Gtk.EventControllerFocus()
+        tr_focus.connect("leave", lambda *_: self._autosave_transcript(base))
+        tr_view.add_controller(tr_focus)
         tr_scroller.set_child(tr_view)
         self._detail["tr_view"] = tr_view
         self._detail["tr_scroller"] = tr_scroller
@@ -2491,6 +2632,8 @@ class RecorderView(Gtk.Box):
 
     def _note_label(self, note) -> str:
         label = str(note.get("label", "")).strip()
+        if label == "Action-Items":
+            return "Aufgaben"
         if label and label != "Notiz":
             return label
         # Older notes have no stored label — derive a meaningful one from
@@ -2499,7 +2642,7 @@ class RecorderView(Gtk.Box):
         if "protokoll" in hint:
             return "Protokoll"
         if "action-item" in hint or "aufgaben" in hint:
-            return "Action-Items"
+            return "Aufgaben"
         if "lernnotizen" in hint or "prüfungsrelevant" in hint:
             return "Vorlesungsnotizen"
         return "Zusammenfassung"
@@ -2522,9 +2665,10 @@ class RecorderView(Gtk.Box):
             lbl = Gtk.Label(label="Noch keine Notizen.")
             lbl.add_css_class("dim-label")
             empty.append(lbl)
-            btn = Gtk.Button(label="Zusammenfassen …", halign=Gtk.Align.CENTER)
+            btn = Gtk.Button(halign=Gtk.Align.CENTER)
+            btn.set_child(Adw.ButtonContent(icon_name="starred-symbolic", label="KI-Tools"))
             btn.add_css_class("pill")
-            btn.connect("clicked", lambda *_: self._ask_focus(base))
+            btn.connect("clicked", lambda *_: self._open_ai_tools(base))
             empty.append(btn)
             stack.add_titled(empty, "note-empty", "Notizen")
             self._detail["note_pages"].append("note-empty")
@@ -2553,11 +2697,6 @@ class RecorderView(Gtk.Box):
         caption.add_css_class("dim-label")
         caption.add_css_class("caption")
         bar.append(caption)
-        add_btn = Gtk.Button(label="Zusammenfassen …", valign=Gtk.Align.CENTER)
-        add_btn.add_css_class("flat")
-        add_btn.set_tooltip_text("Weitere Zusammenfassung mit eigenem Fokus erstellen")
-        add_btn.connect("clicked", lambda *_: self._ask_focus(base))
-        bar.append(add_btn)
         copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
         copy.add_css_class("flat")
         copy.set_tooltip_text("Diese Notiz kopieren (Markdown)")
@@ -2577,34 +2716,26 @@ class RecorderView(Gtk.Box):
                             left_margin=4, right_margin=4,
                             pixels_above_lines=3, pixels_inside_wrap=5)
         view.add_css_class("doc-view")
-        # Direct in-place editing like the transcript: click in = raw
-        # Markdown source, click out = auto-save + pretty rendering.
-        render_markdown(view, str(note.get("text", "")))
+        # Obsidian-style live preview: the buffer holds raw Markdown, the
+        # syntax tokens hide themselves except on the cursor line. Typing
+        # '# Welt' turns into a heading the moment you leave the line.
+        view.get_buffer().set_text(str(note.get("text", "")))
+        attach_live_markdown(view)
         focus_ctrl = Gtk.EventControllerFocus()
-        focus_ctrl.connect("enter", lambda *_: self._note_edit_enter(view, note))
-        focus_ctrl.connect("leave", lambda *_: self._note_edit_leave(base, view, note))
+        focus_ctrl.connect("leave", lambda *_: self._note_autosave(base, view, note))
         view.add_controller(focus_ctrl)
         scroll.set_child(view)
         page.append(scroll)
         return page
 
-    def _note_edit_enter(self, view, note) -> None:
-        if getattr(view, "_editing", False):
-            return
-        view._editing = True
-        view.get_buffer().set_text(str(note.get("text", "")))
-
-    def _note_edit_leave(self, base, view, note) -> None:
-        if not getattr(view, "_editing", False):
-            return
-        view._editing = False
+    def _note_autosave(self, base, view, note) -> None:
         buf = view.get_buffer()
-        new = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+        # include_hidden_chars=True: concealed Markdown tokens must be saved!
+        new = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True).strip()
         if new and new != str(note.get("text", "")).strip():
             note["text"] = new
             self._save_note_text(base, note)
             self._toast("Notiz gespeichert ✓")
-        render_markdown(view, str(note.get("text", "")))
 
     def _save_note_text(self, base, note) -> None:
         if note.get("_legacy"):
@@ -2707,11 +2838,20 @@ class RecorderView(Gtk.Box):
             bar.pulse()
 
     # ── detail actions ───────────────────────────────────────────────────────
-    def _save_transcript(self, base):
-        buf = self._detail["tr_view"].get_buffer()
-        txt = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
-        (RECORDINGS_DIR / f"{base}.txt").write_text(txt, encoding="utf-8")
-        self._toast("Transkript gespeichert ✓")
+    def _autosave_transcript(self, base):
+        view = self._detail.get("tr_view")
+        if view is None:
+            return
+        buf = view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        path = RECORDINGS_DIR / f"{base}.txt"
+        try:
+            old = path.read_text(encoding="utf-8")
+        except OSError:
+            old = ""
+        if text.strip() and text != old:
+            path.write_text(text, encoding="utf-8")
+            self._toast("Transkript gespeichert ✓")
 
     def _retranscribe(self, base):
         if base in self._busy:
