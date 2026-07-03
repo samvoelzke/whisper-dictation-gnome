@@ -753,8 +753,14 @@ class WhisperDictationDaemon:
         def work():
             try:
                 import speaker
-                if speaker.available():
-                    speaker.enroll_samples(clip, 16000)
+                if not speaker.available():
+                    print("[whisper-dictation] voice enroll skipped: models missing",
+                          flush=True)
+                    return
+                if speaker.enroll_samples(clip, 16000):
+                    count = int(speaker.load_profile().get("count", 0))
+                    print(f"[whisper-dictation] voice enrolled (clip {count})",
+                          flush=True)
             except Exception as exc:  # noqa: BLE001
                 print(f"[whisper-dictation] voice enroll skipped: {exc}",
                       file=sys.stderr, flush=True)
@@ -1280,6 +1286,9 @@ class WhisperDictationDaemon:
             audio = read_wav_mono(Path(wav))
             with self._infer_lock:
                 text = self._transcribe_audio(audio).strip()
+            # Werkbank dictations are enrollment clips too — this path was
+            # silently skipping the voice profile.
+            self._maybe_enroll_voice(audio)
             return {"text": text}
         if cmd == "instruct":
             try:
