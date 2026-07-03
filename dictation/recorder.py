@@ -1346,6 +1346,15 @@ def main() -> int:
     s.set_defaults(func=cmd_delete)
 
     args = p.parse_args()
+    # Heavy batch work (Whisper, diarization, LLM prep) runs at low priority:
+    # same total compute, but typing/browsing stays smooth while it grinds.
+    # record-* stays at normal priority — dropping live capture is worse.
+    if args.cmd in ("transcribe", "diarize", "summarize", "chapters",
+                    "ask", "import"):
+        try:
+            os.nice(10)
+        except OSError:
+            pass
     try:
         return int(args.func(args))
     except KeyboardInterrupt:
