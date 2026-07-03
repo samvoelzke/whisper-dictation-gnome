@@ -1504,7 +1504,10 @@ class RecorderView(Gtk.Box):
         hero.append(controls)
         # Big timer UNDER the button (Sound-Recorder style) — while recording
         # it is the loudest element on the page.
-        self.timer_label = Gtk.Label(label="", halign=Gtk.Align.CENTER)
+        # visible=False: even an empty label reserves a full 2.2em line and
+        # tears a phantom gap between button and source pill.
+        self.timer_label = Gtk.Label(label="", halign=Gtk.Align.CENTER,
+                                     visible=False)
         self.timer_label.add_css_class("hero-timer")
         self.timer_label.add_css_class("numeric")
         hero.append(self.timer_label)
@@ -1636,30 +1639,8 @@ class RecorderView(Gtk.Box):
         self._meters_group.add(self._sys_box)
         self._meters_group.set_visible(False)
 
-        # Library header: title left, import/options/refresh right — always
-        # reachable, even while the library is still empty.
-        lib_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
-        lib_title = Gtk.Label(label="Aufnahmen", xalign=0, hexpand=True)
-        lib_title.add_css_class("heading")
-        lib_head.append(lib_title)
-        for icon, tip, cb in (
-            ("document-open-symbolic",
-             "Audio/Video importieren und transkribieren — oder Datei "
-             "einfach hierher ziehen",
-             lambda *_: self._open_import_dialog()),
-            ("emblem-system-symbolic",
-             "Rekorder-Optionen — Geräte, Modell, Automatik",
-             lambda *_: self._open_recorder_options()),
-            ("view-refresh-symbolic", "Aktualisieren", lambda *_: self.refresh()),
-        ):
-            btn = Gtk.Button(icon_name=icon, valign=Gtk.Align.CENTER)
-            btn.add_css_class("flat")
-            btn.set_tooltip_text(tip)
-            btn.connect("clicked", cb)
-            lib_head.append(btn)
-        outer.append(lib_head)
-
         # Recordings are grouped by date (Heute/Gestern/…) at refresh time.
+        # Import/options live in the window header bar (only on this tab).
         self._list_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         outer.append(self._list_container)
 
@@ -1944,6 +1925,7 @@ class RecorderView(Gtk.Box):
             GLib.source_remove(self._timer_id)
             self._timer_id = None
         self.timer_label.set_label("")
+        self.timer_label.set_visible(False)
         self._rec_button_state(recording=False)
         self.pause_btn.set_visible(False)
         self.title_row.set_text("")
@@ -2003,6 +1985,7 @@ class RecorderView(Gtk.Box):
             except OSError:
                 pass
         self.timer_label.set_text(text)
+        self.timer_label.set_visible(True)
         return True
 
     def _apply_record_status(self, r: dict):
@@ -4697,6 +4680,23 @@ class SettingsWindow(Adw.ApplicationWindow):
         menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
         menu_button.set_tooltip_text("Hauptmenü")
         header.pack_end(menu_button)
+
+        # Recorder-tab actions live in the header bar, GNOME-style; they
+        # appear only while the Rekorder view is active (_on_view_changed).
+        self._rec_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                                    spacing=0, visible=False)
+        rec_import = Gtk.Button(icon_name="document-open-symbolic")
+        rec_import.add_css_class("flat")
+        rec_import.set_tooltip_text("Audio/Video importieren und transkribieren "
+                                    "— oder Datei einfach aufs Fenster ziehen")
+        rec_import.connect("clicked", lambda *_: self.recorder._open_import_dialog())
+        self._rec_actions.append(rec_import)
+        rec_opts = Gtk.Button(icon_name="emblem-system-symbolic")
+        rec_opts.add_css_class("flat")
+        rec_opts.set_tooltip_text("Rekorder-Optionen — Geräte, Modell, Automatik")
+        rec_opts.connect("clicked", lambda *_: self.recorder._open_recorder_options())
+        self._rec_actions.append(rec_opts)
+        header.pack_start(self._rec_actions)
         for name, handler in (
             ("prefs", self._on_prefs), ("shortcuts", self._on_shortcuts),
             ("restart", self._on_restart), ("stop", self._on_stop),
@@ -4796,6 +4796,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _on_view_changed(self, *_a) -> None:
         name = self.stack.get_visible_child_name()
+        self._rec_actions.set_visible(name == "rekorder")
         if name == "verlauf":
             self._refresh_history()
         if name == "rekorder":
