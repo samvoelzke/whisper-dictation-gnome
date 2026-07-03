@@ -356,6 +356,53 @@ def cmd_record_resume(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import(args: argparse.Namespace) -> int:
+    """Import any audio/video file into the recordings library: ffmpeg
+    transcodes it to the usual mono Opus (it decodes practically every
+    format), after that the whole pipeline works as if it were recorded."""
+    src = Path(args.path).expanduser()
+    if not src.is_file():
+        print(json.dumps({"error": "file_not_found", "path": str(src)}))
+        return 1
+    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    title = (args.title or src.stem).strip()[:80] or "Import"
+    # Unique base even when several files arrive in the same second
+    # (multi-select import).
+    base, n = f"{stamp}_Import", 1
+    while (RECORDINGS_DIR / f"{base}.opus").exists() \
+            or (RECORDINGS_DIR / f"{base}.meta.json").exists():
+        n += 1
+        base = f"{stamp}_Import-{n}"
+    audio = RECORDINGS_DIR / f"{base}.opus"
+    cfg = load_config()
+    bitrate = str(cfg.get("recorder_bitrate", "32k") or "32k")
+    cmd = ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", str(src),
+           "-vn", "-ac", "1", "-ar", "48000",
+           "-c:a", "libopus", "-b:a", bitrate, str(audio)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        audio.unlink(missing_ok=True)
+        print(json.dumps({"error": f"ffmpeg: {exc}", "path": str(src)}))
+        return 1
+    if proc.returncode != 0 or not audio.exists():
+        audio.unlink(missing_ok=True)
+        err = (proc.stderr or "").strip().splitlines()
+        print(json.dumps({"error": err[-1] if err else "ffmpeg_failed",
+                          "path": str(src)}))
+        return 1
+    duration = _probe_duration(audio)
+    _write_json(RECORDINGS_DIR / f"{base}.meta.json", {
+        "title": title, "source": "import", "created": datetime.now().isoformat(),
+        "audio": audio.name, "duration_seconds": round(duration, 1),
+        "imported_from": str(src),
+    })
+    print(json.dumps({"base": base, "title": title,
+                      "duration_seconds": round(duration, 1)}))
+    return 0
+
+
 def cmd_rename(args: argparse.Namespace) -> int:
     meta_path = RECORDINGS_DIR / f"{args.base}.meta.json"
     if not meta_path.exists():
@@ -1192,6 +1239,11 @@ def main() -> int:
     s.add_argument("base")
     s.add_argument("--title", default="")
     s.set_defaults(func=cmd_rename)
+
+    s = sub.add_parser("import")
+    s.add_argument("path")
+    s.add_argument("--title", default="")
+    s.set_defaults(func=cmd_import)
 
     s = sub.add_parser("transcribe")
     s.add_argument("base")

@@ -335,7 +335,8 @@ REC_SOURCE_OPTIONS = [
     ("system", "Nur System-Ton (Call/Video)"),
     ("mic", "Nur Mikrofon (Präsenz)"),
 ]
-REC_SOURCE_SHORT = {"both": "Mic+System", "system": "System", "mic": "Mic"}
+REC_SOURCE_SHORT = {"both": "Mic+System", "system": "System", "mic": "Mic",
+                    "import": "Importiert"}
 
 # Recorder-specific model / quality choices, surfaced directly in the tab.
 REC_MODEL_OPTIONS = [
@@ -1372,6 +1373,11 @@ class RecorderView(Gtk.Box):
         self.nav.add(Adw.NavigationPage(title="Rekorder", child=self._build_list_page()))
         self.nav.connect("popped", self._on_popped)
 
+        # Drop any audio/video file onto the tab to import + transcribe it.
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", self._on_file_drop)
+        self.add_controller(drop)
+
     # ── tab lifecycle (called by the window) ─────────────────────────────────
     def on_shown(self):
         self.refresh()
@@ -1521,6 +1527,13 @@ class RecorderView(Gtk.Box):
             self.source_row = None
         else:
             self._source_toggle = None
+        imp = Gtk.Button(icon_name="document-open-symbolic", valign=Gtk.Align.CENTER)
+        imp.add_css_class("flat")
+        imp.add_css_class("circular")
+        imp.set_tooltip_text("Audio/Video-Datei importieren und transkribieren "
+                             "— oder einfach hierher ziehen")
+        imp.connect("clicked", lambda *_: self._open_import_dialog())
+        src_line.append(imp)
         gear = Gtk.Button(icon_name="emblem-system-symbolic", valign=Gtk.Align.CENTER)
         gear.add_css_class("flat")
         gear.add_css_class("circular")
@@ -1784,6 +1797,65 @@ class RecorderView(Gtk.Box):
 
     def _open_recorder_options(self) -> None:
         self._opts_dialog.present(self.get_root())
+
+    # ── import external audio/video files ───────────────────────────────────
+
+    def _open_import_dialog(self) -> None:
+        dlg = Gtk.FileDialog(title="Audio oder Video importieren")
+        flt = Gtk.FileFilter()
+        flt.set_name("Audio und Video")
+        flt.add_mime_type("audio/*")
+        flt.add_mime_type("video/*")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(flt)
+        dlg.set_filters(filters)
+        dlg.set_default_filter(flt)
+
+        def done(d, result):
+            try:
+                files = d.open_multiple_finish(result)
+            except GLib.Error:
+                return  # cancelled
+            paths = [files.get_item(i).get_path()
+                     for i in range(files.get_n_items())]
+            self._import_paths([p for p in paths if p])
+
+        dlg.open_multiple(self.get_root(), None, done)
+
+    def _on_file_drop(self, _target, value, _x, _y) -> bool:
+        try:
+            paths = [f.get_path() for f in value.get_files()]
+        except Exception:
+            return False
+        self._import_paths([p for p in paths if p])
+        return True
+
+    def _import_paths(self, paths: list) -> None:
+        """ffmpeg reads practically every format — transcode to the library's
+        Opus, then the normal pipeline (transcribe → auto-analysis) takes over."""
+        if not paths:
+            return
+        self._toast(f"Importiere {len(paths)} Datei(en) …")
+
+        def done(results: list) -> bool:
+            ok = [r for r in results if "base" in r]
+            errs = [r for r in results if "error" in r]
+            if errs:
+                self._toast(f"Import fehlgeschlagen: {errs[0]['error']}")
+            self.refresh()
+            if len(ok) == 1:
+                self._transcribe(ok[0]["base"])  # straight into the pipeline
+            elif ok:
+                # several at once: not in parallel (each load = one Whisper
+                # model in RAM) — start per row instead.
+                self._toast(f"{len(ok)} importiert — Transkription pro "
+                            "Aufnahme starten")
+            return False
+
+        def work():
+            results = [recorder_call("import", p, timeout=1800) for p in paths]
+            GLib.idle_add(done, results)
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_title_changed(self, *_a) -> None:
         """Live-rename the running recording (debounced)."""

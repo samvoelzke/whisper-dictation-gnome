@@ -203,6 +203,9 @@ ein Absturz nicht alles verliert:
 1. **Aufnahme** – `ffmpeg` schreibt **laufend** eine Opus-Datei (3 h ≈ ~40 MB).
    Quelle wählbar: **Mikrofon + System-Ton** (Standard), nur System-Ton
    (PipeWire-Monitor – für Online-Calls/Videos) oder nur Mikrofon.
+   Alternativ: **beliebige Audio-/Videodateien importieren** (MP3, WAV, M4A,
+   OGG, FLAC, MP4-Tonspur, …) — per 📂-Knopf oder einfach **auf den
+   Rekorder-Tab ziehen**; ffmpeg wandelt um, danach läuft dieselbe Pipeline.
 2. **Transkription** – erst nach der Aufnahme, in **~5-Minuten-Chunks** über das
    Whisper-Backend (Standard `large-v3`). Chunk-Grenzen werden an **Sprechpausen
    ausgerichtet** (Silence-Detection), damit keine Wörter zerschnitten werden.
@@ -249,6 +252,7 @@ Dateien liegen unter `~/.local/share/whisper-dictation/recordings/`
 (`.opus`, `.txt`, `.summary.md`). CLI direkt nutzbar:
 
 ```bash
+bin/whisper-recorder.sh import ~/Downloads/podcast.mp3   # beliebiges Audio/Video
 bin/whisper-recorder.sh record-start --source both --title "Vorlesung"
 bin/whisper-recorder.sh record-stop
 bin/whisper-recorder.sh transcribe <id> --model large-v3
