@@ -465,6 +465,38 @@ def install_app_css() -> None:
         .record-idle:active {
           background: alpha(@error_color, 0.26);
         }
+        /* Hero zones: a whisper of color behind the record areas - the eye
+           lands on the primary action without a single extra widget */
+        .hero-zone {
+          background: linear-gradient(to bottom,
+                      alpha(@accent_bg_color, 0.10),
+                      alpha(@accent_bg_color, 0.02) 70%,
+                      transparent);
+          border-radius: 18px;
+          padding: 18px 12px 14px 12px;
+        }
+        /* Chat-style AI bar (Werkbank): one rounded pill holding the
+           instruction entry and a round send button */
+        .ai-bar {
+          background: @view_bg_color;
+          border: 1px solid alpha(@borders, 0.8);
+          border-radius: 9999px;
+          padding: 3px;
+        }
+        .ai-bar:focus-within {
+          border-color: @accent_color;
+        }
+        .ai-bar entry,
+        .ai-bar text {
+          background: transparent;
+          border: none;
+          box-shadow: none;
+        }
+        .ai-send {
+          min-width: 34px;
+          min-height: 34px;
+          -gtk-icon-size: 15px;
+        }
         /* While recording: a soft sonar pulse around the button - visible
            from across the room that the mic is hot */
         @keyframes rec-pulse {
@@ -500,7 +532,8 @@ def install_app_css() -> None:
           background: alpha(@window_fg_color, 0.07);
         }
         .chip:hover {
-          background: alpha(@window_fg_color, 0.13);
+          color: @accent_color;
+          background: alpha(@accent_bg_color, 0.12);
         }
         /* Accent-tinted chips: everything that jumps in the audio
            (chapters, cited timestamps) shares the accent color */
@@ -984,9 +1017,10 @@ class WorkbenchView(Gtk.Box):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         clamp.set_child(box)
 
-        # Hero: one big circular record button, status underneath.
+        # Hero: one big circular record button on a soft accent glow.
         hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
-                       halign=Gtk.Align.CENTER, margin_top=4)
+                       margin_top=4)
+        hero.add_css_class("hero-zone")
         self.rec_btn = Gtk.Button(icon_name="media-record-symbolic",
                                   halign=Gtk.Align.CENTER)
         self.rec_btn.add_css_class("circular")
@@ -1070,14 +1104,22 @@ class WorkbenchView(Gtk.Box):
             presets.append(chip)
         box.append(presets)
 
-        instr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        # Chat-style pill: sparkle · entry · round send button.
+        instr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        instr_row.add_css_class("ai-bar")
+        spark = Gtk.Image(icon_name="starred-symbolic", margin_start=10)
+        spark.add_css_class("dimmed")
+        instr_row.append(spark)
         self.instr = Gtk.Entry(hexpand=True)
         self.instr.set_placeholder_text("Anweisung an die KI … (formaler · zusammenfassen · auf Englisch)")
         self.instr.connect("activate", self._run_instruction)
         instr_row.append(self.instr)
-        self.send_btn = Gtk.Button()
-        self.send_btn.set_child(Adw.ButtonContent(icon_name="document-send-symbolic",
-                                                  label="Ausführen"))
+        self.send_btn = Gtk.Button(icon_name="document-send-symbolic",
+                                   valign=Gtk.Align.CENTER)
+        self.send_btn.add_css_class("circular")
+        self.send_btn.add_css_class("suggested-action")
+        self.send_btn.add_css_class("ai-send")
+        self.send_btn.set_tooltip_text("Ausführen")
         self.send_btn.connect("clicked", self._run_instruction)
         instr_row.append(self.send_btn)
         box.append(instr_row)
@@ -1428,7 +1470,8 @@ class RecorderView(Gtk.Box):
         # Hero: big circular record button + pause + timer, source toggle and
         # title underneath (GNOME-Sound-Recorder-style, no form rows).
         hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                       halign=Gtk.Align.CENTER, margin_top=4)
+                       margin_top=4)
+        hero.add_css_class("hero-zone")
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16,
                            halign=Gtk.Align.CENTER)
         self.pause_btn = Gtk.Button(icon_name="media-playback-pause-symbolic",
@@ -4712,7 +4755,9 @@ class SettingsWindow(Adw.ApplicationWindow):
                 self._history_groups.append(group)
                 current_bucket = bucket
             preview = (text[:90] + "…") if len(text) > 90 else (text or "(leer)")
-            row = Adw.ExpanderRow(subtitle=stamp)
+            words = len(text.split())
+            sub = f"{stamp} · {words} Wörter" if stamp and words else stamp
+            row = Adw.ExpanderRow(subtitle=sub)
             row.set_title(GLib.markup_escape_text(preview))
             row._search_text = text.lower()
             row._group = group
