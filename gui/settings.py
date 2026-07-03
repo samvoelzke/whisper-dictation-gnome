@@ -1091,6 +1091,8 @@ class RecorderView(Gtk.Box):
                                  lambda *_: self._persist("recorder_bitrate", self._cv(self.quality_row, REC_QUALITY_OPTIONS)))
         opt.add_row(self.quality_row)
         self.lang_row = self._combo("Sprache", LANGUAGE_OPTIONS, str(cfg.get("recorder_language", "")).lower())
+        self.lang_row.set_subtitle("Auto erkennt die Sprache selbst. Nur bei fester Sprache "
+                                   "fließen Kontext-Prompt und Wörterbuch ein.")
         self.lang_row.connect("notify::selected",
                               lambda *_: self._persist("recorder_language", self._cv(self.lang_row, LANGUAGE_OPTIONS)))
         opt.add_row(self.lang_row)

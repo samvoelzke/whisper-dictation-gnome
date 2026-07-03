@@ -413,10 +413,21 @@ class _Backend:
         Times are relative to the chunk start; the caller offsets them.
         Timestamps feed the click-to-seek markers in the GUI transcript.
         """
-        lang = str(self.cfg.get("recorder_language") or self.cfg.get("language") or "").strip().lower()
+        # "" / "auto" = real auto-detection. Deliberately NO fallback to the
+        # global dictation language: recordings (YouTube, calls, lectures)
+        # are foreign-language far more often than dictation, and forcing
+        # 'de' on English audio collapses into hallucinations
+        # ("Bis zum nächsten Mal.") — verified on a real recording.
+        lang = str(self.cfg.get("recorder_language") or "").strip().lower()
         language = None if lang in ("", "auto") else lang
-        from common import effective_prompt_and_hotwords
-        prompt, hotwords = effective_prompt_and_hotwords(self.cfg)
+        if language:
+            from common import effective_prompt_and_hotwords
+            prompt, hotwords = effective_prompt_and_hotwords(self.cfg)
+        else:
+            # The (German) context prompt also poisons auto-detection
+            # ("Thank you for watching.") — only bias when the language
+            # is set explicitly.
+            prompt, hotwords = None, None
         if self.kind == "openvino":
             kwargs: dict[str, Any] = {"task": "transcribe"}
             if language:
@@ -501,7 +512,9 @@ def _maybe_auto_title(base: str, cfg: dict[str, Any]) -> None:
         title = _ollama_chat(
             cfg,
             "Du benennst Audio-Aufnahmen. Antworte NUR mit einem kurzen, praegnanten "
-            "Titel (3-6 Woerter, in der Sprache des Inhalts, keine Anfuehrungszeichen).",
+            "Titel (3-6 Woerter, keine Anfuehrungszeichen). WICHTIG: Der Titel muss "
+            "in DERSELBEN Sprache sein wie das Transkript — englisches Transkript = "
+            "englischer Titel. Erfinde keine Woerter.",
             f"Transkript-Anfang:\n{excerpt}", timeout=60)
         title = title.strip().strip('"„“').splitlines()[0].strip()[:80]
         if title:
