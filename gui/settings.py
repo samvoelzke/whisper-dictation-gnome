@@ -200,6 +200,22 @@ def model_display_name(model_id: str) -> str:
     return model_id
 
 
+def apply_document_style(view: Gtk.TextView) -> None:
+    """libadwaita 1.8 '.document' gives reading views the correct document
+    font + line height automatically; '.doc-view' keeps the older custom look."""
+    view.add_css_class("doc-view")
+    view.add_css_class("document")  # harmless no-op on < 1.8
+
+
+def make_spinner(**kwargs):
+    """Adw.Spinner (1.6+) — keeps animating under 'reduce animations' and
+    stops computing when hidden — with a Gtk.Spinner fallback."""
+    if hasattr(Adw, "Spinner"):
+        sp = Adw.Spinner(**{k: v for k, v in kwargs.items() if k != "spinning"})
+        return sp
+    return Gtk.Spinner(**kwargs)
+
+
 def star_box(filled: int, total: int = 5) -> Gtk.Box:
     """A row of real star icons — never truncates like text stars in a combo."""
     box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=1,
@@ -518,11 +534,11 @@ def _md_ensure_tags(buf: Gtk.TextBuffer) -> None:
     r, g, b = accent_rgb()
     rgba = Gdk.RGBA()
     rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
-    buf.create_tag("md-h1", weight=700, scale=1.4)
-    h2 = buf.create_tag("md-h2", weight=700, scale=1.25)
-    h2.set_property("foreground-rgba", rgba)
-    h3 = buf.create_tag("md-h3", weight=700, scale=1.1)
-    h3.set_property("foreground-rgba", rgba)
+    # Headings use weight+size for hierarchy (HIG: don't lean on accent color
+    # for structure); only the bullet glyph carries a touch of accent.
+    buf.create_tag("md-h1", weight=800, scale=1.4)
+    buf.create_tag("md-h2", weight=800, scale=1.22)
+    buf.create_tag("md-h3", weight=700, scale=1.08)
     buf.create_tag("md-bold", weight=700)
     buf.create_tag("md-italic", style=Pango.Style.ITALIC)
     buf.create_tag("md-code", family="monospace")
@@ -884,10 +900,10 @@ class WorkbenchView(Gtk.Box):
         hero.append(self.rec_btn)
         status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
                              halign=Gtk.Align.CENTER)
-        self.spinner = Gtk.Spinner(visible=False)
+        self.spinner = make_spinner(visible=False)
         status_row.append(self.spinner)
         self.status = Gtk.Label(label="Bereit")
-        self.status.add_css_class("dim-label")
+        self.status.add_css_class("dimmed")
         status_row.append(self.status)
         hero.append(status_row)
         box.append(hero)
@@ -932,7 +948,7 @@ class WorkbenchView(Gtk.Box):
             halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
             justify=Gtk.Justification.CENTER,
         )
-        self._placeholder.add_css_class("dim-label")
+        self._placeholder.add_css_class("dimmed")
         self._placeholder.set_can_target(False)  # clicks fall through to the editor
         overlay.add_overlay(self._placeholder)
         self.text_view.get_buffer().connect(
@@ -997,13 +1013,14 @@ class WorkbenchView(Gtk.Box):
         """One status line: gray for state, red for errors, spinner while busy."""
         self.status.set_text(text)
         if error:
-            self.status.remove_css_class("dim-label")
+            self.status.remove_css_class("dimmed")
             self.status.add_css_class("error")
         else:
             self.status.remove_css_class("error")
-            self.status.add_css_class("dim-label")
+            self.status.add_css_class("dimmed")
         self.spinner.set_visible(busy)
-        self.spinner.set_spinning(busy)
+        if hasattr(self.spinner, "set_spinning"):  # Gtk.Spinner fallback only
+            self.spinner.set_spinning(busy)
 
     def _toggle_record(self, *_a) -> None:
         if self.rec_proc is None:
@@ -1333,7 +1350,7 @@ class RecorderView(Gtk.Box):
                                  lambda *_: self._persist("recorder_bitrate", self._cv(self.quality_row, REC_QUALITY_OPTIONS)))
         aufnahme.add_row(self.quality_row)
 
-        transkription = Adw.ExpanderRow(title="Transkription & Notizen",
+        transkription = Adw.ExpanderRow(title="Transkription und Notizen",
                                         subtitle="Modell, Sprache, Automatik, Export")
         rec_opt_group.add(transkription)
         self.model_row = self._combo("Modell", REC_MODEL_OPTIONS, str(cfg.get("recorder_model", "large-v3")))
@@ -1382,12 +1399,12 @@ class RecorderView(Gtk.Box):
             title="Live-Pegel", description="Wird während der Aufnahme angezeigt.")
         outer.append(self._meters_group)
         self._mic_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self._mic_box.append(Gtk.Label(label="Mikrofon", xalign=0, css_classes=["dim-label"]))
+        self._mic_box.append(Gtk.Label(label="Mikrofon", xalign=0, css_classes=["dimmed"]))
         self._mic_viz = AudioVisualizer(mode=viz_mode)
         self._mic_box.append(self._mic_viz)
         self._meters_group.add(self._mic_box)
         self._sys_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_top=8)
-        self._sys_box.append(Gtk.Label(label="System-Ton", xalign=0, css_classes=["dim-label"]))
+        self._sys_box.append(Gtk.Label(label="System-Ton", xalign=0, css_classes=["dimmed"]))
         self._sys_viz = AudioVisualizer(mode=viz_mode)
         self._sys_box.append(self._sys_viz)
         self._meters_group.add(self._sys_box)
@@ -1761,7 +1778,7 @@ class RecorderView(Gtk.Box):
         row.connect("activated", lambda _r, x=base: self._open_detail(x))
         if base in self._busy:
             row.set_subtitle(self._busy_subtitle(base))
-            row.add_suffix(Gtk.Spinner(spinning=True, valign=Gtk.Align.CENTER))
+            row.add_suffix(make_spinner(valign=Gtk.Align.CENTER))
             return
         row.set_subtitle(self._status_line(item))
         # Play/delete only appear on hover or keyboard focus (calm rows);
@@ -2041,25 +2058,31 @@ class RecorderView(Gtk.Box):
 
         current_title = meta.get("title", base)
 
-        # header: back | title | edit pencil | actions menu
+        # header row (the app keeps one persistent top header with the view
+        # switcher, so the detail page uses a slim in-content header instead
+        # of a second full HeaderBar): back · title · actions.
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         back = Gtk.Button(icon_name="go-previous-symbolic", valign=Gtk.Align.CENTER)
         back.add_css_class("flat")
+        back.add_css_class("circular")
         back.set_tooltip_text("Zurück")
         back.connect("clicked", lambda *_: self.nav.pop())
         head.append(back)
-        title_lbl = Gtk.Label(label=current_title, xalign=0, hexpand=True, wrap=True)
+        title_lbl = Gtk.Label(label=current_title, xalign=0, hexpand=True,
+                              ellipsize=Pango.EllipsizeMode.END)
         title_lbl.add_css_class("title-2")
         head.append(title_lbl)
         self._detail["title_lbl"] = title_lbl
         qa_btn = Gtk.Button(icon_name="dialog-question-symbolic", valign=Gtk.Align.CENTER)
         qa_btn.add_css_class("flat")
+        qa_btn.add_css_class("circular")
         qa_btn.set_tooltip_text("Frag die Aufnahme — inhaltliche Fragen ans Transkript")
         qa_btn.connect("clicked", lambda *_: self._open_qa(base))
         self._detail["qa_btn"] = qa_btn
         head.append(qa_btn)
         rename = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER)
         rename.add_css_class("flat")
+        rename.add_css_class("circular")
         rename.set_tooltip_text("Titel bearbeiten")
         rename.connect("clicked", lambda *_: self._rename(base))
         head.append(rename)
@@ -2118,7 +2141,7 @@ class RecorderView(Gtk.Box):
             play_btn.add_css_class("flat")
             play_lbl = Gtk.Label(label="")
             play_lbl.add_css_class("numeric")
-            play_lbl.add_css_class("dim-label")
+            play_lbl.add_css_class("dimmed")
             play_btn.connect("clicked", lambda *_: self._toggle_play(base, play_btn, play_lbl))
             player.add_suffix(play_lbl)
             player.add_suffix(play_btn)
@@ -2146,7 +2169,7 @@ class RecorderView(Gtk.Box):
         prog_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self._detail["progress_box"] = prog_box
         prog_lbl = Gtk.Label(label="", xalign=0)
-        prog_lbl.add_css_class("dim-label")
+        prog_lbl.add_css_class("dimmed")
         bar = Gtk.ProgressBar(show_text=False)
         self._detail["progress_lbl"] = prog_lbl
         self._detail["progress_bar"] = bar
@@ -2156,6 +2179,8 @@ class RecorderView(Gtk.Box):
 
         # ── Transkript | Notizen as full-height views (no stacked mini boxes)
         content_stack = Adw.ViewStack(vexpand=True)
+        if hasattr(content_stack, "set_enable_transitions"):
+            content_stack.set_enable_transitions(True)  # crossfade Transkript↔Notizen
         self._detail["content_stack"] = content_stack
         if hasattr(Adw, "InlineViewSwitcher"):
             switcher = Adw.InlineViewSwitcher(stack=content_stack,
@@ -2193,7 +2218,7 @@ class RecorderView(Gtk.Box):
                                top_margin=12, bottom_margin=24,
                                left_margin=4, right_margin=4,
                                pixels_above_lines=3, pixels_inside_wrap=5)
-        tr_view.add_css_class("doc-view")
+        apply_document_style(tr_view)
         click = Gtk.GestureClick()
         click.connect("released", self._on_transcript_click)
         tr_view.add_controller(click)
@@ -2209,7 +2234,7 @@ class RecorderView(Gtk.Box):
         tr_empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                            valign=Gtk.Align.CENTER, vexpand=True)
         tr_empty_lbl = Gtk.Label(label="Noch nicht transkribiert.")
-        tr_empty_lbl.add_css_class("dim-label")
+        tr_empty_lbl.add_css_class("dimmed")
         tr_empty.append(tr_empty_lbl)
         tr_btn = Gtk.Button(label="Transkribieren", halign=Gtk.Align.CENTER)
         tr_btn.add_css_class("pill")
@@ -2498,7 +2523,7 @@ class RecorderView(Gtk.Box):
                       "die KI antwortet nur aus dem Transkript.",
                 justify=Gtk.Justification.CENTER, vexpand=True,
                 valign=Gtk.Align.CENTER)
-            hint.add_css_class("dim-label")
+            hint.add_css_class("dimmed")
             self._detail["qa_hint"] = hint
             qa_answers.append(hint)
             scroller.set_child(qa_answers)
@@ -2543,7 +2568,7 @@ class RecorderView(Gtk.Box):
         q_lbl.add_css_class("heading")
         a_lbl = Gtk.Label(label="Die KI liest das Transkript …", xalign=0,
                           wrap=True, selectable=True)
-        a_lbl.add_css_class("dim-label")
+        a_lbl.add_css_class("dimmed")
         item = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         item.append(q_lbl)
         item.append(a_lbl)
@@ -2559,12 +2584,12 @@ class RecorderView(Gtk.Box):
             try:
                 if "error" in r:
                     a_lbl.set_text(f"Fehler: {r['error']}")
-                    a_lbl.remove_css_class("dim-label")
+                    a_lbl.remove_css_class("dimmed")
                     a_lbl.add_css_class("error")
                 else:
                     answer = str(r.get("answer", "")).strip() or "(keine Antwort)"
                     a_lbl.set_text(answer)
-                    a_lbl.remove_css_class("dim-label")
+                    a_lbl.remove_css_class("dimmed")
                     # Cited [mm:ss] marks become jump buttons into the audio.
                     stamps: list[str] = []
                     for match in self._TS_RE.finditer(answer):
@@ -2752,7 +2777,7 @@ class RecorderView(Gtk.Box):
             empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                             valign=Gtk.Align.CENTER, vexpand=True)
             lbl = Gtk.Label(label="Noch keine Notizen.")
-            lbl.add_css_class("dim-label")
+            lbl.add_css_class("dimmed")
             empty.append(lbl)
             btn = Gtk.Button(halign=Gtk.Align.CENTER)
             btn.set_child(Adw.ButtonContent(icon_name="starred-symbolic", label="KI-Tools"))
@@ -2783,7 +2808,7 @@ class RecorderView(Gtk.Box):
         caption = Gtk.Label(
             label=" · ".join(p for p in (str(note.get("focus", "")), created) if p),
             xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
-        caption.add_css_class("dim-label")
+        caption.add_css_class("dimmed")
         caption.add_css_class("caption")
         bar.append(caption)
         copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
@@ -2804,7 +2829,7 @@ class RecorderView(Gtk.Box):
                             top_margin=8, bottom_margin=24,
                             left_margin=4, right_margin=4,
                             pixels_above_lines=3, pixels_inside_wrap=5)
-        view.add_css_class("doc-view")
+        apply_document_style(view)
         # Obsidian-style live preview: the buffer holds raw Markdown, the
         # syntax tokens hide themselves except on the cursor line. Typing
         # '# Welt' turns into a heading the moment you leave the line.
@@ -3799,6 +3824,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         toolbar.add_top_bar(header)
 
         self.stack = Adw.ViewStack()
+        if hasattr(self.stack, "set_enable_transitions"):
+            self.stack.set_enable_transitions(True)  # subtle crossfade between views
         switcher = Adw.ViewSwitcher(policy=Adw.ViewSwitcherPolicy.WIDE)
         switcher.set_stack(self.stack)
         header.set_title_widget(switcher)
