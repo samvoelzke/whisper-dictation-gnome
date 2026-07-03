@@ -2924,15 +2924,17 @@ class RecorderView(Gtk.Box):
             self._toast("Das bist du — erkannt über dein Stimmprofil.")
             return
         dlg = Adw.AlertDialog(
-            heading=f"„{old}“ benennen",
-            body="Der Name ersetzt das Label im Transkript. Die Stimme wird "
-                 "gemerkt und in künftigen Aufnahmen automatisch erkannt.")
+            heading=f"Wer ist „{old}“?",
+            body="Ein Name ersetzt das Label im Transkript; die Stimme wird "
+                 "gemerkt und künftig automatisch erkannt. „Das bin ich“ "
+                 "lernt die Stimme stattdessen in dein eigenes Stimmprofil.")
         entry = Gtk.Entry(placeholder_text="z. B. Anna", max_length=20,
                           activates_default=True)
         if not old.startswith("Sprecher "):
             entry.set_text(old)
         dlg.set_extra_child(entry)
         dlg.add_response("cancel", "Abbrechen")
+        dlg.add_response("me", "Das bin ich")
         dlg.add_response("ok", "Benennen")
         dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
         dlg.set_default_response("ok")
@@ -2950,7 +2952,26 @@ class RecorderView(Gtk.Box):
                     self._load_detail_content(base)
             return False
 
+        def done_me(r: dict) -> bool:
+            if "error" in r:
+                hint = {"no_voice_data": "Keine Stimmdaten — einmal „Sprecher "
+                                         "neu erkennen“ ausführen."}.get(
+                    r["error"], r["error"])
+                self._toast(f"Fehlgeschlagen: {hint}")
+            else:
+                self._toast(f"Deine Stimme gelernt ✓ (Profil: "
+                            f"{r.get('profile_count', '?')} Probe(n))")
+                if self._detail_base == base:
+                    self._load_detail_content(base)
+            return False
+
         def on_resp(_d, resp):
+            if resp == "me":
+                def work_me():
+                    r = recorder_call("mark-me", base, "--label", old, timeout=60)
+                    GLib.idle_add(done_me, r)
+                threading.Thread(target=work_me, daemon=True).start()
+                return
             if resp != "ok":
                 return
             new = entry.get_text().strip()

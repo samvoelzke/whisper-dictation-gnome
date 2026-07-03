@@ -129,13 +129,16 @@ def profile_vector():
     return np.asarray(vec, dtype=np.float32)
 
 
-def enroll_samples(samples, sr: int = SAMPLE_RATE) -> bool:
-    """Fold one dictation clip into the running voice profile (mean of unit
-    embeddings, re-normalized). Best effort — returns True if it updated."""
+def enroll_vector(vector) -> bool:
+    """Fold an existing embedding into the voice profile (running mean of
+    unit vectors, re-normalized). Used by dictation clips and by
+    'Das bin ich' on a diarized recording's stored speaker embedding."""
     import numpy as np
-    vec = embed(samples, sr)
-    if vec is None:
+    vec = np.asarray(vector, dtype=np.float32)
+    n = float(np.linalg.norm(vec))
+    if vec.size == 0 or n <= 1e-9:
         return False
+    vec = vec / n
     data = load_profile()
     count = int(data.get("count", 0))
     if count and data.get("vector"):
@@ -149,6 +152,13 @@ def enroll_samples(samples, sr: int = SAMPLE_RATE) -> bool:
         "vector": merged.tolist(), "count": count + 1,
     }))
     return True
+
+
+def enroll_samples(samples, sr: int = SAMPLE_RATE) -> bool:
+    """Fold one dictation clip into the running voice profile.
+    Best effort — returns True if it updated."""
+    vec = embed(samples, sr)
+    return False if vec is None else enroll_vector(vec)
 
 
 def reset_profile() -> None:

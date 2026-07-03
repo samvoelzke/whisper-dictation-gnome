@@ -1123,6 +1123,63 @@ def cmd_rename_speaker(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mark_me(args: argparse.Namespace) -> int:
+    """'Das bin ich': enroll a diarized speaker's stored embedding into the
+    user's voice profile and relabel that speaker as 'Ich' — bootstraps the
+    profile from existing recordings without re-dictating."""
+    base, label = args.base, args.label.strip()
+    spk_path = RECORDINGS_DIR / f"{base}.speakers.json"
+    data = _read_json(spk_path, {})
+    if isinstance(data, list):  # pre-registry format has no embeddings
+        print(json.dumps({"error": "no_voice_data", "base": base}))
+        return 1
+    segments = data.get("segments") or []
+    voices = data.get("voices") or {}
+    if not voices.get(label):
+        print(json.dumps({"error": "no_voice_data", "base": base}))
+        return 1
+    try:
+        import speaker
+        if not speaker.enroll_vector(voices[label]):
+            print(json.dumps({"error": "enroll_failed", "base": base}))
+            return 1
+        count = int(speaker.load_profile().get("count", 0))
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"error": f"speaker: {exc}", "base": base}))
+        return 1
+
+    txt_path = RECORDINGS_DIR / f"{base}.txt"
+    text = txt_path.read_text(encoding="utf-8") if txt_path.exists() else ""
+    if label != "Ich":
+        # A previously (mis)matched 'Ich' cluster gets demoted first.
+        if any(s.get("label") == "Ich" for s in segments):
+            # NOTE: the demoted name must differ from the clicked label —
+            # the transcript rewrite below runs by name, a reused number
+            # would merge both speakers into 'Ich'.
+            used = {s.get("label") for s in segments}
+            n = 2
+            while f"Sprecher {n}" in used:
+                n += 1
+            demoted = f"Sprecher {n}"
+            for seg in segments:
+                if seg.get("label") == "Ich":
+                    seg["label"] = demoted
+            if "Ich" in voices:
+                voices[demoted] = voices.pop("Ich")
+            text = _rename_speaker_in_transcript(text, "Ich", demoted)
+        for seg in segments:
+            if seg.get("label") == label:
+                seg["label"] = "Ich"
+        voices["Ich"] = voices.pop(label)
+        text = _rename_speaker_in_transcript(text, label, "Ich")
+        _write_json(spk_path, {"segments": segments, "voices": voices})
+        if text:
+            from common import atomic_write
+            atomic_write(txt_path, text)
+    print(json.dumps({"base": base, "marked": label, "profile_count": count}))
+    return 0
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     """Answer a content question strictly from the transcript (Q&A)."""
     base = args.base
@@ -1274,6 +1331,11 @@ def main() -> int:
     s.add_argument("--old", required=True)
     s.add_argument("--new", required=True)
     s.set_defaults(func=cmd_rename_speaker)
+
+    s = sub.add_parser("mark-me")
+    s.add_argument("base")
+    s.add_argument("--label", required=True)
+    s.set_defaults(func=cmd_mark_me)
 
     s = sub.add_parser("diarize")
     s.add_argument("base")
