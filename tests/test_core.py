@@ -180,5 +180,50 @@ class TestParagraphs(unittest.TestCase):
         self.assertEqual(self.recorder._strip_markers("[05:12] A [1:02:05] B"), "A B")
 
 
+class TestSpeakerAwareAI(unittest.TestCase):
+    """Diarized transcripts must feed speaker context into the LLM prompts."""
+    T = ("[00:00] Ich: Hallo zusammen.\n\n"
+         "[00:12] Sprecher 2: Hi!\n\n"
+         "[01:05] Anna: Ich übernehme das Protokoll.\n\n")
+
+    def setUp(self):
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("numpy not available")
+        import importlib
+        self.recorder = importlib.import_module("recorder")
+
+    def test_speaker_names_and_hint(self):
+        self.assertEqual(self.recorder._speaker_names(self.T),
+                         ["Ich", "Sprecher 2", "Anna"])
+        hint = self.recorder._speaker_hint(self.T)
+        self.assertIn("Anna", hint)
+        self.assertIn("'Ich' ist", hint)
+        self.assertEqual(self.recorder._speaker_hint("[00:00] Nur Text."), "")
+
+    def test_names_survive_marker_stripping(self):
+        # cmd_summarize strips [mm:ss] but must keep the 'Name:' prefixes
+        stripped = self.recorder._strip_markers(self.T)
+        self.assertIn("Ich: Hallo", stripped)
+        self.assertIn("Anna: Ich übernehme", stripped)
+
+    def test_rename_speaker_in_transcript(self):
+        out = self.recorder._rename_speaker_in_transcript(
+            self.T, "Sprecher 2", "Max")
+        self.assertIn("[00:12] Max: Hi!", out)
+        self.assertIn("Ich: Hallo", out)          # others untouched
+        # idempotent + no substring accidents ('Sprecher 2' inside text stays)
+        body = "[00:00] Ich: Sprecher 2 sagte etwas.\n"
+        self.assertEqual(self.recorder._rename_speaker_in_transcript(
+            body, "Sprecher 2", "Max"), body)
+
+    def test_kind_notes_complete(self):
+        self.assertEqual(set(self.recorder.KIND_NOTES),
+                         {"meeting", "vorlesung", "memo"})
+        for label, focus in self.recorder.KIND_NOTES.values():
+            self.assertTrue(label and focus)
+
+
 if __name__ == "__main__":
     unittest.main()

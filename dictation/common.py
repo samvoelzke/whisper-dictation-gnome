@@ -127,6 +127,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # After transcription, let Ollama detect topic chapters (clickable
     # jump marks under the player). Only for recordings >= 2 min.
     "recorder_auto_chapters": True,
+    # After transcription, run speaker diarization automatically (no-op
+    # unless speaker_enabled is on and the models are present).
+    "recorder_auto_speakers": True,
+    # After transcription, classify the recording (Meeting/Vorlesung/Memo)
+    # and auto-create the fitting note (Protokoll/Lernnotizen/Zusammenfassung).
+    "recorder_auto_note": True,
     # Obsidian vault folder for exporting transcripts/notes ("" = ask once).
     "obsidian_vault": "",
     # Per-app dictation modes: auto-pick the mode by focused app (needs the

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -526,6 +527,107 @@ def _maybe_auto_title(base: str, cfg: dict[str, Any]) -> None:
         print(f"[recorder] auto-title skipped: {exc}", file=sys.stderr, flush=True)
 
 
+# ── speaker-aware AI: diarization feeds through into every LLM feature ───────
+
+_SPK_PREFIX_RE = re.compile(r"^\[\d+:\d{2}(?::\d{2})?\]\s+([^:\n]{1,20}):\s", re.MULTILINE)
+
+
+def _speaker_names(transcript: str) -> list[str]:
+    """Distinct '[mm:ss] Name:' speaker prefixes, in order of appearance."""
+    names: list[str] = []
+    for m in _SPK_PREFIX_RE.finditer(transcript):
+        name = m.group(1).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _speaker_hint(raw_transcript: str) -> str:
+    """Extra system-prompt instruction once the transcript carries speaker
+    labels — summaries, Protokolle, Aufgaben and Q&A all become
+    speaker-aware through this single hook."""
+    names = _speaker_names(raw_transcript)
+    if not names:
+        return ""
+    return (
+        " Im Transkript ist markiert, wer spricht ('Name: ...'); 'Ich' ist "
+        f"der Nutzer selbst. Sprecher: {', '.join(names)}. Ordne Aussagen, "
+        "Entscheidungen und Aufgaben immer der jeweiligen Person zu und "
+        "trenne klar, was 'Ich' uebernimmt und was andere uebernehmen."
+    )
+
+
+# Auto-note: recording kind -> (note label, summarize focus). The focus texts
+# mirror the GUI's FOCUS_PRESETS so auto-notes and hand-made notes get the
+# same tab labels.
+KIND_NOTES = {
+    "meeting": ("Protokoll",
+                "besprochene Themen und getroffene Entscheidungen — als Protokoll, "
+                "mit einem Abschnitt 'Nächste Schritte' für die daraus "
+                "resultierenden Aufgaben"),
+    "vorlesung": ("Vorlesungsnotizen",
+                  "prüfungsrelevante Inhalte, Definitionen und Beispiele — als "
+                  "strukturierte Lernnotizen"),
+    "memo": ("Zusammenfassung",
+             "die wichtigsten Inhalte und Kernaussagen — als kompakte "
+             "Zusammenfassung"),
+}
+
+
+def _classify_kind(base: str, cfg: dict[str, Any], duration: float) -> str:
+    """meeting | vorlesung | memo — cheap heuristic first, then one small
+    Ollama call on a condensed excerpt."""
+    transcript = (RECORDINGS_DIR / f"{base}.txt").read_text(encoding="utf-8")
+    speakers = _speaker_names(transcript)
+    if duration < 180 and len(speakers) <= 1:
+        return "memo"
+    lines = [p.strip()[:120] for p in transcript.split("\n\n") if p.strip()]
+    condensed = "\n".join(lines[:80])
+    try:
+        raw = _ollama_chat(
+            cfg,
+            "Du klassifizierst Audio-Aufnahmen anhand des Transkripts. Antworte "
+            "mit GENAU EINEM Wort: 'meeting' (Gespraech/Call mit mehreren "
+            "Personen), 'vorlesung' (Vortrag/Vorlesung/Lehrvideo — einer erklaert "
+            "Stoff) oder 'memo' (kurze Sprachnotiz an sich selbst).",
+            condensed, timeout=90).strip().lower()
+    except Exception:  # noqa: BLE001 — Ollama down: fall through to heuristics
+        raw = ""
+    for kind in KIND_NOTES:
+        if kind in raw:
+            return kind
+    if len(speakers) >= 2:
+        return "meeting"
+    return "vorlesung" if duration >= 900 else "memo"
+
+
+def _maybe_auto_note(base: str, cfg: dict[str, Any], duration: float) -> None:
+    """Classify the recording and auto-create the fitting first note
+    (Meeting → Protokoll, Vorlesung → Lernnotizen, Memo → Zusammenfassung).
+    Skips when notes already exist (e.g. after a re-transcription)."""
+    if not cfg.get("recorder_auto_note", True):
+        return
+    txt_path = RECORDINGS_DIR / f"{base}.txt"
+    if not txt_path.exists():
+        return
+    if _read_json(RECORDINGS_DIR / f"{base}.notes.json", []) or \
+            (RECORDINGS_DIR / f"{base}.summary.md").exists():
+        return
+    if len(_strip_markers(txt_path.read_text(encoding="utf-8")).split()) < 40:
+        return  # too short for a useful note
+    kind = _classify_kind(base, cfg, duration)
+    meta_path = RECORDINGS_DIR / f"{base}.meta.json"
+    meta = _read_json(meta_path, {})
+    meta["kind"] = kind
+    _write_json(meta_path, meta)
+    label, focus = KIND_NOTES[kind]
+    print(f"[recorder] auto-note: {kind} -> {label}", flush=True)
+    try:
+        cmd_summarize(argparse.Namespace(base=base, focus=focus, label=label))
+    except Exception as exc:  # noqa: BLE001 — best effort
+        print(f"[recorder] auto-note failed: {exc}", file=sys.stderr, flush=True)
+
+
 def _decode_chunk(audio: Path, start: float, length: float):
     import numpy as np
     cmd = [
@@ -660,14 +762,32 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
             pct = f"{int(pos / duration * 100)}%" if have_dur and duration else f"{pos:.0f}s"
             print(f"[recorder] segment {segs} -> {pct} ({backend.kind})", flush=True)
 
-    _progress(duration if have_dur else pos, "done", segs)
+    total = duration if have_dur else pos
     chars = len(txt_path.read_text()) if txt_path.exists() else 0
+    # Post-analysis pipeline — every step is best effort and reports its
+    # phase via progress.json so the GUI can narrate what's happening.
+    _progress(total, "title", segs)
     _maybe_auto_title(base, cfg)
-    if cfg.get("recorder_auto_chapters", True) and (duration if have_dur else pos) >= 120:
+    if cfg.get("speaker_enabled") and cfg.get("recorder_auto_speakers", True) \
+            and total >= 20:
+        _progress(total, "speakers", segs)
+        try:
+            cmd_diarize(argparse.Namespace(base=base))
+        except Exception as exc:  # noqa: BLE001 — best effort
+            print(f"[recorder] speakers skipped: {exc}", file=sys.stderr, flush=True)
+    if cfg.get("recorder_auto_chapters", True) and total >= 120:
+        _progress(total, "chapters", segs)
         try:
             cmd_chapters(argparse.Namespace(base=base))
         except Exception as exc:  # noqa: BLE001 — best effort
             print(f"[recorder] chapters skipped: {exc}", file=sys.stderr, flush=True)
+    if cfg.get("recorder_auto_note", True):
+        _progress(total, "note", segs)
+        try:
+            _maybe_auto_note(base, cfg, total)
+        except Exception as exc:  # noqa: BLE001 — best effort
+            print(f"[recorder] auto-note skipped: {exc}", file=sys.stderr, flush=True)
+    _progress(total, "done", segs)
     _notify("Transkription fertig", f"{base} ({chars} Zeichen)")
     print(json.dumps({"base": base, "status": "done", "chars": chars}))
     if args.then_summarize:
@@ -697,12 +817,16 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     if not txt_path.exists():
         print(json.dumps({"error": "transcript_not_found", "base": base}))
         return 1
-    transcript = _strip_markers(txt_path.read_text(encoding="utf-8")).strip()
+    transcript_raw = txt_path.read_text(encoding="utf-8")
+    transcript = _strip_markers(transcript_raw).strip()
     if not transcript:
         print(json.dumps({"error": "empty_transcript", "base": base}))
         return 1
     focus = (args.focus or "").strip() or "die wichtigsten Inhalte, Kernaussagen und Action-Items"
     cfg = load_config()
+    # Diarized transcripts keep their 'Name:' prefixes after marker stripping,
+    # so one hint makes every note speaker-aware.
+    hint = _speaker_hint(transcript_raw)
 
     # ~3000 words (~4k tokens) per map block: well within qwen2.5's 32k context,
     # while keeping the number of LLM calls (and latency) low on long transcripts.
@@ -720,7 +844,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         if len(blocks) == 1:
             summary = _ollama_chat(cfg,
                 "Du bist ein praeziser Notiz-Assistent. Antworte auf Deutsch, behalte "
-                "englische Fachbegriffe bei und erfinde nichts. " + style,
+                "englische Fachbegriffe bei und erfinde nichts. " + style + hint,
                 f"Erstelle aus dieser Transkription kompakte Markdown-Notizen "
                 f"(Stichpunkte, ggf. ##-Abschnitte). Fokus: {focus}.\n\n{transcript}")
         else:
@@ -729,13 +853,13 @@ def cmd_summarize(args: argparse.Namespace) -> int:
                 print(f"[recorder] summarize map {idx}/{len(blocks)}", flush=True)
                 partials.append(_ollama_chat(cfg,
                     "Du bist ein praeziser Notiz-Assistent. Behalte englische Fachbegriffe bei, "
-                    "erfinde nichts.",
+                    "erfinde nichts." + hint,
                     f"Fasse diesen Abschnitt einer laengeren Aufnahme stichpunktartig zusammen. "
                     f"Fokus: {focus}.\n\nAbschnitt {idx}/{len(blocks)}:\n{block}"))
             print("[recorder] summarize reduce", flush=True)
             summary = _ollama_chat(cfg,
                 "Du bist ein praeziser Notiz-Assistent. Antworte auf Deutsch, behalte englische "
-                "Fachbegriffe bei, erfinde nichts. " + style,
+                "Fachbegriffe bei, erfinde nichts. " + style + hint,
                 f"Hier sind Teil-Zusammenfassungen einer langen Aufnahme (in Reihenfolge). "
                 f"Fuege sie zu EINER zusammenhaengenden, gut strukturierten Zusammenfassung "
                 f"mit ##-Abschnitten und Stichpunkten zusammen. Fokus: {focus}.\n\n"
@@ -852,13 +976,17 @@ def cmd_diarize(args: argparse.Namespace) -> int:
     if samples.size < 16000:
         print(json.dumps({"error": "audio_too_short", "base": base}))
         return 1
-    labels = speaker.diarize_and_label(samples, 16000)
+    labels, voices = speaker.diarize_and_label(samples, 16000)
     if not labels:
         print(json.dumps({"error": "no_speakers", "base": base}))
         return 1
-    _write_json(RECORDINGS_DIR / f"{base}.speakers.json",
-                [{"start": round(s, 2), "end": round(e, 2), "label": l}
-                 for s, e, l in labels])
+    # segments + one embedding per label: renaming a speaker later can then
+    # store their voice in the global registry for auto-recognition.
+    _write_json(RECORDINGS_DIR / f"{base}.speakers.json", {
+        "segments": [{"start": round(s, 2), "end": round(e, 2), "label": l}
+                     for s, e, l in labels],
+        "voices": voices,
+    })
 
     # Rewrite transcript paragraphs with a speaker prefix (idempotent: strip
     # any existing 'Name: ' after the [mm:ss] marker first).
@@ -891,6 +1019,60 @@ def cmd_diarize(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rename_speaker_in_transcript(text: str, old: str, new: str) -> str:
+    """Replace '[mm:ss] Old:' paragraph prefixes with the new name."""
+    pat = re.compile(r"^(\[\d+:\d{2}(?::\d{2})?\]\s+)" + re.escape(old) + ":",
+                     re.MULTILINE)
+    return pat.sub(lambda m: m.group(1) + new + ":", text)
+
+
+def cmd_rename_speaker(args: argparse.Namespace) -> int:
+    """Give a diarized speaker a real name: rewrites transcript + speakers.json
+    and stores the voice in the global registry so future recordings
+    recognize this person automatically."""
+    base, old, new = args.base, args.old.strip(), args.new.strip()
+    if not new or len(new) > 20 or ":" in new or "\n" in new or new == "Ich":
+        print(json.dumps({"error": "bad_name", "base": base}))
+        return 1
+    spk_path = RECORDINGS_DIR / f"{base}.speakers.json"
+    data = _read_json(spk_path, {})
+    if isinstance(data, list):  # pre-registry format: bare segment list
+        data = {"segments": data, "voices": {}}
+    segments = data.get("segments") or []
+    voices = data.get("voices") or {}
+    changed = False
+    for seg in segments:
+        if seg.get("label") == old:
+            seg["label"] = new
+            changed = True
+    if old in voices:
+        voices[new] = voices.pop(old)
+        changed = True
+    txt_path = RECORDINGS_DIR / f"{base}.txt"
+    if txt_path.exists():
+        text = txt_path.read_text(encoding="utf-8")
+        new_text = _rename_speaker_in_transcript(text, old, new)
+        if new_text != text:
+            from common import atomic_write
+            atomic_write(txt_path, new_text)
+            changed = True
+    if not changed:
+        print(json.dumps({"error": "speaker_not_found", "base": base}))
+        return 1
+    _write_json(spk_path, {"segments": segments, "voices": voices})
+    voice_saved = False
+    if voices.get(new):
+        try:
+            import speaker
+            voice_saved = speaker.save_named_voice(new, voices[new])
+        except Exception as exc:  # noqa: BLE001 — renaming still succeeded
+            print(f"[recorder] voice registry skipped: {exc}",
+                  file=sys.stderr, flush=True)
+    print(json.dumps({"base": base, "renamed": old, "to": new,
+                      "voice_saved": voice_saved}))
+    return 0
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     """Answer a content question strictly from the transcript (Q&A)."""
     base = args.base
@@ -912,7 +1094,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         "ehrlich. Antworte in der Sprache der Frage, kompakt und konkret. "
         "Nenne, wo passend, die [mm:ss]-Zeitmarke(n) aus dem Transkript, an "
         "denen die Stelle vorkommt."
-    )
+    ) + _speaker_hint(transcript)
     blocks = _split_words(transcript, 3000)
     if len(blocks) == 1:
         answer = _ollama_chat(
@@ -959,6 +1141,7 @@ def cmd_list(_args: argparse.Namespace) -> int:
             "created": meta.get("created", ""),
             "source": meta.get("source", ""),
             "duration_seconds": meta.get("duration_seconds", 0),
+            "kind": meta.get("kind", ""),
             "recording": base == active,
             "transcribed": txt.exists() and prog.get("status") == "done",
             "transcribe_status": prog.get("status", ""),
@@ -1030,6 +1213,12 @@ def main() -> int:
     s = sub.add_parser("chapters")
     s.add_argument("base")
     s.set_defaults(func=cmd_chapters)
+
+    s = sub.add_parser("rename-speaker")
+    s.add_argument("base")
+    s.add_argument("--old", required=True)
+    s.add_argument("--new", required=True)
+    s.set_defaults(func=cmd_rename_speaker)
 
     s = sub.add_parser("diarize")
     s.add_argument("base")

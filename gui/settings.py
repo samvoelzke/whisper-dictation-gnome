@@ -51,6 +51,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # Config schema, load/save (atomic) and hotkey labels live in the shared core.
 sys.path.insert(0, str(PROJECT_ROOT / "dictation"))
 from common import (  # noqa: E402
+    CACHE_DIR,
     DEFAULT_CONFIG,
     DEFAULT_PER_APP_MODES,
     DICTATION_MODES,
@@ -528,6 +529,31 @@ def install_app_css() -> None:
         }
         .hero-hint {
           font-size: 0.85em;
+        }
+        /* Bottom player bar (podcast-style): the transcript is the hero,
+           audio controls float in a slim rounded bar underneath */
+        .player-bar {
+          background: @view_bg_color;
+          border: 1px solid alpha(@borders, 0.7);
+          border-radius: 16px;
+          padding: 2px 8px;
+        }
+        /* Speaker chips under the detail title (click = rename) */
+        .spk-chip {
+          border-radius: 9999px;
+          padding: 2px 10px;
+          font-size: 0.85em;
+          background: alpha(@window_fg_color, 0.07);
+        }
+        .spk-chip:hover {
+          background: alpha(@window_fg_color, 0.14);
+        }
+        .spk-chip-me {
+          color: @accent_color;
+          background: alpha(@accent_bg_color, 0.12);
+        }
+        .spk-chip-me:hover {
+          background: alpha(@accent_bg_color, 0.22);
         }
         /* List row actions appear on hover/keyboard focus only (calm rows) */
         row .row-actions {
@@ -1483,14 +1509,23 @@ class RecorderView(Gtk.Box):
         self.auto_row.connect("notify::active",
                               lambda *_: self._persist("recorder_auto_process", bool(self.auto_row.get_active())))
         transkription.add_row(self.auto_row)
-        self.auto_title_row = Adw.SwitchRow(
-            title="Titel automatisch vergeben",
-            subtitle="Nach der Transkription schlägt die KI einen kurzen Titel vor.")
-        self.auto_title_row.set_active(bool(cfg.get("recorder_auto_title", True)))
-        self.auto_title_row.connect(
-            "notify::active",
-            lambda *_: self._persist("recorder_auto_title", bool(self.auto_title_row.get_active())))
-        transkription.add_row(self.auto_title_row)
+        # Auto-analysis pipeline: what runs by itself after each transcription.
+        for attr, key, title, sub in (
+            ("auto_title_row", "recorder_auto_title", "Titel automatisch vergeben",
+             "Die KI schlägt nach der Transkription einen kurzen Titel vor."),
+            ("auto_chapters_row", "recorder_auto_chapters", "Kapitel automatisch erkennen",
+             "Sprungmarken am Player, ab 2 Minuten Länge."),
+            ("auto_speakers_row", "recorder_auto_speakers", "Sprecher automatisch erkennen",
+             "Wer sagt was — benötigt aktivierte Sprechererkennung (KI-Seite)."),
+            ("auto_note_row", "recorder_auto_note", "Passende Notiz automatisch erstellen",
+             "Meeting → Protokoll · Vorlesung → Lernnotizen · Memo → Zusammenfassung."),
+        ):
+            row = Adw.SwitchRow(title=title, subtitle=sub)
+            row.set_active(bool(cfg.get(key, True)))
+            row.connect("notify::active",
+                        lambda _r, _p, k=key, r=row: self._persist(k, bool(r.get_active())))
+            setattr(self, attr, row)
+            transkription.add_row(row)
         vault = str(cfg.get("obsidian_vault", "")).strip()
         self.vault_row = Adw.ActionRow(
             title="Obsidian-Vault",
@@ -1870,9 +1905,16 @@ class RecorderView(Gtk.Box):
             icon.add_css_class("error")
             row.add_prefix(icon)
             return
-        # status icon: at-a-glance state of each recording
+        # status icon: at-a-glance state — once the AI classified the
+        # recording, its kind (Meeting/Vorlesung/Memo) is the richer signal.
+        kind_icons = {"meeting": ("system-users-symbolic", "Meeting"),
+                      "vorlesung": ("accessories-dictionary-symbolic", "Vorlesung"),
+                      "memo": ("audio-input-microphone-symbolic", "Sprachmemo")}
+        tooltip = None
         if base in self._busy:
             ico = "content-loading-symbolic"
+        elif item.get("transcribed") and item.get("kind") in kind_icons:
+            ico, tooltip = kind_icons[item["kind"]]
         elif item.get("summarized"):
             # not emblem-ok-symbolic: missing from Fedora's Adwaita theme
             ico = "object-select-symbolic"
@@ -1880,7 +1922,10 @@ class RecorderView(Gtk.Box):
             ico = "audio-x-generic-symbolic"
         else:
             ico = "audio-input-microphone-symbolic"
-        row.add_prefix(Gtk.Image(icon_name=ico, valign=Gtk.Align.CENTER))
+        prefix_icon = Gtk.Image(icon_name=ico, valign=Gtk.Align.CENTER)
+        if tooltip:
+            prefix_icon.set_tooltip_text(tooltip)
+        row.add_prefix(prefix_icon)
         row.set_activatable(True)
         row.connect("activated", lambda _r, x=base: self._open_detail(x))
         if base in self._busy:
@@ -1969,6 +2014,19 @@ class RecorderView(Gtk.Box):
         def run(focus: str, label: str) -> None:
             dlg.force_close()
             self._summarize(base, focus, label)
+
+        # Ask-the-recording lives here too: ONE AI entry point on the page.
+        ask_group = Adw.PreferencesGroup()
+        ask_row = Adw.ActionRow(
+            title="Frag die Aufnahme",
+            subtitle="Inhaltliche Fragen — die KI antwortet nur aus dem Transkript",
+            activatable=True)
+        ask_row.add_prefix(Gtk.Image(icon_name="dialog-question-symbolic"))
+        ask_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+        ask_row.connect("activated",
+                        lambda *_: (dlg.force_close(), self._open_qa(base)))
+        ask_group.add(ask_row)
+        outer.append(ask_group)
 
         # Built-in tools as a boxed list with icon + description
         tools = Adw.PreferencesGroup(
@@ -2124,12 +2182,24 @@ class RecorderView(Gtk.Box):
         est = min(cp_secs + rate * (now - cp_wall), cp_secs + chunk, dur)
         return max(1, min(99, int(est / dur * 100)))
 
+    # Post-transcription phases (recorder writes them into progress.json) —
+    # the auto-pipeline narrates itself instead of hanging at "100 %".
+    POST_PHASES = {
+        "title": "Wähle Titel …",
+        "speakers": "Erkenne Sprecher …",
+        "chapters": "Erkenne Kapitel …",
+        "note": "Erstelle Notiz …",
+    }
+
     def _busy_subtitle(self, base):
         if self._busy_action.get(base) == "summarize":
             return "Fasse zusammen …"
         d = self._read_progress(base)
         if d.get("status") == "loading":
             return "Lädt Modell …"
+        phase = self.POST_PHASES.get(str(d.get("status", "")))
+        if phase:
+            return phase
         pct = self._smoothed_pct(base)
         if pct is not None:
             return f"Transkribiere … {pct} %{self._eta(base, pct)}"
@@ -2164,10 +2234,26 @@ class RecorderView(Gtk.Box):
         clamp.set_child(box)
 
         current_title = meta.get("title", base)
+        from datetime import datetime as _dt
+        try:
+            created = _dt.fromisoformat(meta.get("created", "")).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            created = ""
+        kind_names = {"meeting": "Meeting", "vorlesung": "Vorlesung",
+                      "memo": "Sprachmemo"}
+        meta_line = " · ".join(p for p in [
+            kind_names.get(str(meta.get("kind", "")), ""),
+            created, fmt_duration(meta.get("duration_seconds", 0)),
+            REC_SOURCE_SHORT.get(meta.get("source", ""), meta.get("source", "")),
+        ] if p)
+        audio_path = RECORDINGS_DIR / f"{base}.opus"
+        try:
+            meta_line += f" · {fmt_size(audio_path.stat().st_size)}"
+        except OSError:
+            meta_line += " · Audio entfernt"
 
-        # header row (the app keeps one persistent top header with the view
-        # switcher, so the detail page uses a slim in-content header instead
-        # of a second full HeaderBar): back · title · actions.
+        # header: back · title over meta caption · rename · menu. (Q&A lives
+        # in the KI hub now — one AI entry point instead of three.)
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         back = Gtk.Button(icon_name="go-previous-symbolic", valign=Gtk.Align.CENTER)
         back.add_css_class("flat")
@@ -2175,18 +2261,18 @@ class RecorderView(Gtk.Box):
         back.set_tooltip_text("Zurück")
         back.connect("clicked", lambda *_: self.nav.pop())
         head.append(back)
-        title_lbl = Gtk.Label(label=current_title, xalign=0, hexpand=True,
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        title_lbl = Gtk.Label(label=current_title, xalign=0,
                               ellipsize=Pango.EllipsizeMode.END)
         title_lbl.add_css_class("title-2")
-        head.append(title_lbl)
+        title_box.append(title_lbl)
+        meta_lbl = Gtk.Label(label=meta_line, xalign=0,
+                             ellipsize=Pango.EllipsizeMode.END)
+        meta_lbl.add_css_class("caption")
+        meta_lbl.add_css_class("dimmed")
+        title_box.append(meta_lbl)
+        head.append(title_box)
         self._detail["title_lbl"] = title_lbl
-        qa_btn = Gtk.Button(icon_name="dialog-question-symbolic", valign=Gtk.Align.CENTER)
-        qa_btn.add_css_class("flat")
-        qa_btn.add_css_class("circular")
-        qa_btn.set_tooltip_text("Frag die Aufnahme — inhaltliche Fragen ans Transkript")
-        qa_btn.connect("clicked", lambda *_: self._open_qa(base))
-        self._detail["qa_btn"] = qa_btn
-        head.append(qa_btn)
         rename = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER)
         rename.add_css_class("flat")
         rename.add_css_class("circular")
@@ -2196,81 +2282,16 @@ class RecorderView(Gtk.Box):
         head.append(self._detail_menu_button(base))
         box.append(head)
 
-        # audio metadata + player
-        info = Adw.PreferencesGroup()
-        box.append(info)
-        from datetime import datetime as _dt
-        try:
-            created = _dt.fromisoformat(meta.get("created", "")).strftime("%d.%m.%Y %H:%M")
-        except Exception:
-            created = ""
-        meta_line = " · ".join(p for p in [
-            created, fmt_duration(meta.get("duration_seconds", 0)),
-            REC_SOURCE_SHORT.get(meta.get("source", ""), meta.get("source", "")),
-        ] if p)
-        audio_path = RECORDINGS_DIR / f"{base}.opus"
-        try:
-            meta_line += f" · {fmt_size(audio_path.stat().st_size)}"
-        except OSError:
-            meta_line += " · Audio entfernt"
-        player = Adw.ActionRow(title="Audio", subtitle=meta_line)
-        info.add(player)
-        if hasattr(Gtk, "MediaControls") and audio_path.exists():
-            # Native seekable player (play/pause, scrubbing, volume) with
-            # ±10 s jump buttons — for navigating hour-long lectures.
-            self._media = Gtk.MediaFile.new_for_filename(str(audio_path))
-            controls = Gtk.MediaControls(media_stream=self._media)
-            controls.set_hexpand(True)
-            back10 = Gtk.Button(icon_name="media-seek-backward-symbolic",
-                                valign=Gtk.Align.CENTER)
-            back10.add_css_class("flat")
-            back10.set_tooltip_text("10 Sekunden zurück")
-            back10.connect("clicked", lambda *_: self._seek_relative(-10))
-            fwd10 = Gtk.Button(icon_name="media-seek-forward-symbolic",
-                               valign=Gtk.Align.CENTER)
-            fwd10.add_css_class("flat")
-            fwd10.set_tooltip_text("10 Sekunden vor")
-            fwd10.connect("clicked", lambda *_: self._seek_relative(10))
-            pbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4,
-                           margin_top=4, margin_bottom=4,
-                           margin_start=8, margin_end=8)
-            pbox.append(back10)
-            pbox.append(controls)
-            pbox.append(fwd10)
-            controls_row = Gtk.ListBoxRow(activatable=False, selectable=False,
-                                          child=pbox)
-            info.add(controls_row)
-        elif audio_path.exists():
-            # Fallback without a GStreamer GTK backend: simple ffplay toggle.
-            play_btn = Gtk.Button(icon_name="media-playback-start-symbolic",
-                                  valign=Gtk.Align.CENTER)
-            play_btn.set_tooltip_text("Abspielen")
-            play_btn.add_css_class("flat")
-            play_lbl = Gtk.Label(label="")
-            play_lbl.add_css_class("numeric")
-            play_lbl.add_css_class("dimmed")
-            play_btn.connect("clicked", lambda *_: self._toggle_play(base, play_btn, play_lbl))
-            player.add_suffix(play_lbl)
-            player.add_suffix(play_btn)
-            self._detail["play_btn"] = play_btn
-            self._detail["play_lbl"] = play_lbl
-
-        # chapters (AI-detected topic jump marks, filled in _load_chapters)
-        chapters_row = Gtk.ListBoxRow(activatable=False, selectable=False)
+        # speaker chips (who talks, incl. talk time; filled by _load_speakers)
         if hasattr(Adw, "WrapBox"):
-            chapters_box = Adw.WrapBox(child_spacing=6, line_spacing=6)
+            spk_bar = Adw.WrapBox(child_spacing=6, line_spacing=6)
         else:
-            chapters_box = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
-                                       column_spacing=6, row_spacing=6)
-        chapters_box.set_margin_top(6)
-        chapters_box.set_margin_bottom(8)
-        chapters_box.set_margin_start(10)
-        chapters_box.set_margin_end(10)
-        chapters_row.set_child(chapters_box)
-        chapters_row.set_visible(False)
-        info.add(chapters_row)
-        self._detail["chapters_row"] = chapters_row
-        self._detail["chapters_box"] = chapters_box
+            spk_bar = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                                  column_spacing=6, row_spacing=6)
+        spk_bar.set_margin_start(42)  # align with the title text
+        spk_bar.set_visible(False)
+        self._detail["spk_bar"] = spk_bar
+        box.append(spk_bar)
 
         # progress (transcription / summary)
         prog_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -2289,6 +2310,21 @@ class RecorderView(Gtk.Box):
         if hasattr(content_stack, "set_enable_transitions"):
             content_stack.set_enable_transitions(True)  # crossfade Transkript↔Notizen
         self._detail["content_stack"] = content_stack
+
+        # one calm tool line: search/copy · Transkript|Notizen · KI hub
+        center = Gtk.CenterBox()
+        tools_l = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        search_toggle = Gtk.ToggleButton(icon_name="system-search-symbolic",
+                                         valign=Gtk.Align.CENTER)
+        search_toggle.add_css_class("flat")
+        search_toggle.set_tooltip_text("Im Transkript suchen")
+        tools_l.append(search_toggle)
+        tr_copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
+        tr_copy.add_css_class("flat")
+        tr_copy.set_tooltip_text("Transkript kopieren")
+        tr_copy.connect("clicked", lambda *_: self._copy(self._transcript_text()))
+        tools_l.append(tr_copy)
+        center.set_start_widget(tools_l)
         if hasattr(Adw, "InlineViewSwitcher"):
             switcher = Adw.InlineViewSwitcher(stack=content_stack,
                                               halign=Gtk.Align.CENTER)
@@ -2296,30 +2332,40 @@ class RecorderView(Gtk.Box):
             switcher = Adw.ViewSwitcher(stack=content_stack,
                                         policy=Adw.ViewSwitcherPolicy.WIDE,
                                         halign=Gtk.Align.CENTER)
-        box.append(switcher)
-        box.append(content_stack)
+        center.set_center_widget(switcher)
+        ai_btn = Gtk.Button(valign=Gtk.Align.CENTER)
+        ai_btn.set_child(Adw.ButtonContent(icon_name="starred-symbolic", label="KI"))
+        ai_btn.add_css_class("flat")
+        ai_btn.set_tooltip_text("KI: Fragen stellen, Protokoll, Notizen, Aufgaben …")
+        ai_btn.connect("clicked", lambda *_: self._open_ai_tools(base))
+        center.set_end_widget(ai_btn)
+        self._detail["ki_btn"] = ai_btn
+        self._detail["search_toggle"] = search_toggle
+        self._detail["copy_btn"] = tr_copy
+        box.append(center)
 
-        # — Transkript view: toolbar (search/copy/save) + full-height editor
-        tr_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        tr_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        # search entry slides in on demand instead of sitting there always
+        search_rev = Gtk.Revealer(
+            transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
         self._tr_search = Gtk.SearchEntry(placeholder_text="Im Transkript suchen …")
-        self._tr_search.set_hexpand(True)
         self._tr_search.connect("search-changed", lambda *_: self._tr_do_search(reset=True))
         self._tr_search.connect("activate", lambda *_: self._tr_do_search(reset=False))
-        tr_bar.append(self._tr_search)
-        tr_copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
-        tr_copy.add_css_class("flat")
-        tr_copy.set_tooltip_text("Transkript kopieren")
-        tr_copy.connect("clicked", lambda *_: self._copy(self._transcript_text()))
-        tr_bar.append(tr_copy)
-        ai_btn = Gtk.Button(valign=Gtk.Align.CENTER)
-        ai_btn.set_child(Adw.ButtonContent(icon_name="starred-symbolic", label="KI-Tools"))
-        ai_btn.add_css_class("flat")
-        ai_btn.set_tooltip_text("Protokoll, Notizen, Aufgaben oder eigenen Auftrag erstellen")
-        ai_btn.connect("clicked", lambda *_: self._open_ai_tools(base))
-        tr_bar.append(ai_btn)
-        self._detail["tr_actions"] = tr_bar
-        tr_page.append(tr_bar)
+        search_rev.set_child(self._tr_search)
+        box.append(search_rev)
+
+        def toggle_search(btn):
+            search_rev.set_reveal_child(btn.get_active())
+            if btn.get_active():
+                self._tr_search.grab_focus()
+            else:
+                self._tr_search.set_text("")
+                self._tr_do_search(reset=True)  # clear the highlights
+        search_toggle.connect("toggled", toggle_search)
+
+        box.append(content_stack)
+
+        # — Transkript view: full-height document editor
+        tr_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         tr_scroller = Gtk.ScrolledWindow(vexpand=True)
         tr_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR,
                                top_margin=12, bottom_margin=24,
@@ -2356,6 +2402,70 @@ class RecorderView(Gtk.Box):
         # _load_notes ("Transkript | Protokoll | Action-Items | …").
         self._detail["note_pages"] = []
 
+        # slim bottom player bar (podcast style): Kapitel · −10 s · Player · +10 s
+        if audio_path.exists():
+            pbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            pbar.add_css_class("player-bar")
+            chapters_btn = Gtk.MenuButton(icon_name="view-list-symbolic",
+                                          valign=Gtk.Align.CENTER)
+            chapters_btn.add_css_class("flat")
+            chapters_btn.set_tooltip_text("Kapitel")
+            chapters_btn.set_visible(False)
+            chap_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            chap_list.add_css_class("navigation-sidebar")
+            chap_scroll = Gtk.ScrolledWindow(propagate_natural_height=True,
+                                             propagate_natural_width=True,
+                                             max_content_height=380)
+            chap_scroll.set_child(chap_list)
+            chap_pop = Gtk.Popover()
+            chap_pop.set_child(chap_scroll)
+            chapters_btn.set_popover(chap_pop)
+
+            def on_chapter(_lst, row):
+                seconds = getattr(row, "_seconds", None)
+                if seconds is not None:
+                    self._seek_to(seconds)
+                chap_pop.popdown()
+            chap_list.connect("row-activated", on_chapter)
+            self._detail["chapters_btn"] = chapters_btn
+            self._detail["chapters_list"] = chap_list
+            pbar.append(chapters_btn)
+            if hasattr(Gtk, "MediaControls"):
+                # Native seekable player (play/pause, scrubbing, volume) with
+                # ±10 s jump buttons — for navigating hour-long lectures.
+                self._media = Gtk.MediaFile.new_for_filename(str(audio_path))
+                controls = Gtk.MediaControls(media_stream=self._media)
+                controls.set_hexpand(True)
+                back10 = Gtk.Button(icon_name="media-seek-backward-symbolic",
+                                    valign=Gtk.Align.CENTER)
+                back10.add_css_class("flat")
+                back10.set_tooltip_text("10 Sekunden zurück")
+                back10.connect("clicked", lambda *_: self._seek_relative(-10))
+                fwd10 = Gtk.Button(icon_name="media-seek-forward-symbolic",
+                                   valign=Gtk.Align.CENTER)
+                fwd10.add_css_class("flat")
+                fwd10.set_tooltip_text("10 Sekunden vor")
+                fwd10.connect("clicked", lambda *_: self._seek_relative(10))
+                pbar.append(back10)
+                pbar.append(controls)
+                pbar.append(fwd10)
+            else:
+                # Fallback without a GStreamer GTK backend: simple ffplay toggle.
+                play_btn = Gtk.Button(icon_name="media-playback-start-symbolic",
+                                      valign=Gtk.Align.CENTER)
+                play_btn.set_tooltip_text("Abspielen")
+                play_btn.add_css_class("flat")
+                play_lbl = Gtk.Label(label="", hexpand=True, xalign=0)
+                play_lbl.add_css_class("numeric")
+                play_lbl.add_css_class("dimmed")
+                play_btn.connect("clicked",
+                                 lambda *_: self._toggle_play(base, play_btn, play_lbl))
+                pbar.append(play_btn)
+                pbar.append(play_lbl)
+                self._detail["play_btn"] = play_btn
+                self._detail["play_lbl"] = play_lbl
+            box.append(pbar)
+
         page = Adw.NavigationPage(title=current_title, child=clamp)
         self._detail["page"] = page
         self.nav.push(page)
@@ -2387,10 +2497,9 @@ class RecorderView(Gtk.Box):
             actions.add_action(action)
         menu = Gio.Menu()
         section = Gio.Menu()
-        section.append("Frag die Aufnahme …", "detail.ask")
-        section.append("Kapitel erkennen", "detail.chapters")
-        section.append("Sprecher erkennen", "detail.speakers")
-        menu.append_section(None, section)
+        section.append("Kapitel neu erkennen", "detail.chapters")
+        section.append("Sprecher neu erkennen", "detail.speakers")
+        menu.append_section("Neu analysieren", section)
         export = Gio.Menu()
         export.append("Nach Obsidian exportieren", "detail.export-obsidian")
         export.append("Untertitel (.srt)", "detail.export-srt")
@@ -2477,30 +2586,46 @@ class RecorderView(Gtk.Box):
             rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
             tag = buf.create_tag("ts-marker", weight=700, scale=0.85)
             tag.set_property("foreground-rgba", rgba)
-        spk = buf.get_tag_table().lookup("spk-marker")
-        if spk is None:
-            spk = buf.create_tag("spk-marker", weight=800)
         start, end = buf.get_bounds()
         buf.remove_tag(tag, start, end)
-        buf.remove_tag(spk, start, end)
         text = buf.get_text(start, end, False)
         for m in self._TS_RE.finditer(text):
             buf.apply_tag(tag, buf.get_iter_at_offset(m.start()),
                           buf.get_iter_at_offset(m.end()))
-        # Speaker prefix: "[mm:ss] Name: …" -> bold the "Name:" part.
+        # Speaker prefix "[mm:ss] Name: …": bold + one stable color per
+        # person ('Ich' = accent) — dialogs scan like a chat, not a wall.
+        palette = ((0.15, 0.63, 0.41), (0.90, 0.38, 0.00),
+                   (0.57, 0.25, 0.67), (0.75, 0.11, 0.16))
+        spk_order: list[str] = []
         for m in re.finditer(r"\]\s([^:\n]{1,20}):", text):
-            buf.apply_tag(spk, buf.get_iter_at_offset(m.start(1)),
+            name = m.group(1)
+            if name not in spk_order:
+                spk_order.append(name)
+            spk_tag = buf.get_tag_table().lookup(f"spk-{name}")
+            if spk_tag is None:
+                if name == "Ich":
+                    r, g, b = accent_rgb()
+                else:
+                    others = [n for n in spk_order if n != "Ich"]
+                    r, g, b = palette[others.index(name) % len(palette)]
+                rgba = Gdk.RGBA()
+                rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
+                spk_tag = buf.create_tag(f"spk-{name}", weight=800)
+                spk_tag.set_property("foreground-rgba", rgba)
+            buf.apply_tag(spk_tag, buf.get_iter_at_offset(m.start(1)),
                           buf.get_iter_at_offset(m.end(1) + 1))
 
     def _load_chapters(self, base) -> None:
-        row = self._detail.get("chapters_row")
-        box = self._detail.get("chapters_box")
-        if row is None or box is None:
+        """Fill the chapter popover at the player (jump list, like a podcast
+        chapter menu) — chapters no longer eat fixed screen space."""
+        btn = self._detail.get("chapters_btn")
+        lst = self._detail.get("chapters_list")
+        if btn is None or lst is None:
             return
-        child = box.get_first_child()
+        child = lst.get_first_child()
         while child is not None:
             nxt = child.get_next_sibling()
-            box.remove(child)
+            lst.remove(child)
             child = nxt
         try:
             chapters = json.loads(
@@ -2509,7 +2634,7 @@ class RecorderView(Gtk.Box):
             chapters = []
         usable = (isinstance(chapters, list) and chapters
                   and self._media is not None)
-        row.set_visible(bool(usable))
+        btn.set_visible(bool(usable))
         if not usable:
             return
         for chapter in chapters:
@@ -2518,13 +2643,20 @@ class RecorderView(Gtk.Box):
             seconds = self._ts_to_seconds(stamp)
             if seconds is None or not title:
                 continue
-            btn = Gtk.Button(label=f"{stamp} · {title}")
-            btn.add_css_class("flat")
-            btn.add_css_class("chip")
-            btn.add_css_class("chip-accent")
-            btn.set_tooltip_text("Im Audio dorthin springen")
-            btn.connect("clicked", lambda _b, s=seconds: self._seek_to(s))
-            box.append(btn)
+            row = Gtk.ListBoxRow()
+            row._seconds = seconds
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10,
+                           margin_top=4, margin_bottom=4,
+                           margin_start=8, margin_end=8)
+            t_lbl = Gtk.Label(label=stamp, xalign=0)
+            t_lbl.add_css_class("numeric")
+            t_lbl.add_css_class("dimmed")
+            line.append(t_lbl)
+            line.append(Gtk.Label(label=title, xalign=0,
+                                  ellipsize=Pango.EllipsizeMode.END))
+            row.set_child(line)
+            row.set_tooltip_text("Im Audio dorthin springen")
+            lst.append(row)
 
     def _make_chapters(self, base) -> None:
         if not (RECORDINGS_DIR / f"{base}.txt").exists():
@@ -2572,6 +2704,104 @@ class RecorderView(Gtk.Box):
             r = recorder_call("diarize", base, timeout=900)
             GLib.idle_add(done, r)
         threading.Thread(target=work, daemon=True).start()
+
+    # ── detail: speaker chips + naming (feeds the global voice registry) ────
+
+    def _read_speakers(self, base) -> list:
+        """speakers.json segments — supports the old bare-list format too."""
+        try:
+            data = json.loads(
+                (RECORDINGS_DIR / f"{base}.speakers.json").read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        segs = data.get("segments") if isinstance(data, dict) else data
+        return segs if isinstance(segs, list) else []
+
+    def _load_speakers(self, base) -> None:
+        bar = self._detail.get("spk_bar")
+        if bar is None:
+            return
+        child = bar.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            bar.remove(child)
+            child = nxt
+        talk: dict[str, float] = {}
+        for seg in self._read_speakers(base):
+            label = str(seg.get("label", "")).strip()
+            if not label:
+                continue
+            talk[label] = talk.get(label, 0.0) + max(
+                0.0, float(seg.get("end", 0)) - float(seg.get("start", 0)))
+        bar.set_visible(bool(talk))
+        if not talk:
+            return
+        for label, secs in sorted(talk.items(), key=lambda kv: -kv[1]):
+            mins = secs / 60
+            t = f"{mins:.0f} min" if mins >= 1 else f"{secs:.0f} s"
+            btn = Gtk.Button(label=f"{label} · {t}")
+            btn.add_css_class("flat")
+            btn.add_css_class("spk-chip")
+            if label == "Ich":
+                btn.add_css_class("spk-chip-me")
+                btn.set_tooltip_text("Deine Stimme — über dein Stimmprofil erkannt")
+            elif label.startswith("Sprecher "):
+                btn.set_tooltip_text("Klicken zum Benennen — die Stimme wird "
+                                     "künftig automatisch erkannt")
+            else:
+                btn.set_tooltip_text("Aus dem Stimm-Register erkannt — klicken "
+                                     "zum Umbenennen")
+            btn.connect("clicked",
+                        lambda _b, l=label: self._rename_speaker_dialog(base, l))
+            bar.append(btn)
+
+    def _rename_speaker_dialog(self, base, old: str) -> None:
+        if old == "Ich":
+            self._toast("Das bist du — erkannt über dein Stimmprofil.")
+            return
+        dlg = Adw.AlertDialog(
+            heading=f"„{old}“ benennen",
+            body="Der Name ersetzt das Label im Transkript. Die Stimme wird "
+                 "gemerkt und in künftigen Aufnahmen automatisch erkannt.")
+        entry = Gtk.Entry(placeholder_text="z. B. Anna", max_length=20,
+                          activates_default=True)
+        if not old.startswith("Sprecher "):
+            entry.set_text(old)
+        dlg.set_extra_child(entry)
+        dlg.add_response("cancel", "Abbrechen")
+        dlg.add_response("ok", "Benennen")
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("ok")
+
+        def done(r: dict, new: str) -> bool:
+            if "error" in r:
+                hint = {"bad_name": "Name bitte ohne Doppelpunkt, max. 20 Zeichen.",
+                        "speaker_not_found": "Sprecher nicht gefunden."}.get(
+                    r["error"], r["error"])
+                self._toast(f"Benennen fehlgeschlagen: {hint}")
+            else:
+                extra = " — wird künftig automatisch erkannt" if r.get("voice_saved") else ""
+                self._toast(f"„{new}“ gespeichert{extra} ✓")
+                if self._detail_base == base:
+                    self._load_detail_content(base)
+            return False
+
+        def on_resp(_d, resp):
+            if resp != "ok":
+                return
+            new = entry.get_text().strip()
+            if not new or ":" in new:
+                self._toast("Bitte einen Namen ohne Doppelpunkt eingeben.")
+                return
+
+            def work():
+                r = recorder_call("rename-speaker", base,
+                                  "--old", old, "--new", new, timeout=60)
+                GLib.idle_add(done, r, new)
+            threading.Thread(target=work, daemon=True).start()
+
+        dlg.connect("response", on_resp)
+        dlg.present(self.get_root())
 
     # ── detail: transcript search with highlight ────────────────────────────
 
@@ -3098,16 +3328,18 @@ class RecorderView(Gtk.Box):
             txt = ""
         self._detail["tr_view"].get_buffer().set_text(txt)
         self._detail["tr_scroller"].set_visible(has_txt)
-        self._detail["tr_actions"].set_visible(has_txt)
         self._detail["tr_empty"].set_visible(not has_txt and not busy)
 
         self._decorate_transcript()
         self._load_chapters(base)
+        self._load_speakers(base)
 
         self._load_notes(base)
-        # can only ask once a transcript exists
-        if self._detail.get("qa_btn") is not None:
-            self._detail["qa_btn"].set_sensitive(has_txt)
+        # search/copy/KI only make sense once a transcript exists
+        for key in ("search_toggle", "copy_btn", "ki_btn"):
+            widget = self._detail.get(key)
+            if widget is not None:
+                widget.set_sensitive(has_txt)
         self._update_detail_progress(base)
 
     def _update_detail_progress(self, base):
@@ -3129,6 +3361,11 @@ class RecorderView(Gtk.Box):
         d = self._read_progress(base)
         if d.get("status") == "loading":
             lbl.set_label("Lädt Modell …")
+            bar.pulse()
+            return
+        phase = self.POST_PHASES.get(str(d.get("status", "")))
+        if phase:
+            lbl.set_label(phase)
             bar.pulse()
             return
         pct = self._smoothed_pct(base)
@@ -3544,6 +3781,15 @@ class PrefsDialog(Adw.PreferencesDialog):
         self.speaker_profile_row.add_suffix(reset_btn)
         spk_group.add(self.speaker_profile_row)
         self._refresh_profile_row()
+        # Named voices: people renamed once in a recording, auto-recognized
+        # in all future recordings. Managed straight from here.
+        self.voices_row = Adw.ActionRow(
+            title="Bekannte Stimmen", activatable=True,
+            subtitle="Benenne Sprecher in einer Aufnahme — hier verwalten.")
+        self.voices_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+        self.voices_row.connect("activated", lambda *_: self._open_named_voices())
+        spk_group.add(self.voices_row)
+        self._refresh_voices_row()
         llm = Adw.PreferencesGroup(
             title="Textverbesserung (Ollama)",
             description="Optionaler LLM-Schritt: entfernt Füllwörter, korrigiert "
@@ -3834,6 +4080,61 @@ class PrefsDialog(Adw.PreferencesDialog):
             GLib.idle_add(self._refresh_profile_row)
             GLib.idle_add(self._toast, "Stimmprofil zurückgesetzt")
         threading.Thread(target=work, daemon=True).start()
+
+    # Named-voice registry (plain JSON next to the voice profile — the GUI
+    # can list/delete it without the venv, only diarization needs sherpa).
+    NAMED_VOICES_FILE = CACHE_DIR / "named-voices.json"
+
+    def _named_voices(self) -> dict:
+        try:
+            data = json.loads(self.NAMED_VOICES_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _refresh_voices_row(self) -> None:
+        names = sorted(self._named_voices())
+        self.voices_row.set_subtitle(
+            ", ".join(names) if names
+            else "Noch keine — benenne Sprecher in einer Aufnahme.")
+
+    def _open_named_voices(self) -> None:
+        voices = self._named_voices()
+        if not voices:
+            self._toast("Noch keine bekannten Stimmen — benenne einen Sprecher "
+                        "in einer Aufnahme.")
+            return
+        dlg = Adw.Dialog(title="Bekannte Stimmen", content_width=420)
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+        group = Adw.PreferencesGroup(
+            description="Diese Stimmen werden in neuen Aufnahmen automatisch "
+                        "erkannt und mit Namen beschriftet.",
+            margin_top=6, margin_bottom=18, margin_start=18, margin_end=18)
+        for name in sorted(voices):
+            count = int((voices.get(name) or {}).get("count", 1))
+            row = Adw.ActionRow(title=name,
+                                subtitle=f"aus {count} Aufnahme(n) gelernt")
+            row.add_prefix(Gtk.Image(icon_name="avatar-default-symbolic"))
+            remove = Gtk.Button(icon_name="user-trash-symbolic",
+                                valign=Gtk.Align.CENTER)
+            remove.add_css_class("flat")
+            remove.set_tooltip_text("Stimme vergessen")
+            remove.connect("clicked",
+                           lambda _b, n=name, r=row, g=group:
+                           (g.remove(r), self._delete_named_voice(n)))
+            row.add_suffix(remove)
+            group.add(row)
+        toolbar.set_content(group)
+        dlg.set_child(toolbar)
+        dlg.present(self.win)
+
+    def _delete_named_voice(self, name: str) -> None:
+        data = self._named_voices()
+        if data.pop(name, None) is not None:
+            atomic_write(self.NAMED_VOICES_FILE, json.dumps(data))
+        self._refresh_voices_row()
+        self._toast(f"Stimme „{name}“ vergessen")
 
     def _on_speaker_toggled(self, *_a) -> None:
         active = bool(self.speaker_row.get_active())

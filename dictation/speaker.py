@@ -155,6 +155,48 @@ def reset_profile() -> None:
     PROFILE_FILE.unlink(missing_ok=True)
 
 
+# ── Named voices: a global registry of people you renamed once ───────────────
+# {"Anna": {"vector": [...], "count": 3}, ...} — future diarizations match
+# clusters against these, so Anna is recognized automatically next time.
+
+NAMED_FILE = CACHE_DIR / "named-voices.json"
+
+
+def named_voices() -> dict[str, Any]:
+    try:
+        data = json.loads(NAMED_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_named_voice(name: str, vector) -> bool:
+    """Store or merge (running mean) one voice embedding under a real name."""
+    import numpy as np
+    vec = np.asarray(vector, dtype=np.float32)
+    if vec.size == 0:
+        return False
+    data = named_voices()
+    entry = data.get(name) or {}
+    count = int(entry.get("count", 0))
+    if count and entry.get("vector"):
+        prev = np.asarray(entry["vector"], dtype=np.float32)
+        merged = (prev * count + vec) / (count + 1)
+    else:
+        merged = vec
+    n = float(np.linalg.norm(merged))
+    merged = merged / n if n > 1e-9 else merged
+    data[name] = {"vector": merged.tolist(), "count": count + 1}
+    atomic_write(NAMED_FILE, json.dumps(data))
+    return True
+
+
+def delete_named_voice(name: str) -> None:
+    data = named_voices()
+    if data.pop(name, None) is not None:
+        atomic_write(NAMED_FILE, json.dumps(data))
+
+
 # ── Diarization + labeling ───────────────────────────────────────────────────
 
 def _get_diarizer():
@@ -173,23 +215,28 @@ def _get_diarizer():
     return _diarizer
 
 
-def diarize_and_label(samples, sr: int = SAMPLE_RATE, me_threshold: float = 0.45):
-    """Return [(start, end, label)] where the enrolled user is 'Ich' and
-    others are 'Sprecher 2/3…'. Returns [] on failure/unavailable.
+def diarize_and_label(samples, sr: int = SAMPLE_RATE, me_threshold: float = 0.45,
+                      named_threshold: float = 0.5):
+    """Return ([(start, end, label)], {label: embedding-list}).
+
+    The enrolled user becomes 'Ich', voices from the named registry get
+    their real name, everyone else 'Sprecher N'. The per-label embeddings
+    let the GUI enroll a voice into the registry when the user renames it.
+    Returns ([], {}) on failure/unavailable.
     """
     import numpy as np
     if not available():
-        return []
+        return [], {}
     try:
         sd = _get_diarizer()
         if sr != sd.sample_rate:  # sherpa expects 16 kHz
-            return []
+            return [], {}
         segments = sd.process(samples).sort_by_start_time()
     except Exception as exc:  # noqa: BLE001
         print(f"[speaker] diarize failed: {exc}", file=sys.stderr, flush=True)
-        return []
+        return [], {}
     if not segments:
-        return []
+        return [], {}
 
     profile = profile_vector()
     # Mean embedding per diarized cluster (re-embed each cluster's audio once).
@@ -214,16 +261,38 @@ def diarize_and_label(samples, sr: int = SAMPLE_RATE, me_threshold: float = 0.45
         if sims[best] >= me_threshold:
             me_cluster = best
 
-    # Stable labels: "Ich" for the matched cluster, "Sprecher N" for the rest.
+    # Named registry: greedy best-match, each name and each cluster used once.
+    # Slightly stricter threshold than 'Ich' — a wrong real name is worse
+    # than a neutral 'Sprecher 2'.
+    registry = {name: np.asarray(e["vector"], dtype=np.float32)
+                for name, e in named_voices().items()
+                if isinstance(e, dict) and e.get("vector")}
+    assigned: dict[int, str] = {}
+    if registry and means:
+        pairs = sorted(
+            ((float(np.dot(vec, m)), spk, name)
+             for spk, m in means.items() if spk != me_cluster
+             for name, vec in registry.items()),
+            key=lambda p: p[0], reverse=True)
+        for sim, spk, name in pairs:
+            if sim < named_threshold:
+                break
+            if spk in assigned or name in assigned.values():
+                continue
+            assigned[spk] = name
+
+    # Labels: 'Ich' > real name > 'Sprecher N' (numbered from 2 when the
+    # user is present, from 1 otherwise — matching how people count).
     order = sorted({r.speaker for r in segments})
     labels: dict[int, str] = {}
-    n = 1
+    counter = 1 if me_cluster is not None else 0
     for spk in order:
         if spk == me_cluster:
             labels[spk] = "Ich"
+        elif spk in assigned:
+            labels[spk] = assigned[spk]
         else:
-            n += 1
-            labels[spk] = f"Sprecher {n}"
-    if me_cluster is None:  # nobody matched: number everyone plainly
-        labels = {spk: f"Sprecher {i + 1}" for i, spk in enumerate(order)}
-    return [(r.start, r.end, labels[r.speaker]) for r in segments]
+            counter += 1
+            labels[spk] = f"Sprecher {counter}"
+    voices = {labels[spk]: m.tolist() for spk, m in means.items()}
+    return [(r.start, r.end, labels[r.speaker]) for r in segments], voices
