@@ -1022,7 +1022,7 @@ class WorkbenchView(Gtk.Box):
                              halign=Gtk.Align.CENTER)
         self.spinner = make_spinner(visible=False)
         status_row.append(self.spinner)
-        self.status = Gtk.Label(label="Bereit")
+        self.status = Gtk.Label(label="Bereit", visible=False)  # idle says nothing
         self.status.add_css_class("dimmed")
         status_row.append(self.status)
         hero.append(status_row)
@@ -1040,16 +1040,19 @@ class WorkbenchView(Gtk.Box):
         self._count_lbl.add_css_class("caption")
         self._count_lbl.add_css_class("dimmed")
         editor_head.append(self._count_lbl)
-        clear_btn = Gtk.Button(icon_name="edit-clear-all-symbolic", valign=Gtk.Align.CENTER)
-        clear_btn.add_css_class("flat")
-        clear_btn.set_tooltip_text("Leeren")
-        clear_btn.connect("clicked", lambda *_: self._set_text(""))
-        editor_head.append(clear_btn)
-        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
-        copy_btn.add_css_class("flat")
-        copy_btn.set_tooltip_text("Kopieren")
-        copy_btn.connect("clicked", self._copy)
-        editor_head.append(copy_btn)
+        # Clear/copy only exist once there is text — the empty stage stays empty.
+        self._clear_btn = Gtk.Button(icon_name="edit-clear-all-symbolic",
+                                     valign=Gtk.Align.CENTER, visible=False)
+        self._clear_btn.add_css_class("flat")
+        self._clear_btn.set_tooltip_text("Leeren")
+        self._clear_btn.connect("clicked", lambda *_: self._set_text(""))
+        editor_head.append(self._clear_btn)
+        self._copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
+                                    valign=Gtk.Align.CENTER, visible=False)
+        self._copy_btn.add_css_class("flat")
+        self._copy_btn.set_tooltip_text("Kopieren")
+        self._copy_btn.connect("clicked", self._copy)
+        editor_head.append(self._copy_btn)
         box.append(editor_head)
 
         # Borderless document editor — the text is the interface, no form box.
@@ -1124,6 +1127,8 @@ class WorkbenchView(Gtk.Box):
     def _on_buffer_changed(self, buf) -> None:
         chars = buf.get_char_count()
         self._placeholder.set_visible(chars == 0)
+        self._clear_btn.set_visible(chars > 0)
+        self._copy_btn.set_visible(chars > 0)
         if chars == 0:
             self._count_lbl.set_label("")
             return
@@ -1154,8 +1159,10 @@ class WorkbenchView(Gtk.Box):
         self.text_view.get_buffer().set_text(text)
 
     def _set_status(self, text: str, error: bool = False, busy: bool = False) -> None:
-        """One status line: gray for state, red for errors, spinner while busy."""
+        """One status line: gray for state, red for errors, spinner while busy.
+        The idle 'Bereit' says nothing and stays hidden."""
         self.status.set_text(text)
+        self.status.set_visible(bool(text) and (text != "Bereit" or busy or error))
         if error:
             self.status.remove_css_class("dimmed")
             self.status.add_css_class("error")
@@ -1397,12 +1404,14 @@ class RecorderView(Gtk.Box):
             self.rec_btn.remove_css_class("record-idle")
             self.rec_btn.add_css_class("destructive-action")
             self.rec_btn.add_css_class("record-live")
+            self.title_row.set_visible(True)
         else:
             self.rec_btn.set_icon_name("media-record-symbolic")
             self.rec_btn.set_tooltip_text("Aufnahme starten")
             self.rec_btn.remove_css_class("destructive-action")
             self.rec_btn.remove_css_class("record-live")
             self.rec_btn.add_css_class("record-idle")
+            self.title_row.set_visible(False)
 
     def _pause_button_state(self, paused: bool) -> None:
         self.pause_btn.set_icon_name(
@@ -1495,9 +1504,11 @@ class RecorderView(Gtk.Box):
         hero.append(self.timer_label)
 
         current_source = str(cfg.get("recorder_source", "both"))
+        src_line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                           halign=Gtk.Align.CENTER)
         if hasattr(Adw, "ToggleGroup"):
             # One-click switching between call (Mic+System) and lecture (Mic).
-            self._source_toggle = Adw.ToggleGroup(halign=Gtk.Align.CENTER)
+            self._source_toggle = Adw.ToggleGroup()
             self._source_toggle.add_css_class("flat")
             self._source_toggle.add_css_class("round")
             for value, label in (("both", "Mic + System"), ("system", "System"), ("mic", "Mic")):
@@ -1506,71 +1517,78 @@ class RecorderView(Gtk.Box):
                 self._source_toggle.add(toggle)
             self._source_toggle.set_active_name(current_source)
             self._source_toggle.connect("notify::active", self._on_source_changed)
-            hero.append(self._source_toggle)
+            src_line.append(self._source_toggle)
             self.source_row = None
         else:
             self._source_toggle = None
-        # Ghost entry: reads as a dim caption, becomes a field on focus.
+        gear = Gtk.Button(icon_name="emblem-system-symbolic", valign=Gtk.Align.CENTER)
+        gear.add_css_class("flat")
+        gear.add_css_class("circular")
+        gear.set_tooltip_text("Rekorder-Optionen — Geräte, Modell, Automatik")
+        gear.connect("clicked", lambda *_: self._open_recorder_options())
+        src_line.append(gear)
+        hero.append(src_line)
+        # Title entry only exists while recording — that's the moment naming
+        # makes sense. Typing live-renames the running recording.
         self.title_row = Gtk.Entry(halign=Gtk.Align.CENTER, width_chars=30, xalign=0.5)
         self.title_row.add_css_class("inline-title")
-        self.title_row.set_placeholder_text("Titel (optional)")
-        self.title_row.set_tooltip_text(
-            "Wird laufend gespeichert — ein Absturz kostet höchstens Sekunden.")
+        self.title_row.set_placeholder_text("Titel der Aufnahme …")
+        self.title_row.set_visible(False)
+        self.title_row.connect("changed", self._on_title_changed)
+        self._title_save_id = None
         hero.append(self.title_row)
         outer.append(hero)
 
-        # Two focused expanders instead of one 10-row scroll trap:
-        # "Aufnahme" (what you set per recording) and "Transkription" (rarer).
-        rec_opt_group = Adw.PreferencesGroup()
-        outer.append(rec_opt_group)
-        aufnahme = Adw.ExpanderRow(title="Aufnahme-Optionen",
-                                   subtitle="Geräte und Qualität")
-        rec_opt_group.add(aufnahme)
+        # All options live in one compact dialog behind the gear — the page
+        # itself stays: record button, source, recordings.
+        opts_page = Adw.PreferencesPage()
+        aufnahme = Adw.PreferencesGroup(title="Aufnahme",
+                                        description="Geräte und Qualität")
+        opts_page.add(aufnahme)
         if self._source_toggle is None:
             self.source_row = self._combo("Quelle", REC_SOURCE_OPTIONS, current_source)
             self.source_row.connect("notify::selected", self._on_source_changed)
-            aufnahme.add_row(self.source_row)
+            aufnahme.add(self.source_row)
         # Device combos start with just the defaults; the real list is filled in
         # asynchronously by _load_devices_async() so construction never blocks.
         self._mic_opts = [("", "Standard-Mikrofon")]
         self._mon_opts = [("", "Standard-Ausgang")]
         self.mic_row = self._combo("Mikrofon", self._mic_opts, "")
         self.mic_row.connect("notify::selected", self._on_device_changed)
-        aufnahme.add_row(self.mic_row)
+        aufnahme.add(self.mic_row)
         self.mon_row = self._combo("System-Ausgang (Monitor)", self._mon_opts, "")
         self.mon_row.connect("notify::selected", self._on_device_changed)
-        aufnahme.add_row(self.mon_row)
+        aufnahme.add(self.mon_row)
         self.quality_row = self._combo("Qualität", REC_QUALITY_OPTIONS, str(cfg.get("recorder_bitrate", "32k")))
         self.quality_row.connect("notify::selected",
                                  lambda *_: self._persist("recorder_bitrate", self._cv(self.quality_row, REC_QUALITY_OPTIONS)))
-        aufnahme.add_row(self.quality_row)
+        aufnahme.add(self.quality_row)
 
-        transkription = Adw.ExpanderRow(title="Transkription und Notizen",
-                                        subtitle="Modell, Sprache, Automatik, Export")
-        rec_opt_group.add(transkription)
+        transkription = Adw.PreferencesGroup(title="Transkription und Notizen")
+        opts_page.add(transkription)
         self.model_row = self._combo("Modell", REC_MODEL_OPTIONS, str(cfg.get("recorder_model", "large-v3")))
         self.model_row.connect("notify::selected",
                                lambda *_: self._persist("recorder_model", self._cv(self.model_row, REC_MODEL_OPTIONS)))
-        transkription.add_row(self.model_row)
+        transkription.add(self.model_row)
         self.lang_row = self._combo("Sprache", LANGUAGE_OPTIONS, str(cfg.get("recorder_language", "")).lower())
         self.lang_row.set_subtitle("Auto erkennt die Sprache selbst. Nur bei fester Sprache "
                                    "fließen Kontext-Prompt und Wörterbuch ein.")
         self.lang_row.connect("notify::selected",
                               lambda *_: self._persist("recorder_language", self._cv(self.lang_row, LANGUAGE_OPTIONS)))
-        transkription.add_row(self.lang_row)
+        transkription.add(self.lang_row)
         self.chunk_row = Adw.SpinRow.new_with_range(60, 900, 30)
         self.chunk_row.set_title("Chunk-Länge (s)")
         self.chunk_row.set_subtitle("Teil-Speicherung; Grenzen werden an Sprechpausen ausgerichtet")
         self.chunk_row.set_value(float(cfg.get("recorder_chunk_seconds", 300)))
         self.chunk_row.connect("notify::value",
                                lambda *_: self._persist("recorder_chunk_seconds", int(self.chunk_row.get_value())))
-        transkription.add_row(self.chunk_row)
+        transkription.add(self.chunk_row)
         self.auto_row = Adw.SwitchRow(title="Nach Stopp automatisch transkribieren",
                                       subtitle="Zusammenfassung danach manuell mit Fokus.")
         self.auto_row.set_active(bool(cfg.get("recorder_auto_process", False)))
         self.auto_row.connect("notify::active",
                               lambda *_: self._persist("recorder_auto_process", bool(self.auto_row.get_active())))
-        transkription.add_row(self.auto_row)
+        transkription.add(self.auto_row)
         # Auto-analysis pipeline: what runs by itself after each transcription.
         for attr, key, title, sub in (
             ("auto_title_row", "recorder_auto_title", "Titel automatisch vergeben",
@@ -1587,7 +1605,7 @@ class RecorderView(Gtk.Box):
             row.connect("notify::active",
                         lambda _r, _p, k=key, r=row: self._persist(k, bool(r.get_active())))
             setattr(self, attr, row)
-            transkription.add_row(row)
+            transkription.add(row)
         vault = str(cfg.get("obsidian_vault", "")).strip()
         self.vault_row = Adw.ActionRow(
             title="Obsidian-Vault",
@@ -1596,7 +1614,14 @@ class RecorderView(Gtk.Box):
         vault_btn.add_css_class("flat")
         vault_btn.connect("clicked", self._pick_vault)
         self.vault_row.add_suffix(vault_btn)
-        transkription.add_row(self.vault_row)
+        transkription.add(self.vault_row)
+
+        self._opts_dialog = Adw.Dialog(title="Rekorder-Optionen",
+                                       content_width=560, content_height=680)
+        opts_toolbar = Adw.ToolbarView()
+        opts_toolbar.add_top_bar(Adw.HeaderBar())
+        opts_toolbar.set_content(opts_page)
+        self._opts_dialog.set_child(opts_toolbar)
 
         viz_mode = str(cfg.get("audio_visualizer", "waves"))
         self._meters_group = Adw.PreferencesGroup(
@@ -1756,6 +1781,27 @@ class RecorderView(Gtk.Box):
         # otherwise they'll start with the new mode on the next on_shown().
         if self._meters_on:
             self._start_meters()
+
+    def _open_recorder_options(self) -> None:
+        self._opts_dialog.present(self.get_root())
+
+    def _on_title_changed(self, *_a) -> None:
+        """Live-rename the running recording (debounced)."""
+        if self._recording_base is None:
+            return
+        if self._title_save_id is not None:
+            GLib.source_remove(self._title_save_id)
+
+        def save() -> bool:
+            self._title_save_id = None
+            base = self._recording_base
+            title = self.title_row.get_text().strip()
+            if base and title:
+                threading.Thread(
+                    target=lambda: recorder_call("rename", base, "--title", title),
+                    daemon=True).start()
+            return False
+        self._title_save_id = GLib.timeout_add(800, save)
 
     # ── recording control ────────────────────────────────────────────────────
     def _toggle_record(self, *_):
@@ -4732,10 +4778,19 @@ class SettingsWindow(Adw.ApplicationWindow):
         if not has_entries:
             return
         import datetime as _dt
-        current_bucket = None
-        group = None
+        # Merge runs of identical dictations into one row with an 'n ×' badge
+        # — 'Vielen Dank.' three times in a row doesn't need three rows.
+        merged: list[tuple[str, list]] = []
         for entry in reversed(entries):
             text = str(entry.get("text", "")).strip()
+            if merged and merged[-1][0] == text:
+                merged[-1][1].append(entry)
+            else:
+                merged.append((text, [entry]))
+        current_bucket = None
+        group = None
+        for text, run in merged:
+            entry = run[0]  # newest of the run carries time + raw text
             ts = entry.get("ts")
             try:
                 when = _dt.datetime.fromtimestamp(float(ts))
@@ -4774,17 +4829,26 @@ class SettingsWindow(Adw.ApplicationWindow):
                 raw_btn.set_tooltip_text("Rohtext kopieren (vor KI-Bearbeitung)")
                 raw_btn.connect("clicked", lambda _b, t=raw: self._copy_text(t))
                 row.add_suffix(raw_btn)
-            load = Gtk.Button(label="In Werkbank", valign=Gtk.Align.CENTER)
+            load = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER)
             load.add_css_class("flat")
             load.add_css_class("row-actions")
+            load.set_tooltip_text("In der Werkbank weiterbearbeiten")
             load.connect("clicked", lambda _b, t=text: self._load_to_workbench(t))
             row.add_suffix(load)
             trash = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
             trash.add_css_class("flat")
             trash.add_css_class("row-actions")
-            trash.set_tooltip_text("Eintrag löschen")
-            trash.connect("clicked", lambda _b, t=ts: self._delete_history_entry(t))
+            trash.set_tooltip_text("Eintrag löschen" if len(run) == 1
+                                   else f"Alle {len(run)} Einträge löschen")
+            trash.connect("clicked",
+                          lambda _b, t=[e.get("ts") for e in run]:
+                          self._delete_history_entry(t))
             row.add_suffix(trash)
+            if len(run) > 1:
+                badge = Gtk.Label(label=f"{len(run)} ×", valign=Gtk.Align.CENTER)
+                badge.add_css_class("note-chip")
+                badge.set_tooltip_text(f"{len(run)} identische Diktate zusammengefasst")
+                row.add_suffix(badge)
             time_lbl = Gtk.Label(label=stamp, valign=Gtk.Align.CENTER)
             time_lbl.add_css_class("caption")
             time_lbl.add_css_class("numeric")
@@ -4820,12 +4884,13 @@ class SettingsWindow(Adw.ApplicationWindow):
             group.set_visible(group in visible_groups)
 
     def _delete_history_entry(self, ts) -> None:
+        doomed = set(ts) if isinstance(ts, (list, tuple, set)) else {ts}
         try:
             lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
             kept = []
             for line in lines:
                 try:
-                    if json.loads(line).get("ts") == ts:
+                    if json.loads(line).get("ts") in doomed:
                         continue
                 except Exception:
                     pass
