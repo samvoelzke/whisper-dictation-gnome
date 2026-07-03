@@ -1660,12 +1660,13 @@ class RecorderView(Gtk.Box):
             self._poll_id = GLib.timeout_add(400, self._poll_progress)
 
     # One-click summary styles for the common cases (free text stays possible).
+    # Protokoll first: the all-in-one (topics + decisions + resulting tasks).
     FOCUS_PRESETS = (
-        ("Vorlesungsnotizen",
-         "prüfungsrelevante Inhalte, Definitionen und Beispiele — als strukturierte Lernnotizen"),
         ("Protokoll",
          "besprochene Themen und getroffene Entscheidungen — als Protokoll, mit einem "
          "Abschnitt 'Nächste Schritte' für die daraus resultierenden Aufgaben"),
+        ("Vorlesungsnotizen",
+         "prüfungsrelevante Inhalte, Definitionen und Beispiele — als strukturierte Lernnotizen"),
         ("Action-Items",
          "Aufgaben, Verantwortliche und Fristen — als kompakte Action-Item-Liste"),
     )
@@ -1699,7 +1700,7 @@ class RecorderView(Gtk.Box):
                                               self._summarize(base, entry.get_text().strip())))
         dlg.present(self.get_root())
 
-    def _summarize(self, base, focus, label: str = "Notiz"):
+    def _summarize(self, base, focus, label: str = "Zusammenfassung"):
         if base in self._busy:
             return
         self._busy.add(base)
@@ -2490,13 +2491,18 @@ class RecorderView(Gtk.Box):
 
     def _note_label(self, note) -> str:
         label = str(note.get("label", "")).strip()
-        if label:
+        if label and label != "Notiz":
             return label
-        focus = str(note.get("focus", "")).strip()
-        for preset_label, preset_focus in self.FOCUS_PRESETS:
-            if focus == preset_focus:
-                return preset_label
-        return "Notiz"
+        # Older notes have no stored label — derive a meaningful one from
+        # the focus (or the note text for pre-label summaries).
+        hint = (str(note.get("focus", "")) + " " + str(note.get("text", ""))[:200]).lower()
+        if "protokoll" in hint:
+            return "Protokoll"
+        if "action-item" in hint or "aufgaben" in hint:
+            return "Action-Items"
+        if "lernnotizen" in hint or "prüfungsrelevant" in hint:
+            return "Vorlesungsnotizen"
+        return "Zusammenfassung"
 
     def _load_notes(self, base) -> None:
         """One tab per note next to 'Transkript' (rebuilt on every change)."""

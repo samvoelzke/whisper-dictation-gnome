@@ -734,7 +734,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     if not isinstance(notes, list):
         notes = []
     notes.append({
-        "label": (getattr(args, "label", "") or "Notiz").strip()[:30],
+        "label": (getattr(args, "label", "") or "Zusammenfassung").strip()[:30],
         "focus": focus,
         "created": datetime.now().isoformat(timespec="seconds"),
         "text": summary.strip(),
