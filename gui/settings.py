@@ -465,16 +465,6 @@ def install_app_css() -> None:
         .record-idle:active {
           background: alpha(@error_color, 0.26);
         }
-        /* Hero zones: a whisper of color behind the record areas - the eye
-           lands on the primary action without a single extra widget */
-        .hero-zone {
-          background: linear-gradient(to bottom,
-                      alpha(@accent_bg_color, 0.16),
-                      alpha(@accent_bg_color, 0.04) 70%,
-                      transparent);
-          border-radius: 20px;
-          padding: 22px 12px 16px 12px;
-        }
         /* Chat-style AI bar (Werkbank): one rounded pill holding the
            instruction entry and a round send button */
         .ai-bar {
@@ -1017,10 +1007,9 @@ class WorkbenchView(Gtk.Box):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         clamp.set_child(box)
 
-        # Hero: one big circular record button on a soft accent glow.
+        # Hero: one big circular record button, status underneath.
         hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
-                       margin_top=4)
-        hero.add_css_class("hero-zone")
+                       halign=Gtk.Align.CENTER, margin_top=8)
         self.rec_btn = Gtk.Button(icon_name="media-record-symbolic",
                                   halign=Gtk.Align.CENTER)
         self.rec_btn.add_css_class("circular")
@@ -1478,8 +1467,7 @@ class RecorderView(Gtk.Box):
         # Hero: big circular record button + pause + timer, source toggle and
         # title underneath (GNOME-Sound-Recorder-style, no form rows).
         hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                       margin_top=4)
-        hero.add_css_class("hero-zone")
+                       halign=Gtk.Align.CENTER, margin_top=8)
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16,
                            halign=Gtk.Align.CENTER)
         self.pause_btn = Gtk.Button(icon_name="media-playback-pause-symbolic",
