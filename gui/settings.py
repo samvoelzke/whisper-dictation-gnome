@@ -339,10 +339,11 @@ REC_SOURCE_SHORT = {"both": "Mic+System", "system": "System", "mic": "Mic",
                     "import": "Importiert"}
 
 # Speaker-embedding models (see dictation/speaker.py EMBED_MODELS).
+# Labels stay short — combo popups clip long text; details go in the subtitle.
 SPK_MODEL_OPTIONS = [
-    ("campplus", "CAM++ · 27 MB — schnell (Standard)"),
-    ("eres2netv2", "ERes2NetV2 · 68 MB — genauer, ~3× Rechenzeit"),
-    ("resnet293", "ResNet293 · 109 MB — maximal, ~5× Rechenzeit"),
+    ("campplus", "Schnell (CAM++)"),
+    ("eres2netv2", "Genauer (ERes2NetV2)"),
+    ("resnet293", "Maximal (ResNet293)"),
 ]
 
 # Recorder-specific model / quality choices, surfaced directly in the tab.
@@ -460,18 +461,20 @@ def install_app_css() -> None:
           min-height: 42px;
           -gtk-icon-size: 17px;
         }
-        /* Idle record button: soft red tint (red dot = record, universally
-           understood); while recording the button switches to solid
-           destructive red with a stop icon. */
+        /* Idle record button: juicy solid red with a soft glow - THE button
+           of the app. While recording it switches to destructive red with a
+           stop icon and the sonar pulse. */
         .record-idle {
-          color: @error_color;
-          background: alpha(@error_color, 0.1);
+          color: #ffffff;
+          background: linear-gradient(160deg, #f66151, #c01c28);
+          box-shadow: 0 3px 14px alpha(#e01b24, 0.35);
         }
         .record-idle:hover {
-          background: alpha(@error_color, 0.18);
+          background: linear-gradient(160deg, #f0554a, #a51d2d);
         }
         .record-idle:active {
-          background: alpha(@error_color, 0.26);
+          background: linear-gradient(160deg, #d94b41, #8f1d28);
+          box-shadow: 0 1px 6px alpha(#e01b24, 0.35);
         }
         /* Chat-style AI bar (Werkbank): one rounded pill holding the
            instruction entry and a round send button */
@@ -1522,8 +1525,9 @@ class RecorderView(Gtk.Box):
         current_source = str(cfg.get("recorder_source", "both"))
         if hasattr(Adw, "ToggleGroup"):
             # One-click switching between call (Mic+System) and lecture (Mic).
-            # A real segmented pill — not flat text — so it reads as a control.
+            # flat+round = the same quiet look as the app's tab switchers.
             self._source_toggle = Adw.ToggleGroup(halign=Gtk.Align.CENTER)
+            self._source_toggle.add_css_class("flat")
             self._source_toggle.add_css_class("round")
             for value, label in (("both", "Mic + System"), ("system", "System"), ("mic", "Mic")):
                 toggle = Adw.Toggle(label=label)
@@ -4063,8 +4067,8 @@ class PrefsDialog(Adw.PreferencesDialog):
             "Stimm-Modell", SPK_MODEL_OPTIONS,
             str(self.config.get("speaker_embed_model", "campplus")))
         self.spk_model_row.set_subtitle(
-            "Stimmprofil und bekannte Stimmen werden pro Modell getrennt "
-            "gespeichert — Wechsel heißt neu anlernen.")
+            "Schnell 27 MB · Genauer 68 MB (~3× Zeit) · Maximal 109 MB (~5×). "
+            "Profil und Stimmen werden pro Modell getrennt gespeichert.")
         self.spk_model_row.connect("notify::selected", self._on_spk_model_changed)
         spk_group.add(self.spk_model_row)
         self.speaker_profile_row = Adw.ActionRow(title="Stimmprofil")
