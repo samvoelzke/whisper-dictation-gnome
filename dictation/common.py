@@ -122,6 +122,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # After transcription, let Ollama suggest a short title when the
     # recording still has the default one.
     "recorder_auto_title": True,
+    # After transcription, let Ollama detect topic chapters (clickable
+    # jump marks under the player). Only for recordings >= 2 min.
+    "recorder_auto_chapters": True,
     # Obsidian vault folder for exporting transcripts/notes ("" = ask once).
     "obsidian_vault": "",
     # Personal dictionary: names/jargon (list of strings). Biases recognition

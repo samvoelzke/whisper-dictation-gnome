@@ -637,6 +637,11 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     _progress(duration if have_dur else pos, "done", segs)
     chars = len(txt_path.read_text()) if txt_path.exists() else 0
     _maybe_auto_title(base, cfg)
+    if cfg.get("recorder_auto_chapters", True) and (duration if have_dur else pos) >= 120:
+        try:
+            cmd_chapters(argparse.Namespace(base=base))
+        except Exception as exc:  # noqa: BLE001 — best effort
+            print(f"[recorder] chapters skipped: {exc}", file=sys.stderr, flush=True)
     _notify("Transkription fertig", f"{base} ({chars} Zeichen)")
     print(json.dumps({"base": base, "status": "done", "chars": chars}))
     if args.then_summarize:
@@ -709,6 +714,55 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chapters(args: argparse.Namespace) -> int:
+    """Detect topic chapters via Ollama -> base.chapters.json (jump marks)."""
+    import re
+    base = args.base
+    txt_path = RECORDINGS_DIR / f"{base}.txt"
+    if not txt_path.exists():
+        print(json.dumps({"error": "transcript_not_found", "base": base}))
+        return 1
+    transcript = txt_path.read_text(encoding="utf-8").strip()
+    if not transcript:
+        print(json.dumps({"error": "empty_transcript", "base": base}))
+        return 1
+    cfg = load_config()
+
+    # Condensed view: per paragraph only the [mm:ss] marker + the first words
+    # — plenty for topic detection and tiny for the LLM context.
+    lines = [p.strip()[:160] for p in transcript.split("\n\n") if p.strip()]
+    condensed = "\n".join(lines)
+    raw = _ollama_chat(
+        cfg,
+        "Du erstellst Kapitelmarken fuer eine Audio-Aufnahme, wie YouTube-Kapitel. "
+        "Antworte AUSSCHLIESSLICH mit einer JSON-Liste: "
+        '[{"time": "mm:ss", "title": "..."}]. Verwende NUR Zeitmarken, die im '
+        "Text vorkommen. 3 bis 8 Kapitel, Titel maximal 5 Woerter, in der "
+        "Sprache des Inhalts. Das erste Kapitel beginnt bei der ersten Zeitmarke.",
+        condensed, timeout=240)
+
+    # Only timestamps that really exist in the transcript count — small
+    # models happily invent plausible-looking ones otherwise.
+    valid_stamps = {m.group(1) for m in re.finditer(r"\[(\d+:\d{2}(?::\d{2})?)\]", transcript)}
+    chapters: list[dict[str, str]] = []
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if match:
+        try:
+            for c in json.loads(match.group(0)):
+                t = str(c.get("time", "")).strip()
+                title = str(c.get("title", "")).strip()
+                if t in valid_stamps and title:
+                    chapters.append({"time": t, "title": title[:60]})
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+    if not chapters:
+        print(json.dumps({"error": "no_chapters", "base": base}))
+        return 1
+    _write_json(RECORDINGS_DIR / f"{base}.chapters.json", chapters)
+    print(json.dumps({"base": base, "chapters": chapters}))
+    return 0
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     """Answer a content question strictly from the transcript (Q&A)."""
     base = args.base
@@ -716,7 +770,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if not txt_path.exists():
         print(json.dumps({"error": "transcript_not_found", "base": base}))
         return 1
-    transcript = _strip_markers(txt_path.read_text(encoding="utf-8")).strip()
+    # Markers stay in: the model cites [mm:ss] so the GUI can offer jumps.
+    transcript = txt_path.read_text(encoding="utf-8").strip()
     question = (args.question or "").strip()
     if not transcript or not question:
         print(json.dumps({"error": "empty_transcript_or_question", "base": base}))
@@ -726,7 +781,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
     system = (
         "Du beantwortest Fragen zu einer Audio-Transkription praezise und NUR "
         "anhand des gegebenen Texts. Steht die Antwort nicht im Text, sage das "
-        "ehrlich. Antworte in der Sprache der Frage, kompakt und konkret."
+        "ehrlich. Antworte in der Sprache der Frage, kompakt und konkret. "
+        "Nenne, wo passend, die [mm:ss]-Zeitmarke(n) aus dem Transkript, an "
+        "denen die Stelle vorkommt."
     )
     blocks = _split_words(transcript, 3000)
     if len(blocks) == 1:
@@ -786,7 +843,8 @@ def cmd_list(_args: argparse.Namespace) -> int:
 
 def cmd_delete(args: argparse.Namespace) -> int:
     base = args.base
-    for suffix in (".opus", ".meta.json", ".txt", ".progress.json", ".summary.md"):
+    for suffix in (".opus", ".meta.json", ".txt", ".progress.json",
+                   ".summary.md", ".chapters.json"):
         (RECORDINGS_DIR / f"{base}{suffix}").unlink(missing_ok=True)
     print(json.dumps({"base": base, "status": "deleted"}))
     return 0
@@ -836,6 +894,10 @@ def main() -> int:
     s.add_argument("base")
     s.add_argument("--question", default="")
     s.set_defaults(func=cmd_ask)
+
+    s = sub.add_parser("chapters")
+    s.add_argument("base")
+    s.set_defaults(func=cmd_chapters)
 
     s = sub.add_parser("delete")
     s.add_argument("base")

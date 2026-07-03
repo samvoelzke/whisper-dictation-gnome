@@ -192,9 +192,14 @@ ein Absturz nicht alles verliert:
    Teil-Transkript + Fortschritt werden nach **jedem** Chunk gespeichert →
    abbruchsicher und fortsetzbar (auch nach Absturz/Kill, inkl. abgeschnittener
    Dateien ohne Dauer-Metadaten). Chunk-Länge: `recorder_chunk_seconds`.
-   Das Transkript bekommt **`[mm:ss]`-Zeitmarken** pro Absatz — ein Klick auf
-   eine Marke springt im Player genau dorthin. Danach schlägt die KI
-   automatisch einen **Titel** vor (abschaltbar: `recorder_auto_title`).
+   Das Transkript bekommt **`[mm:ss]`-Zeitmarken** pro Absatz (farbig
+   hervorgehoben) — ein Klick auf eine Marke springt im Player genau dorthin.
+   Danach schlägt die KI automatisch einen **Titel** vor (abschaltbar:
+   `recorder_auto_title`) und erkennt bei Aufnahmen ab 2 Minuten
+   **Themen-Kapitel** wie bei YouTube: klickbare Sprungmarken unter dem
+   Player (abschaltbar: `recorder_auto_chapters`; manuell über ⋮ → „Kapitel
+   erkennen"). Auch „Frag die Aufnahme" zitiert Zeitmarken — mit
+   Sprung-Knopf direkt zur Stelle.
 3. **Zusammenfassung** – optional via Ollama (Map-Reduce). Ein Klick auf ein
    **Preset** (Vorlesungsnotizen / Meeting-Protokoll / Action-Items) oder ein
    eigener **Fokus-Prompt** (z. B. „prüfungsrelevante Definitionen") liefert

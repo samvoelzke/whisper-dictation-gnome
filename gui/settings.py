@@ -414,6 +414,22 @@ def _die_with_parent():
         pass
 
 
+def pw_record_cmd(device: str) -> list[str]:
+    """Build the pw-record command for a capture target.
+
+    pw-record cannot resolve Pulse-style '<sink>.monitor' names — it silently
+    falls back to the DEFAULT SOURCE (the mic!), so a 'System' meter would
+    show microphone waves. Monitors are captured from the sink node itself
+    via stream.capture.sink=true (verified against a test tone).
+    """
+    cmd = ["pw-record"]
+    if device.endswith(".monitor"):
+        cmd += ["--target", device[: -len(".monitor")], "-P", "stream.capture.sink=true"]
+    else:
+        cmd += ["--target", device]
+    return cmd + ["--rate", "16000", "--channels", "1", "--format", "s16", "-"]
+
+
 def default_source_name() -> str:
     """The default PipeWire mic source name (for live meters)."""
     try:
@@ -567,8 +583,7 @@ class LevelMeter:
         def work():
             try:
                 proc = subprocess.Popen(
-                    ["pw-record", "--target", device, "--rate", "16000",
-                     "--channels", "1", "--format", "s16", "-"],
+                    pw_record_cmd(device),
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                     preexec_fn=_die_with_parent)
             except FileNotFoundError:
@@ -1114,16 +1129,16 @@ class RecorderView(Gtk.Box):
         self._meters_group = Adw.PreferencesGroup(
             title="Live-Pegel", description="Wird während der Aufnahme angezeigt.")
         outer.append(self._meters_group)
-        mic_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        mic_box.append(Gtk.Label(label="🎤 Mikrofon", xalign=0, css_classes=["dim-label"]))
+        self._mic_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._mic_box.append(Gtk.Label(label="Mikrofon", xalign=0, css_classes=["dim-label"]))
         self._mic_viz = AudioVisualizer(mode=viz_mode)
-        mic_box.append(self._mic_viz)
-        self._meters_group.add(mic_box)
-        sys_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_top=8)
-        sys_box.append(Gtk.Label(label="🔊 System-Ton", xalign=0, css_classes=["dim-label"]))
+        self._mic_box.append(self._mic_viz)
+        self._meters_group.add(self._mic_box)
+        self._sys_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_top=8)
+        self._sys_box.append(Gtk.Label(label="System-Ton", xalign=0, css_classes=["dim-label"]))
         self._sys_viz = AudioVisualizer(mode=viz_mode)
-        sys_box.append(self._sys_viz)
-        self._meters_group.add(sys_box)
+        self._sys_box.append(self._sys_viz)
+        self._meters_group.add(self._sys_box)
         self._meters_group.set_visible(False)
 
         # Recordings are grouped by date (Heute/Gestern/…) at refresh time.
@@ -1199,9 +1214,16 @@ class RecorderView(Gtk.Box):
         src = self._current_source()
         mic = self._cv(self.mic_row, self._mic_opts) or self._default_mic
         mon = self._cv(self.mon_row, self._mon_opts) or self._default_monitor
-        if src in ("both", "mic") and mic:
+        # Only the meters of active sources are shown — an always-empty
+        # 'Mikrofon' row during a system-only recording just confuses.
+        show_mic = src in ("both", "mic")
+        show_sys = src in ("both", "system")
+        if hasattr(self, "_mic_box"):
+            self._mic_box.set_visible(show_mic)
+            self._sys_box.set_visible(show_sys)
+        if show_mic and mic:
             self._spawn_meter(mic, self._mic_viz)
-        if src in ("both", "system") and mon:
+        if show_sys and mon:
             self._spawn_meter(mon, self._sys_viz)
 
     def _spawn_meter(self, device, viz):
@@ -1213,8 +1235,7 @@ class RecorderView(Gtk.Box):
                 # pw-record is the reliable PipeWire capture (parec can yield no
                 # data on some setups). "-" streams raw s16 to stdout.
                 proc = subprocess.Popen(
-                    ["pw-record", "--target", device, "--rate", "16000",
-                     "--channels", "1", "--format", "s16", "-"],
+                    pw_record_cmd(device),
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                     preexec_fn=_die_with_parent)
             except FileNotFoundError:
@@ -1781,6 +1802,23 @@ class RecorderView(Gtk.Box):
             self._detail["play_btn"] = play_btn
             self._detail["play_lbl"] = play_lbl
 
+        # chapters (AI-detected topic jump marks, filled in _load_chapters)
+        chapters_row = Gtk.ListBoxRow(activatable=False, selectable=False)
+        if hasattr(Adw, "WrapBox"):
+            chapters_box = Adw.WrapBox(child_spacing=6, line_spacing=6)
+        else:
+            chapters_box = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                                       column_spacing=6, row_spacing=6)
+        chapters_box.set_margin_top(6)
+        chapters_box.set_margin_bottom(8)
+        chapters_box.set_margin_start(10)
+        chapters_box.set_margin_end(10)
+        chapters_row.set_child(chapters_box)
+        chapters_row.set_visible(False)
+        info.add(chapters_row)
+        self._detail["chapters_row"] = chapters_row
+        self._detail["chapters_box"] = chapters_box
+
         # progress (transcription / summary)
         prog_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self._detail["progress_box"] = prog_box
@@ -1891,6 +1929,7 @@ class RecorderView(Gtk.Box):
         actions = Gio.SimpleActionGroup()
         for name, callback in (
             ("ask", lambda: self._open_qa(base)),
+            ("chapters", lambda: self._make_chapters(base)),
             ("export-obsidian", lambda: self._export_obsidian(base)),
             ("retranscribe", lambda: self._confirm_retranscribe(base)),
             ("open-folder", self._open_folder),
@@ -1903,6 +1942,7 @@ class RecorderView(Gtk.Box):
         menu = Gio.Menu()
         section = Gio.Menu()
         section.append("Frag die Aufnahme …", "detail.ask")
+        section.append("Kapitel erkennen", "detail.chapters")
         section.append("Nach Obsidian exportieren", "detail.export-obsidian")
         section.append("Erneut transkribieren", "detail.retranscribe")
         section.append("Ordner öffnen", "detail.open-folder")
@@ -1921,6 +1961,18 @@ class RecorderView(Gtk.Box):
     # ── detail: player seek + clickable transcript markers ──────────────────
 
     _TS_RE = re.compile(r"\[(\d+):(\d{2})(?::(\d{2}))?\]")
+
+    @classmethod
+    def _ts_to_seconds(cls, stamp: str) -> int | None:
+        if not stamp.startswith("["):
+            stamp = f"[{stamp}]"
+        m = cls._TS_RE.fullmatch(stamp)
+        if not m:
+            return None
+        first, mm, ss = m.group(1), m.group(2), m.group(3)
+        if ss is not None:
+            return int(first) * 3600 + int(mm) * 60 + int(ss)
+        return int(first) * 60 + int(mm)
 
     def _seek_to(self, seconds: float) -> None:
         if self._media is None:
@@ -1953,13 +2005,85 @@ class RecorderView(Gtk.Box):
         offset = it.get_line_offset()
         for m in self._TS_RE.finditer(line):
             if m.start() <= offset <= m.end():
-                first, mm, ss = m.group(1), m.group(2), m.group(3)
-                if ss is not None:
-                    seconds = int(first) * 3600 + int(mm) * 60 + int(ss)
-                else:
-                    seconds = int(first) * 60 + int(mm)
-                self._seek_to(seconds)
+                seconds = self._ts_to_seconds(m.group(0))
+                if seconds is not None:
+                    self._seek_to(seconds)
                 return
+
+    def _decorate_transcript(self) -> None:
+        """Timestamps get accent color + bold — the transcript reads as
+        structured paragraphs instead of a gray wall of text."""
+        view = self._detail.get("tr_view")
+        if view is None:
+            return
+        buf = view.get_buffer()
+        tag = buf.get_tag_table().lookup("ts-marker")
+        if tag is None:
+            r, g, b = accent_rgb()
+            rgba = Gdk.RGBA()
+            rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
+            tag = buf.create_tag("ts-marker", weight=700, scale=0.85)
+            tag.set_property("foreground-rgba", rgba)
+        start, end = buf.get_bounds()
+        buf.remove_tag(tag, start, end)
+        text = buf.get_text(start, end, False)
+        for m in self._TS_RE.finditer(text):
+            buf.apply_tag(tag,
+                          buf.get_iter_at_offset(m.start()),
+                          buf.get_iter_at_offset(m.end()))
+
+    def _load_chapters(self, base) -> None:
+        row = self._detail.get("chapters_row")
+        box = self._detail.get("chapters_box")
+        if row is None or box is None:
+            return
+        child = box.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            box.remove(child)
+            child = nxt
+        try:
+            chapters = json.loads(
+                (RECORDINGS_DIR / f"{base}.chapters.json").read_text(encoding="utf-8"))
+        except Exception:
+            chapters = []
+        usable = (isinstance(chapters, list) and chapters
+                  and self._media is not None)
+        row.set_visible(bool(usable))
+        if not usable:
+            return
+        for chapter in chapters:
+            stamp = str(chapter.get("time", ""))
+            title = str(chapter.get("title", "")).strip()
+            seconds = self._ts_to_seconds(stamp)
+            if seconds is None or not title:
+                continue
+            btn = Gtk.Button(label=f"{stamp} · {title}")
+            btn.add_css_class("flat")
+            btn.add_css_class("chip")
+            btn.set_tooltip_text("Im Audio dorthin springen")
+            btn.connect("clicked", lambda _b, s=seconds: self._seek_to(s))
+            box.append(btn)
+
+    def _make_chapters(self, base) -> None:
+        if not (RECORDINGS_DIR / f"{base}.txt").exists():
+            self._toast("Erst transkribieren — Kapitel entstehen aus dem Transkript.")
+            return
+        self._toast("Erkenne Kapitel …")
+
+        def done(r: dict) -> bool:
+            if "error" in r:
+                self._toast(f"Kapitel fehlgeschlagen: {r['error']}")
+            else:
+                self._toast(f"{len(r.get('chapters', []))} Kapitel erkannt ✓")
+                if self._detail_base == base:
+                    self._load_chapters(base)
+            return False
+
+        def work():
+            r = recorder_call("chapters", base, timeout=300)
+            GLib.idle_add(done, r)
+        threading.Thread(target=work, daemon=True).start()
 
     # ── detail: transcript search with highlight ────────────────────────────
 
@@ -2126,8 +2250,29 @@ class RecorderView(Gtk.Box):
                     a_lbl.remove_css_class("dim-label")
                     a_lbl.add_css_class("error")
                 else:
-                    a_lbl.set_text(str(r.get("answer", "")).strip() or "(keine Antwort)")
+                    answer = str(r.get("answer", "")).strip() or "(keine Antwort)"
+                    a_lbl.set_text(answer)
                     a_lbl.remove_css_class("dim-label")
+                    # Cited [mm:ss] marks become jump buttons into the audio.
+                    stamps: list[str] = []
+                    for match in self._TS_RE.finditer(answer):
+                        if match.group(0) not in stamps:
+                            stamps.append(match.group(0))
+                    if stamps and self._media is not None:
+                        chips = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                                        spacing=6)
+                        for stamp in stamps[:6]:
+                            seconds = self._ts_to_seconds(stamp)
+                            if seconds is None:
+                                continue
+                            jump = Gtk.Button(label=f"▶ {stamp.strip('[]')}")
+                            jump.add_css_class("flat")
+                            jump.add_css_class("chip")
+                            jump.set_tooltip_text("Im Audio dorthin springen")
+                            jump.connect("clicked",
+                                         lambda _b, s=seconds: self._seek_to(s))
+                            chips.append(jump)
+                        item.append(chips)
             except Exception:
                 pass  # Detail-Seite wurde inzwischen geschlossen
             return False
@@ -2241,6 +2386,9 @@ class RecorderView(Gtk.Box):
         self._detail["tr_scroller"].set_visible(has_txt)
         self._detail["tr_actions"].set_visible(has_txt)
         self._detail["tr_empty"].set_visible(not has_txt and not busy)
+
+        self._decorate_transcript()
+        self._load_chapters(base)
 
         notes = self._notes_text()
         has_notes = bool(notes.strip())
