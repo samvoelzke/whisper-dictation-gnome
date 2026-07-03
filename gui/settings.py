@@ -819,7 +819,7 @@ def fmt_duration(seconds: float) -> str:
     seconds = int(seconds or 0)
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d} h" if h else f"{m}:{s:02d} min"
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def fmt_size(num_bytes: int) -> str:
@@ -1510,12 +1510,10 @@ class RecorderView(Gtk.Box):
         hero.append(self.timer_label)
 
         current_source = str(cfg.get("recorder_source", "both"))
-        src_line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
-                           halign=Gtk.Align.CENTER)
         if hasattr(Adw, "ToggleGroup"):
             # One-click switching between call (Mic+System) and lecture (Mic).
-            self._source_toggle = Adw.ToggleGroup()
-            self._source_toggle.add_css_class("flat")
+            # A real segmented pill — not flat text — so it reads as a control.
+            self._source_toggle = Adw.ToggleGroup(halign=Gtk.Align.CENTER)
             self._source_toggle.add_css_class("round")
             for value, label in (("both", "Mic + System"), ("system", "System"), ("mic", "Mic")):
                 toggle = Adw.Toggle(label=label)
@@ -1523,24 +1521,10 @@ class RecorderView(Gtk.Box):
                 self._source_toggle.add(toggle)
             self._source_toggle.set_active_name(current_source)
             self._source_toggle.connect("notify::active", self._on_source_changed)
-            src_line.append(self._source_toggle)
+            hero.append(self._source_toggle)
             self.source_row = None
         else:
             self._source_toggle = None
-        imp = Gtk.Button(icon_name="document-open-symbolic", valign=Gtk.Align.CENTER)
-        imp.add_css_class("flat")
-        imp.add_css_class("circular")
-        imp.set_tooltip_text("Audio/Video-Datei importieren und transkribieren "
-                             "— oder einfach hierher ziehen")
-        imp.connect("clicked", lambda *_: self._open_import_dialog())
-        src_line.append(imp)
-        gear = Gtk.Button(icon_name="emblem-system-symbolic", valign=Gtk.Align.CENTER)
-        gear.add_css_class("flat")
-        gear.add_css_class("circular")
-        gear.set_tooltip_text("Rekorder-Optionen — Geräte, Modell, Automatik")
-        gear.connect("clicked", lambda *_: self._open_recorder_options())
-        src_line.append(gear)
-        hero.append(src_line)
         # Title entry only exists while recording — that's the moment naming
         # makes sense. Typing live-renames the running recording.
         self.title_row = Gtk.Entry(halign=Gtk.Align.CENTER, width_chars=30, xalign=0.5)
@@ -1651,6 +1635,29 @@ class RecorderView(Gtk.Box):
         self._sys_box.append(self._sys_viz)
         self._meters_group.add(self._sys_box)
         self._meters_group.set_visible(False)
+
+        # Library header: title left, import/options/refresh right — always
+        # reachable, even while the library is still empty.
+        lib_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        lib_title = Gtk.Label(label="Aufnahmen", xalign=0, hexpand=True)
+        lib_title.add_css_class("heading")
+        lib_head.append(lib_title)
+        for icon, tip, cb in (
+            ("document-open-symbolic",
+             "Audio/Video importieren und transkribieren — oder Datei "
+             "einfach hierher ziehen",
+             lambda *_: self._open_import_dialog()),
+            ("emblem-system-symbolic",
+             "Rekorder-Optionen — Geräte, Modell, Automatik",
+             lambda *_: self._open_recorder_options()),
+            ("view-refresh-symbolic", "Aktualisieren", lambda *_: self.refresh()),
+        ):
+            btn = Gtk.Button(icon_name=icon, valign=Gtk.Align.CENTER)
+            btn.add_css_class("flat")
+            btn.set_tooltip_text(tip)
+            btn.connect("clicked", cb)
+            lib_head.append(btn)
+        outer.append(lib_head)
 
         # Recordings are grouped by date (Heute/Gestern/…) at refresh time.
         self._list_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
@@ -2049,13 +2056,6 @@ class RecorderView(Gtk.Box):
             group = groups.get(bucket)
             if group is None:
                 group = Adw.PreferencesGroup(title=bucket)
-                if not groups:  # first (newest) group carries the refresh button
-                    refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic",
-                                             valign=Gtk.Align.CENTER)
-                    refresh_btn.add_css_class("flat")
-                    refresh_btn.set_tooltip_text("Aktualisieren")
-                    refresh_btn.connect("clicked", lambda *_: self.refresh())
-                    group.set_header_suffix(refresh_btn)
                 groups[bucket] = group
                 self._list_container.append(group)
             self._add_row(item, group)
@@ -2103,6 +2103,7 @@ class RecorderView(Gtk.Box):
         else:
             ico = "audio-input-microphone-symbolic"
         prefix_icon = Gtk.Image(icon_name=ico, valign=Gtk.Align.CENTER)
+        prefix_icon.add_css_class("dimmed")  # quiet state marker, not content
         if tooltip:
             prefix_icon.set_tooltip_text(tooltip)
         row.add_prefix(prefix_icon)
