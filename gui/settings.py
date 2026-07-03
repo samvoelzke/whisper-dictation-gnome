@@ -443,9 +443,9 @@ def install_app_css() -> None:
         }
         /* Hero record buttons (GNOME-Sound-Recorder-style) */
         .record-circle {
-          min-width: 64px;
-          min-height: 64px;
-          -gtk-icon-size: 26px;
+          min-width: 76px;
+          min-height: 76px;
+          -gtk-icon-size: 30px;
         }
         .record-circle-small {
           min-width: 42px;
@@ -469,11 +469,11 @@ def install_app_css() -> None:
            lands on the primary action without a single extra widget */
         .hero-zone {
           background: linear-gradient(to bottom,
-                      alpha(@accent_bg_color, 0.10),
-                      alpha(@accent_bg_color, 0.02) 70%,
+                      alpha(@accent_bg_color, 0.16),
+                      alpha(@accent_bg_color, 0.04) 70%,
                       transparent);
-          border-radius: 18px;
-          padding: 18px 12px 14px 12px;
+          border-radius: 20px;
+          padding: 22px 12px 16px 12px;
         }
         /* Chat-style AI bar (Werkbank): one rounded pill holding the
            instruction entry and a round send button */
@@ -566,8 +566,8 @@ def install_app_css() -> None:
           font-size: 0.85em;
         }
         .hero-timer {
-          font-size: 1.5em;
-          font-weight: 300;
+          font-size: 2.2em;
+          font-weight: 200;
         }
         .hero-hint {
           font-size: 0.85em;
@@ -1063,46 +1063,35 @@ class WorkbenchView(Gtk.Box):
         editor_head.append(copy_btn)
         box.append(editor_head)
 
+        # Borderless document editor — the text is the interface, no form box.
         scroller = Gtk.ScrolledWindow(vexpand=True)
-        scroller.add_css_class("card")
-        scroller.add_css_class("editor-card")
         self.text_view = Gtk.TextView(
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
-            top_margin=12, bottom_margin=12, left_margin=12, right_margin=12,
+            top_margin=10, bottom_margin=24, left_margin=6, right_margin=6,
+            pixels_above_lines=3, pixels_inside_wrap=5,
         )
-        self.text_view.add_css_class("editor-view")
+        apply_document_style(self.text_view)
         scroller.set_child(self.text_view)
-        # Placeholder in the empty editor (vanishes with the first character).
+        # Empty stage instead of a tiny placeholder line (vanishes on typing).
         overlay = Gtk.Overlay()
         overlay.set_child(scroller)
-        self._placeholder = Gtk.Label(
-            label="Diktiere mit dem Aufnahme-Knopf –\noder tippe einfach los …",
-            halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
-            justify=Gtk.Justification.CENTER,
-        )
-        self._placeholder.add_css_class("dimmed")
+        stage = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                        halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        stage_title = Gtk.Label(label="Sprich einfach los.")
+        stage_title.add_css_class("title-1")
+        stage_title.add_css_class("dimmed")
+        stage.append(stage_title)
+        stage_sub = Gtk.Label(
+            label="Aufnahme-Knopf drücken oder lostippen —\ndie KI formt den Text auf Zuruf.",
+            justify=Gtk.Justification.CENTER)
+        stage_sub.add_css_class("dimmed")
+        stage_sub.add_css_class("caption")
+        stage.append(stage_sub)
+        self._placeholder = stage
         self._placeholder.set_can_target(False)  # clicks fall through to the editor
         overlay.add_overlay(self._placeholder)
         self.text_view.get_buffer().connect("changed", self._on_buffer_changed)
         box.append(overlay)
-
-        # Adw.WrapBox (libadwaita >= 1.7) wraps unevenly sized chips naturally;
-        # FlowBox stays as fallback for older libadwaita.
-        if hasattr(Adw, "WrapBox"):
-            presets = Adw.WrapBox(child_spacing=4, line_spacing=4)
-        else:
-            presets = Gtk.FlowBox(
-                selection_mode=Gtk.SelectionMode.NONE,
-                column_spacing=4, row_spacing=4, max_children_per_line=12,
-                halign=Gtk.Align.START,
-            )
-        for label, instruction in WB_PRESETS:
-            chip = Gtk.Button(label=label)
-            chip.add_css_class("flat")
-            chip.add_css_class("chip")
-            chip.connect("clicked", lambda _b, i=instruction: self._do_instruct(i))
-            presets.append(chip)
-        box.append(presets)
 
         # Chat-style pill: sparkle · entry · round send button.
         instr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -1123,6 +1112,25 @@ class WorkbenchView(Gtk.Box):
         self.send_btn.connect("clicked", self._run_instruction)
         instr_row.append(self.send_btn)
         box.append(instr_row)
+
+        # Suggestion chips centered under the pill, like modern AI apps.
+        # Adw.WrapBox (libadwaita >= 1.7) wraps uneven chips naturally.
+        if hasattr(Adw, "WrapBox"):
+            presets = Adw.WrapBox(child_spacing=4, line_spacing=4,
+                                  halign=Gtk.Align.CENTER)
+        else:
+            presets = Gtk.FlowBox(
+                selection_mode=Gtk.SelectionMode.NONE,
+                column_spacing=4, row_spacing=4, max_children_per_line=12,
+                halign=Gtk.Align.CENTER,
+            )
+        for label, instruction in WB_PRESETS:
+            chip = Gtk.Button(label=label)
+            chip.add_css_class("flat")
+            chip.add_css_class("chip")
+            chip.connect("clicked", lambda _b, i=instruction: self._do_instruct(i))
+            presets.append(chip)
+        box.append(presets)
 
     def _on_buffer_changed(self, buf) -> None:
         chars = buf.get_char_count()
@@ -1490,11 +1498,13 @@ class RecorderView(Gtk.Box):
         self.rec_btn.set_tooltip_text("Aufnahme starten")
         self.rec_btn.connect("clicked", self._toggle_record)
         controls.append(self.rec_btn)
-        self.timer_label = Gtk.Label(label="", valign=Gtk.Align.CENTER)
+        hero.append(controls)
+        # Big timer UNDER the button (Sound-Recorder style) — while recording
+        # it is the loudest element on the page.
+        self.timer_label = Gtk.Label(label="", halign=Gtk.Align.CENTER)
         self.timer_label.add_css_class("hero-timer")
         self.timer_label.add_css_class("numeric")
-        controls.append(self.timer_label)
-        hero.append(controls)
+        hero.append(self.timer_label)
 
         current_source = str(cfg.get("recorder_source", "both"))
         if hasattr(Adw, "ToggleGroup"):
