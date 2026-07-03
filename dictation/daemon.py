@@ -32,6 +32,7 @@ from common import (
     IS_MACOS,
     FASTER_MODEL_MAP,
     OV_MODEL_REPOS,
+    append_history,
     apply_replacements,
     clipboard_manager_running,
     cuda_available,
@@ -350,7 +351,17 @@ class WhisperDictationDaemon:
         if IS_MACOS:
             check_macos_accessibility()
         self._init_mic_volume()
-        self._load_model()
+        try:
+            self._load_model()
+        except Exception as exc:
+            # A failed model load (bad download, missing wheel) must NOT crash
+            # into a tight systemd restart loop that re-hammers the network.
+            # Exit 0 after a backoff so Restart=on-failure does not fire.
+            print(f"[whisper-dictation] model load failed: {exc}", file=sys.stderr, flush=True)
+            notify("Modell konnte nicht geladen werden",
+                   "Prüfe Internet/Modell. Neuer Versuch in 30 s.")
+            time.sleep(30)
+            raise SystemExit(0)
         self._start_ipc_server()
 
         if IS_MACOS:
@@ -547,12 +558,42 @@ class WhisperDictationDaemon:
             ) if hasattr(ecodes, name)
         }
         self._esc_code = getattr(ecodes, "KEY_ESC", None)
+        self._evdev_wanted = {c for c in (target, toggle_target, command_target)
+                              if c is not None}
 
         selector = selectors.DefaultSelector()
+        watched: dict[str, Any] = {}  # device path -> InputDevice (unhashable, so dict)
+
+        def rescan() -> None:
+            """(Re)register any readable device that carries a wanted key —
+            so a keyboard that was unplugged and re-plugged (or a Bluetooth
+            keyboard reconnecting) rebinds the hotkey automatically."""
+            import evdev as _evdev
+            for path in _evdev.list_devices():
+                if path in watched:
+                    continue
+                try:
+                    dev = _evdev.InputDevice(path)
+                    keys = dev.capabilities().get(ecodes.EV_KEY, [])
+                except Exception:
+                    continue
+                if any(code in keys for code in self._evdev_wanted):
+                    selector.register(dev, selectors.EVENT_READ)
+                    watched[dev.path] = dev
+
         for dev in self._evdev_devices:
             selector.register(dev, selectors.EVENT_READ)
+            watched[dev.path] = dev
 
+        last_rescan = time.monotonic()
         while not self.stopping:
+            # Periodic hotplug re-scan (cheap: only when no known device holds
+            # the key, i.e. after an unplug); 3 s cadence is imperceptible.
+            now = time.monotonic()
+            if now - last_rescan > 3.0:
+                last_rescan = now
+                if not watched:
+                    rescan()
             for key, _mask in selector.select(timeout=0.5):
                 dev = key.fileobj
                 try:
@@ -567,11 +608,14 @@ class WhisperDictationDaemon:
                     # No events ready right now; not an error.
                     continue
                 except OSError:
-                    # Device went away (unplugged); stop watching it.
+                    # Device went away (unplugged); stop watching it and let
+                    # the periodic rescan re-add it when it comes back.
                     try:
                         selector.unregister(dev)
                     except Exception:
                         pass
+                    watched.pop(getattr(dev, "path", None), None)
+                    last_rescan = 0.0  # rescan promptly
 
     def _process_key_event(self, code: int, value: int, target: int,
                            toggle_target: int | None, command_target: int | None,
@@ -696,15 +740,8 @@ class WhisperDictationDaemon:
     def _append_history(self, text: str, raw: str | None = None) -> None:
         if not self.config.get("save_history", True) or not text.strip():
             return
-        entry: dict[str, Any] = {"ts": time.time(), "text": text}
-        if raw and raw.strip() and raw.strip() != text.strip():
-            entry["raw"] = raw  # pre-LLM transcription, for "copy raw"
         try:
-            with HISTORY_FILE.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
-            if len(lines) > 500:  # keep the file bounded
-                HISTORY_FILE.write_text("\n".join(lines[-500:]) + "\n", encoding="utf-8")
+            append_history(text, raw)  # append-only + flock + atomic trim
         except Exception as exc:
             print(f"[whisper-dictation] history write failed: {exc}", file=sys.stderr, flush=True)
 
@@ -1046,7 +1083,8 @@ class WhisperDictationDaemon:
             self._status("Fehler", str(exc), urgency="critical", timeout_ms=6000)
             print(f"[whisper-dictation] {exc}", file=sys.stderr, flush=True)
         finally:
-            self.busy = False
+            with self.lock:
+                self.busy = False
             output_path.unlink(missing_ok=True)
 
     # -- Transcription ----------------------------------------------------------

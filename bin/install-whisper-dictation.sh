@@ -82,19 +82,24 @@ cat > "${SERVICE_FILE}" <<EOF
 Description=Whisper Dictation daemon (local speech-to-text)
 After=graphical-session.target
 PartOf=graphical-session.target
+# Cap restarts so a persistent failure (e.g. no model) can't loop forever.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=${VENV}/bin/python -u ${ROOT}/dictation/daemon.py
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 Environment=YDOTOOL_SOCKET=%t/.ydotool_socket
 StandardOutput=append:%h/.cache/whisper-dictation/daemon.log
 StandardError=append:%h/.cache/whisper-dictation/daemon.log
 
 [Install]
-WantedBy=default.target
+# graphical-session, not default: the daemon needs XDG_RUNTIME_DIR + Wayland
+# (IPC socket, evdev), which only exist once the graphical session is up.
+WantedBy=graphical-session.target
 EOF
 
 # App icon (shown in the GNOME dash / app grid and on the window).

@@ -130,10 +130,11 @@ def _probe_duration(audio: Path) -> float:
         out = subprocess.run(
             ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
              "-of", "csv=p=0", str(audio)],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, check=True, timeout=30,
         )
         return float(out.stdout.strip() or 0.0)
-    except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError,
+            subprocess.TimeoutExpired):
         return 0.0
 
 
@@ -532,7 +533,15 @@ def _decode_chunk(audio: Path, start: float, length: float):
         "-ss", str(start), "-t", str(length), "-i", str(audio),
         "-ar", str(SAMPLE_RATE), "-ac", "1", "-f", "f32le", "-",
     ]
-    raw = subprocess.run(cmd, capture_output=True, check=False).stdout
+    # Timeout so a corrupt Opus (e.g. after a crash) cannot hang transcription
+    # forever; a hung decode is treated as end-of-file (empty array).
+    try:
+        raw = subprocess.run(cmd, capture_output=True, check=False,
+                             timeout=max(60, length * 4)).stdout
+    except subprocess.TimeoutExpired:
+        print("[recorder] ffmpeg decode timed out — treating as end of file",
+              file=sys.stderr, flush=True)
+        raw = b""
     # .copy() makes the array writable (faster-whisper/ctranslate2 may need it).
     return np.frombuffer(raw, dtype=np.float32).copy()
 
@@ -544,7 +553,11 @@ def _find_silence_cut(audio: Path, target: float, window: float) -> float | None
     lo = max(0.0, target - window)
     cmd = ["ffmpeg", "-nostdin", "-v", "info", "-ss", str(lo), "-t", str(2 * window),
            "-i", str(audio), "-af", "silencedetect=n=-35dB:d=0.35", "-f", "null", "-"]
-    err = subprocess.run(cmd, capture_output=True, text=True, check=False).stderr
+    try:
+        err = subprocess.run(cmd, capture_output=True, text=True, check=False,
+                             timeout=60).stderr
+    except subprocess.TimeoutExpired:
+        return None  # no clean cut found; caller falls back to the target time
     events: list[tuple[str, float]] = []
     for line in err.splitlines():
         for kind, tag in (("s", "silence_start:"), ("e", "silence_end:")):
@@ -703,29 +716,37 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         "Aufnahmen ##-Abschnitte. Keine leeren oder inhaltslosen Abschnitte."
     )
     blocks = _split_words(transcript, 3000)
-    if len(blocks) == 1:
-        summary = _ollama_chat(cfg,
-            "Du bist ein praeziser Notiz-Assistent. Antworte auf Deutsch, behalte "
-            "englische Fachbegriffe bei und erfinde nichts. " + style,
-            f"Erstelle aus dieser Transkription kompakte Markdown-Notizen "
-            f"(Stichpunkte, ggf. ##-Abschnitte). Fokus: {focus}.\n\n{transcript}")
-    else:
-        partials = []
-        for idx, block in enumerate(blocks, 1):
-            print(f"[recorder] summarize map {idx}/{len(blocks)}", flush=True)
-            partials.append(_ollama_chat(cfg,
-                "Du bist ein praeziser Notiz-Assistent. Behalte englische Fachbegriffe bei, "
-                "erfinde nichts.",
-                f"Fasse diesen Abschnitt einer laengeren Aufnahme stichpunktartig zusammen. "
-                f"Fokus: {focus}.\n\nAbschnitt {idx}/{len(blocks)}:\n{block}"))
-        print("[recorder] summarize reduce", flush=True)
-        summary = _ollama_chat(cfg,
-            "Du bist ein praeziser Notiz-Assistent. Antworte auf Deutsch, behalte englische "
-            "Fachbegriffe bei, erfinde nichts. " + style,
-            f"Hier sind Teil-Zusammenfassungen einer langen Aufnahme (in Reihenfolge). "
-            f"Fuege sie zu EINER zusammenhaengenden, gut strukturierten Zusammenfassung "
-            f"mit ##-Abschnitten und Stichpunkten zusammen. Fokus: {focus}.\n\n"
-            + "\n\n".join(partials), timeout=420)
+    try:
+        if len(blocks) == 1:
+            summary = _ollama_chat(cfg,
+                "Du bist ein praeziser Notiz-Assistent. Antworte auf Deutsch, behalte "
+                "englische Fachbegriffe bei und erfinde nichts. " + style,
+                f"Erstelle aus dieser Transkription kompakte Markdown-Notizen "
+                f"(Stichpunkte, ggf. ##-Abschnitte). Fokus: {focus}.\n\n{transcript}")
+        else:
+            partials = []
+            for idx, block in enumerate(blocks, 1):
+                print(f"[recorder] summarize map {idx}/{len(blocks)}", flush=True)
+                partials.append(_ollama_chat(cfg,
+                    "Du bist ein praeziser Notiz-Assistent. Behalte englische Fachbegriffe bei, "
+                    "erfinde nichts.",
+                    f"Fasse diesen Abschnitt einer laengeren Aufnahme stichpunktartig zusammen. "
+                    f"Fokus: {focus}.\n\nAbschnitt {idx}/{len(blocks)}:\n{block}"))
+            print("[recorder] summarize reduce", flush=True)
+            summary = _ollama_chat(cfg,
+                "Du bist ein praeziser Notiz-Assistent. Antworte auf Deutsch, behalte englische "
+                "Fachbegriffe bei, erfinde nichts. " + style,
+                f"Hier sind Teil-Zusammenfassungen einer langen Aufnahme (in Reihenfolge). "
+                f"Fuege sie zu EINER zusammenhaengenden, gut strukturierten Zusammenfassung "
+                f"mit ##-Abschnitten und Stichpunkten zusammen. Fokus: {focus}.\n\n"
+                + "\n\n".join(partials), timeout=420)
+    except Exception as exc:  # noqa: BLE001 — Ollama down / network / timeout
+        msg = "Ollama nicht erreichbar" if "urlopen" in str(exc) or "refused" in str(exc).lower() else str(exc)[:120]
+        print(json.dumps({"error": msg, "base": base}))
+        return 1
+    if not summary.strip():
+        print(json.dumps({"error": "leere Antwort von Ollama", "base": base}))
+        return 1
 
     # Notes accumulate: several summaries with different foci can coexist
     # (Protokoll + Action-Items side by side). The GUI shows one card each.

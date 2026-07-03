@@ -58,9 +58,11 @@ from common import (  # noqa: E402
     IPC_SOCKET,
     LOG_FILE,
     RECORDINGS_DIR,
+    atomic_write,
     dictionary_terms,
     key_label,
     load_config,
+    rewrite_history,
     save_config,
 )
 
@@ -949,7 +951,10 @@ class WorkbenchView(Gtk.Box):
                 self.rec_proc = subprocess.Popen([
                     "arecord", "-q", "-D", device, "-f", "S16_LE",
                     "-r", "16000", "-c", "1", "-t", "wav", self.rec_wav,
-                ])
+                ], preexec_fn=_die_with_parent)  # dies with the GUI, never orphans the mic
+            except FileNotFoundError:
+                self._set_status("arecord fehlt (alsa-utils installieren)", error=True)
+                return
             except Exception as exc:
                 self._set_status(f"arecord-Fehler: {exc}", error=True)
                 return
@@ -2577,7 +2582,7 @@ class RecorderView(Gtk.Box):
                     parts += [str(note.get("text", "")).strip(), ""]
             if transcript:
                 parts += ["## Transkript", "", transcript, ""]
-            target.write_text("\n".join(parts), encoding="utf-8")
+            atomic_write(target, "\n".join(parts))
             self._toast(f"Exportiert: {target.name}")
         except OSError as exc:
             self._toast(f"Export fehlgeschlagen: {exc}")
@@ -2750,19 +2755,19 @@ class RecorderView(Gtk.Box):
 
     def _save_note_text(self, base, note) -> None:
         if note.get("_legacy"):
-            (RECORDINGS_DIR / f"{base}.summary.md").write_text(
-                str(note.get("text", "")) + "\n", encoding="utf-8")
+            atomic_write(RECORDINGS_DIR / f"{base}.summary.md",
+                         str(note.get("text", "")) + "\n")
             return
         path = RECORDINGS_DIR / f"{base}.notes.json"
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
+            # Never clobber a transiently unreadable notes file with partial data.
             return
         idx = note.get("_index")
         if isinstance(data, list) and isinstance(idx, int) and 0 <= idx < len(data):
             data[idx]["text"] = str(note.get("text", ""))
-            path.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                            encoding="utf-8")
+            atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False))
 
     def _delete_note(self, base, note) -> None:
         dlg = Adw.AlertDialog(heading="Notiz löschen?",
@@ -2781,12 +2786,13 @@ class RecorderView(Gtk.Box):
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
                 except Exception:
-                    data = []
+                    # Corrupt/unreadable: skip rather than overwrite with [].
+                    self._toast("Notizen-Datei nicht lesbar — nichts gelöscht")
+                    return
                 idx = note.get("_index")
                 if isinstance(data, list) and isinstance(idx, int) and 0 <= idx < len(data):
                     del data[idx]
-                    path.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                                    encoding="utf-8")
+                    atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False))
             self._load_notes(base)
             self.refresh()
             self._toast("Notiz gelöscht")
@@ -2861,7 +2867,7 @@ class RecorderView(Gtk.Box):
         except OSError:
             old = ""
         if text.strip() and text != old:
-            path.write_text(text, encoding="utf-8")
+            atomic_write(path, text)
             self._toast("Transkript gespeichert ✓")
 
     def _retranscribe(self, base):
@@ -3890,7 +3896,7 @@ class SettingsWindow(Adw.ApplicationWindow):
                 except Exception:
                     pass
                 kept.append(line)
-            HISTORY_FILE.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            rewrite_history(kept)  # flock + atomic, shared with the daemon
         except Exception:
             pass
         self._refresh_history()
@@ -3906,7 +3912,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _clear_history(self, *_a) -> None:
         try:
-            HISTORY_FILE.write_text("", encoding="utf-8")
+            rewrite_history([])
         except Exception:
             pass
         self._refresh_history()

@@ -13,6 +13,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -276,21 +277,67 @@ def load_config() -> dict[str, Any]:
     return config
 
 
-def save_config(config: dict[str, Any]) -> None:
-    """Atomic write (tmp + rename): a crash can never corrupt config.json."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
-    fd, tmp = tempfile.mkstemp(dir=str(CONFIG_DIR), prefix=".config-", suffix=".tmp")
+def atomic_write(path: Path, text: str) -> None:
+    """Crash-safe write: a temp file in the same dir + os.replace (atomic on
+    POSIX). A crash or full disk can never leave a half-written target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        os.replace(tmp, CONFIG_FILE)
+            fh.write(text)
+        os.replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def save_config(config: dict[str, Any]) -> None:
+    """Atomic write (tmp + rename): a crash can never corrupt config.json."""
+    atomic_write(CONFIG_FILE, json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+
+
+# ── History (shared, append-only + atomic, cross-process safe) ───────────────
+
+def append_history(text: str, raw: str | None = None, limit: int = 500) -> None:
+    """Append one dictation to history.jsonl under an flock, trimming to
+    `limit` lines atomically. Daemon and GUI both touch this file, so the
+    lock + atomic rewrite prevent interleaved-write corruption."""
+    import fcntl
+    if not text.strip():
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    entry: dict[str, Any] = {"ts": time.time(), "text": text}
+    if raw and raw.strip() and raw.strip() != text.strip():
+        entry["raw"] = raw
+    lock = CACHE_DIR / "history.lock"
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            lines = []
+            if HISTORY_FILE.exists():
+                lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+            lines.append(json.dumps(entry, ensure_ascii=False))
+            if len(lines) > limit:
+                lines = lines[-limit:]
+            atomic_write(HISTORY_FILE, "\n".join(lines) + "\n")
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def rewrite_history(lines: list[str]) -> None:
+    """Replace history.jsonl atomically under the same lock (GUI delete/clear)."""
+    import fcntl
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = CACHE_DIR / "history.lock"
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            atomic_write(HISTORY_FILE, ("\n".join(lines) + "\n") if lines else "")
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 # ── Hotkeys ──────────────────────────────────────────────────────────────────
