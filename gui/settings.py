@@ -2713,9 +2713,10 @@ class RecorderView(Gtk.Box):
         self._seek_to(max(0.0, self._media.get_timestamp() / 1_000_000 + delta))
 
     def _on_transcript_click(self, _gesture, _n_press, x, y) -> None:
-        """Click on a [mm:ss] marker → jump the player to that moment."""
+        """Click a [mm:ss] marker → jump the player there.
+        Click a speaker name → assign/rename popover for that paragraph."""
         view = self._detail.get("tr_view")
-        if view is None or self._media is None:
+        if view is None:
             return
         bx, by = view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
         ok, it = view.get_iter_at_location(bx, by)
@@ -2732,9 +2733,13 @@ class RecorderView(Gtk.Box):
         for m in self._TS_RE.finditer(line):
             if m.start() <= offset <= m.end():
                 seconds = self._ts_to_seconds(m.group(0))
-                if seconds is not None:
+                if seconds is not None and self._media is not None:
                     self._seek_to(seconds)
                 return
+        spk = re.match(r"^(\[\d+:\d{2}(?::\d{2})?\])\s+([^:\n]{1,20}):", line)
+        if spk and spk.start(2) <= offset <= spk.end(2):
+            self._open_speaker_assign(self._detail_base, spk.group(1),
+                                      spk.group(2), x, y)
 
     def _decorate_transcript(self) -> None:
         """Timestamps get accent color + bold; 'Sprecher:' prefixes get bold —
@@ -2918,6 +2923,86 @@ class RecorderView(Gtk.Box):
             btn.connect("clicked",
                         lambda _b, l=label: self._rename_speaker_dialog(base, l))
             bar.append(btn)
+
+    def _known_speakers(self, base) -> list[str]:
+        """All speaker labels of a recording (segments + transcript prefixes)."""
+        names: list[str] = []
+        for seg in self._read_speakers(base):
+            label = str(seg.get("label", "")).strip()
+            if label and label not in names:
+                names.append(label)
+        for m in re.finditer(r"^\[\d+:\d{2}(?::\d{2})?\]\s+([^:\n]{1,20}):",
+                             self._transcript_text(), re.MULTILINE):
+            if m.group(1) not in names:
+                names.append(m.group(1))
+        return names
+
+    def _open_speaker_assign(self, base, stamp: str, current: str,
+                             x: float, y: float) -> None:
+        """Popover on a transcript speaker name: reassign THIS paragraph to a
+        known/new speaker, or rename the speaker everywhere."""
+        view = self._detail.get("tr_view")
+        if view is None or base is None:
+            return
+        pop = Gtk.Popover()
+        pop.set_parent(view)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                      margin_top=8, margin_bottom=8,
+                      margin_start=8, margin_end=8)
+        cap = Gtk.Label(label=f"Absatz {stamp} gehört zu …", xalign=0)
+        cap.add_css_class("dimmed")
+        cap.add_css_class("caption")
+        box.append(cap)
+
+        def done(r: dict, name: str) -> bool:
+            if "error" in r:
+                self._toast(f"Zuordnen fehlgeschlagen: {r['error']}")
+            else:
+                self._toast(f"Absatz {stamp} → „{name}“ ✓")
+                if self._detail_base == base:
+                    self._load_detail_content(base)
+            return False
+
+        def assign(name: str) -> None:
+            pop.popdown()
+
+            def work():
+                r = recorder_call("reassign-speaker", base, "--stamp", stamp,
+                                  "--new", name, timeout=30)
+                GLib.idle_add(done, r, name)
+            threading.Thread(target=work, daemon=True).start()
+
+        known = self._known_speakers(base)
+        for name in known:
+            if name == current:
+                continue
+            btn = Gtk.Button()
+            btn.add_css_class("flat")
+            btn.set_child(Gtk.Label(label=name, xalign=0))
+            btn.connect("clicked", lambda _b, n=name: assign(n))
+            box.append(btn)
+        nums = [int(m.group(1)) for n in known
+                for m in [re.fullmatch(r"Sprecher (\d+)", n)] if m]
+        nxt = f"Sprecher {max(nums, default=1) + 1}"
+        new_btn = Gtk.Button()
+        new_btn.add_css_class("flat")
+        new_btn.set_child(Gtk.Label(label=f"Neuer Sprecher ({nxt})", xalign=0))
+        new_btn.connect("clicked", lambda *_: assign(nxt))
+        box.append(new_btn)
+        box.append(Gtk.Separator(margin_top=4, margin_bottom=4))
+        ren = Gtk.Button()
+        ren.add_css_class("flat")
+        ren.set_child(Gtk.Label(label=f"„{current}“ überall ändern …", xalign=0))
+        ren.connect("clicked",
+                    lambda *_: (pop.popdown(),
+                                self._rename_speaker_dialog(base, current)))
+        box.append(ren)
+        pop.set_child(box)
+        pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        pop.popup()
 
     def _rename_speaker_dialog(self, base, old: str) -> None:
         if old == "Ich":

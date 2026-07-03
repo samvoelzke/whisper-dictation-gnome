@@ -1123,6 +1123,78 @@ def cmd_rename_speaker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stamp_to_secs(stamp: str) -> float:
+    m = re.match(r"^\[(\d+):(\d{2})(?::(\d{2}))?\]$", stamp.strip())
+    if not m:
+        return -1.0
+    g = m.groups()
+    if g[2] is not None:
+        return int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2])
+    return int(g[0]) * 60 + int(g[1])
+
+
+def cmd_reassign_speaker(args: argparse.Namespace) -> int:
+    """Assign ONE transcript paragraph (picked by its [mm:ss] stamp) to a
+    different or new speaker — fixes single diarization misses without
+    touching the rest of the recording."""
+    base, stamp, new = args.base, args.stamp.strip(), args.new.strip()
+    if not new or len(new) > 20 or ":" in new or "\n" in new:
+        print(json.dumps({"error": "bad_name", "base": base}))
+        return 1
+    start_secs = _stamp_to_secs(stamp)
+    if start_secs < 0:
+        print(json.dumps({"error": "bad_stamp", "base": base}))
+        return 1
+    txt_path = RECORDINGS_DIR / f"{base}.txt"
+    if not txt_path.exists():
+        print(json.dumps({"error": "transcript_not_found", "base": base}))
+        return 1
+    text = txt_path.read_text(encoding="utf-8")
+    paras = text.split("\n\n")
+    hit = None
+    end_secs = None
+    for i, para in enumerate(paras):
+        p = para.strip()
+        if not p.startswith(stamp):
+            continue
+        m = re.match(r"^(\[\d+:\d{2}(?::\d{2})?\])\s*(?:[^:\n]{1,20}:\s*)?(.*)$",
+                     p, re.DOTALL)
+        if m is None:
+            break
+        paras[i] = f"{m.group(1)} {new}: {m.group(2)}"
+        hit = i
+        for nxt in paras[i + 1:]:  # paragraph ends where the next one starts
+            mm = re.match(r"^\[\d+:\d{2}(?::\d{2})?\]", nxt.strip())
+            if mm:
+                end_secs = _stamp_to_secs(mm.group(0))
+                break
+        break
+    if hit is None:
+        print(json.dumps({"error": "paragraph_not_found", "base": base}))
+        return 1
+    from common import atomic_write
+    atomic_write(txt_path, "\n\n".join(paras))
+
+    # Keep speakers.json in step: segments whose midpoint falls inside the
+    # paragraph's time range move to the new label (talk-time chips stay true).
+    spk_path = RECORDINGS_DIR / f"{base}.speakers.json"
+    data = _read_json(spk_path, {})
+    if isinstance(data, list):
+        data = {"segments": data, "voices": {}}
+    moved = 0
+    for seg in data.get("segments") or []:
+        mid = (float(seg.get("start", 0)) + float(seg.get("end", 0))) / 2
+        if mid >= start_secs and (end_secs is None or mid < end_secs):
+            seg["label"] = new
+            moved += 1
+    if data.get("segments"):
+        _write_json(spk_path, {"segments": data["segments"],
+                               "voices": data.get("voices") or {}})
+    print(json.dumps({"base": base, "stamp": stamp, "new": new,
+                      "segments_moved": moved}))
+    return 0
+
+
 def cmd_mark_me(args: argparse.Namespace) -> int:
     """'Das bin ich': enroll a diarized speaker's stored embedding into the
     user's voice profile and relabel that speaker as 'Ich' — bootstraps the
@@ -1336,6 +1408,12 @@ def main() -> int:
     s.add_argument("base")
     s.add_argument("--label", required=True)
     s.set_defaults(func=cmd_mark_me)
+
+    s = sub.add_parser("reassign-speaker")
+    s.add_argument("base")
+    s.add_argument("--stamp", required=True)
+    s.add_argument("--new", required=True)
+    s.set_defaults(func=cmd_reassign_speaker)
 
     s = sub.add_parser("diarize")
     s.add_argument("base")
