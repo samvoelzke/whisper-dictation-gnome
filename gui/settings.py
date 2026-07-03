@@ -150,6 +150,68 @@ MODEL_HINTS = {
     "large-v2": "Aelteres grosses Modell (CPU). Meist nur fuer Vergleiche.",
 }
 
+# Rich metadata for the model-picker subpage: quality/speed as 1-5 (rendered
+# as real star icons, never truncated text), device, size, one-line note.
+# quality/speed are relative guidance, not benchmarks.
+WHISPER_MODEL_META = {
+    "turbo":            {"quality": 5, "speed": 5, "device": "GPU", "size": "~1.5 GB",
+                         "note": "Beste Standardwahl: stark + multilingual (DE/EN gemischt)."},
+    DE_FINETUNE:        {"quality": 5, "speed": 2, "device": "CPU", "size": "~1.5 GB",
+                         "note": "Deutsch-Finetune (WER ~2.6 %). Bestes Deutsch, schwächer bei EN."},
+    "distil-large-v3":  {"quality": 4, "speed": 5, "device": "GPU", "size": "~1.4 GB",
+                         "note": "Nur Englisch, distilliert — am schnellsten."},
+    "large-v3":         {"quality": 5, "speed": 3, "device": "GPU", "size": "~3 GB",
+                         "note": "Höchste Qualität, multilingual. Etwas langsamer als turbo."},
+    "tiny":             {"quality": 1, "speed": 5, "device": "CPU", "size": "~75 MB",
+                         "note": "Extrem schnell, geringste Genauigkeit."},
+    "base":             {"quality": 2, "speed": 5, "device": "CPU", "size": "~140 MB",
+                         "note": "Etwas genauer als tiny, sehr leicht."},
+    "small":            {"quality": 3, "speed": 4, "device": "CPU", "size": "~460 MB",
+                         "note": "Guter Mittelweg."},
+    "medium":           {"quality": 4, "speed": 2, "device": "CPU", "size": "~1.5 GB",
+                         "note": "Deutlich genauer, aber merklich schwerer."},
+    "tiny.en":          {"quality": 1, "speed": 5, "device": "CPU", "size": "~75 MB",
+                         "note": "Nur Englisch, maximal leichtgewichtig."},
+    "base.en":          {"quality": 2, "speed": 5, "device": "CPU", "size": "~140 MB",
+                         "note": "Nur Englisch, kompakt."},
+    "small.en":         {"quality": 3, "speed": 4, "device": "CPU", "size": "~460 MB",
+                         "note": "Nur Englisch, guter Kompromiss."},
+    "medium.en":        {"quality": 4, "speed": 2, "device": "CPU", "size": "~1.5 GB",
+                         "note": "Nur Englisch, stark aber schwerer."},
+    "large-v2":         {"quality": 4, "speed": 2, "device": "CPU", "size": "~3 GB",
+                         "note": "Älteres großes Modell. Meist nur für Vergleiche."},
+}
+
+# Ollama cleanup models: quality for the cleanup/notes task (1-5) + note.
+LLM_MODEL_META = {
+    "qwen2.5:7b":  {"quality": 5, "note": "empfohlen (DE+EN)"},
+    "qwen2.5:14b": {"quality": 5, "note": "stärker, langsamer"},
+    "gemma3:4b":   {"quality": 4, "note": "schnell, multilingual"},
+    "qwen3:4b":    {"quality": 4, "note": "kompakt"},
+    "qwen2.5:3b":  {"quality": 3, "note": "schnell"},
+    "llama3.2:3b": {"quality": 2, "note": "sehr schnell, schwächer"},
+}
+
+
+def model_display_name(model_id: str) -> str:
+    """Short human name for a model id (drops the HF org path)."""
+    if model_id == DE_FINETUNE:
+        return "Deutsch-Finetune (turbo)"
+    return model_id
+
+
+def star_box(filled: int, total: int = 5) -> Gtk.Box:
+    """A row of real star icons — never truncates like text stars in a combo."""
+    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=1,
+                  valign=Gtk.Align.CENTER)
+    for i in range(total):
+        star = Gtk.Image(icon_name="starred-symbolic" if i < filled
+                         else "non-starred-symbolic")
+        star.add_css_class("star-lit" if i < filled else "star-dim")
+        box.append(star)
+    return box
+
+
 # backend + ov_device stay in config (defaults: auto -> OpenVINO GPU, with
 # automatic fallback to faster-whisper CPU). They are not exposed in the GUI
 # because "auto" is right for virtually everyone; power users can edit the JSON.
@@ -183,16 +245,8 @@ PASTE_OPTIONS = [
     ("shift_insert", "Shift+Insert"),
 ]
 
-# Ollama cleanup models. Stars = quality for the cleanup task; bigger models are
-# stronger but slower and need more RAM. Must be installed (ollama pull <name>).
-LLM_MODEL_OPTIONS = [
-    ("qwen2.5:7b", "qwen2.5:7b  ★★★★★  empfohlen (DE+EN)"),
-    ("qwen2.5:14b", "qwen2.5:14b  ★★★★★  stärker, langsamer"),
-    ("gemma3:4b", "gemma3:4b  ★★★★☆  schnell, multilingual"),
-    ("qwen3:4b", "qwen3:4b  ★★★★☆"),
-    ("qwen2.5:3b", "qwen2.5:3b  ★★★☆☆  schnell"),
-    ("llama3.2:3b", "llama3.2:3b  ★★☆☆☆  sehr schnell, schwächer"),
-]
+# Ollama cleanup models: metadata in LLM_MODEL_META below (rendered as
+# real star icons in the model expander, not truncating text).
 
 
 # ── Long-form recorder (lectures / calls) ────────────────────────────────────
@@ -369,6 +423,18 @@ def install_app_css() -> None:
         }
         .chip-accent:hover {
           background: alpha(@accent_bg_color, 0.22);
+        }
+        /* Model-picker star ratings (real icons, never truncate) */
+        .star-lit {
+          color: @accent_color;
+          -gtk-icon-size: 13px;
+        }
+        .star-dim {
+          opacity: 0.28;
+          -gtk-icon-size: 13px;
+        }
+        .metric-caption {
+          font-size: 0.82em;
         }
         /* Note tab label chip (accent pill above each note) */
         .note-chip {
@@ -1241,51 +1307,58 @@ class RecorderView(Gtk.Box):
         hero.append(self.title_row)
         outer.append(hero)
 
-        opt_group = Adw.PreferencesGroup()
-        outer.append(opt_group)
-        opt = Adw.ExpanderRow(title="Optionen", subtitle="Geräte, Modell, Qualität, Sprache, Chunk-Länge")
-        opt_group.add(opt)
+        # Two focused expanders instead of one 10-row scroll trap:
+        # "Aufnahme" (what you set per recording) and "Transkription" (rarer).
+        rec_opt_group = Adw.PreferencesGroup()
+        outer.append(rec_opt_group)
+        aufnahme = Adw.ExpanderRow(title="Aufnahme-Optionen",
+                                   subtitle="Geräte und Qualität")
+        rec_opt_group.add(aufnahme)
         if self._source_toggle is None:
             self.source_row = self._combo("Quelle", REC_SOURCE_OPTIONS, current_source)
             self.source_row.connect("notify::selected", self._on_source_changed)
-            opt.add_row(self.source_row)
+            aufnahme.add_row(self.source_row)
         # Device combos start with just the defaults; the real list is filled in
         # asynchronously by _load_devices_async() so construction never blocks.
         self._mic_opts = [("", "Standard-Mikrofon")]
         self._mon_opts = [("", "Standard-Ausgang")]
         self.mic_row = self._combo("Mikrofon", self._mic_opts, "")
         self.mic_row.connect("notify::selected", self._on_device_changed)
-        opt.add_row(self.mic_row)
+        aufnahme.add_row(self.mic_row)
         self.mon_row = self._combo("System-Ausgang (Monitor)", self._mon_opts, "")
         self.mon_row.connect("notify::selected", self._on_device_changed)
-        opt.add_row(self.mon_row)
-        self.model_row = self._combo("Modell", REC_MODEL_OPTIONS, str(cfg.get("recorder_model", "large-v3")))
-        self.model_row.connect("notify::selected",
-                               lambda *_: self._persist("recorder_model", self._cv(self.model_row, REC_MODEL_OPTIONS)))
-        opt.add_row(self.model_row)
+        aufnahme.add_row(self.mon_row)
         self.quality_row = self._combo("Qualität", REC_QUALITY_OPTIONS, str(cfg.get("recorder_bitrate", "32k")))
         self.quality_row.connect("notify::selected",
                                  lambda *_: self._persist("recorder_bitrate", self._cv(self.quality_row, REC_QUALITY_OPTIONS)))
-        opt.add_row(self.quality_row)
+        aufnahme.add_row(self.quality_row)
+
+        transkription = Adw.ExpanderRow(title="Transkription & Notizen",
+                                        subtitle="Modell, Sprache, Automatik, Export")
+        rec_opt_group.add(transkription)
+        self.model_row = self._combo("Modell", REC_MODEL_OPTIONS, str(cfg.get("recorder_model", "large-v3")))
+        self.model_row.connect("notify::selected",
+                               lambda *_: self._persist("recorder_model", self._cv(self.model_row, REC_MODEL_OPTIONS)))
+        transkription.add_row(self.model_row)
         self.lang_row = self._combo("Sprache", LANGUAGE_OPTIONS, str(cfg.get("recorder_language", "")).lower())
         self.lang_row.set_subtitle("Auto erkennt die Sprache selbst. Nur bei fester Sprache "
                                    "fließen Kontext-Prompt und Wörterbuch ein.")
         self.lang_row.connect("notify::selected",
                               lambda *_: self._persist("recorder_language", self._cv(self.lang_row, LANGUAGE_OPTIONS)))
-        opt.add_row(self.lang_row)
+        transkription.add_row(self.lang_row)
         self.chunk_row = Adw.SpinRow.new_with_range(60, 900, 30)
         self.chunk_row.set_title("Chunk-Länge (s)")
         self.chunk_row.set_subtitle("Teil-Speicherung; Grenzen werden an Sprechpausen ausgerichtet")
         self.chunk_row.set_value(float(cfg.get("recorder_chunk_seconds", 300)))
         self.chunk_row.connect("notify::value",
                                lambda *_: self._persist("recorder_chunk_seconds", int(self.chunk_row.get_value())))
-        opt.add_row(self.chunk_row)
+        transkription.add_row(self.chunk_row)
         self.auto_row = Adw.SwitchRow(title="Nach Stopp automatisch transkribieren",
                                       subtitle="Zusammenfassung danach manuell mit Fokus.")
         self.auto_row.set_active(bool(cfg.get("recorder_auto_process", False)))
         self.auto_row.connect("notify::active",
                               lambda *_: self._persist("recorder_auto_process", bool(self.auto_row.get_active())))
-        opt.add_row(self.auto_row)
+        transkription.add_row(self.auto_row)
         self.auto_title_row = Adw.SwitchRow(
             title="Titel automatisch vergeben",
             subtitle="Nach der Transkription schlägt die KI einen kurzen Titel vor.")
@@ -1293,7 +1366,7 @@ class RecorderView(Gtk.Box):
         self.auto_title_row.connect(
             "notify::active",
             lambda *_: self._persist("recorder_auto_title", bool(self.auto_title_row.get_active())))
-        opt.add_row(self.auto_title_row)
+        transkription.add_row(self.auto_title_row)
         vault = str(cfg.get("obsidian_vault", "")).strip()
         self.vault_row = Adw.ActionRow(
             title="Obsidian-Vault",
@@ -1302,7 +1375,7 @@ class RecorderView(Gtk.Box):
         vault_btn.add_css_class("flat")
         vault_btn.connect("clicked", self._pick_vault)
         self.vault_row.add_suffix(vault_btn)
-        opt.add_row(self.vault_row)
+        transkription.add_row(self.vault_row)
 
         viz_mode = str(cfg.get("audio_visualizer", "waves"))
         self._meters_group = Adw.PreferencesGroup(
@@ -3118,9 +3191,13 @@ class PrefsDialog(Adw.PreferencesDialog):
 
         rec = Adw.PreferencesGroup(title="Erkennung")
         page.add(rec)
-        self.model_row = self._combo("Modell", MODEL_OPTIONS, str(self.config["model"]))
-        self._update_model_hint()
-        self.model_row.connect("notify::selected", self._on_model_changed)
+        # Model choice opens a full subpage (cards with star ratings as real
+        # icons + device + size) instead of a truncating dropdown.
+        self.model_row = Adw.ActionRow(title="Modell", activatable=True)
+        self.model_row.add_prefix(Gtk.Image(icon_name="emblem-music-symbolic"))
+        self.model_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+        self.model_row.connect("activated", lambda *_: self._open_model_picker())
+        self._update_model_row_subtitle()
         rec.add(self.model_row)
         self.language_row = self._combo(
             "Sprache", LANGUAGE_OPTIONS, str(self.config.get("language", "de")).lower())
@@ -3228,16 +3305,11 @@ class PrefsDialog(Adw.PreferencesDialog):
         self.ollama_row.set_active(bool(self.config.get("ollama_postprocess", False)))
         self.ollama_row.connect("notify::active", self._on_ollama_toggled)
         llm.add(self.ollama_row)
-        current_model = str(self.config.get("ollama_model", "qwen2.5:7b"))
-        self._llm_model_opts = list(LLM_MODEL_OPTIONS)
-        if current_model not in [v for v, _ in self._llm_model_opts]:
-            self._llm_model_opts.append((current_model, f"{current_model}  (eigenes)"))
-        self.ollama_model_row = self._combo("Modell", self._llm_model_opts, current_model)
-        self.ollama_model_row.set_subtitle(
-            "Mehr Sterne = stärker, aber langsamer. Muss via 'ollama pull' installiert sein.")
-        self.ollama_model_row.connect("notify::selected", self._on_ollama_model_changed)
-        llm.add(self.ollama_model_row)
-        self._mark_installed_ollama_models()
+        # Ollama model as an expander with radio rows: full width for stars
+        # (real icons) + note + an installed badge, no dropdown truncation.
+        self.ollama_expander = Adw.ExpanderRow(title="Cleanup-Modell")
+        llm.add(self.ollama_expander)
+        self._build_ollama_model_rows()
         toggle_cur = str(self.config.get("llm_toggle_key", ""))
         self._llm_toggle_opts = key_options(LLM_TOGGLE_OPTIONS, toggle_cur)
         self.llm_toggle_row = self._combo(
@@ -3486,20 +3558,11 @@ class PrefsDialog(Adw.PreferencesDialog):
         active = bool(self.ollama_row.get_active())
         self._apply("ollama_postprocess", active)
         if active:
-            self._warn_if_model_missing()
+            self._warn_if_model_missing_id(str(self.config.get("ollama_model", "")))
 
-    def _on_ollama_model_changed(self, *_a) -> None:
-        if self._updating:
-            return
-        self._apply("ollama_model", self._cv(self.ollama_model_row, self._llm_model_opts))
-        if bool(self.config.get("ollama_postprocess")):
-            self._warn_if_model_missing()
-
-    def _warn_if_model_missing(self) -> None:
-        model = self._cv(self.ollama_model_row, self._llm_model_opts)
-
+    def _warn_if_model_missing_id(self, model: str) -> None:
         def work():
-            if self.win._ollama_model_installed(model) is False:
+            if model and self.win._ollama_model_installed(model) is False:
                 GLib.idle_add(self._toast, f"Modell fehlt: ollama pull {model}")
         threading.Thread(target=work, daemon=True).start()
 
@@ -3531,14 +3594,70 @@ class PrefsDialog(Adw.PreferencesDialog):
             GLib.idle_add(apply, detect_alsa_capture_devices())
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_model_changed(self, *_a) -> None:
-        self._update_model_hint()
-        if not self._updating:
-            self._apply("model", self._cv(self.model_row, MODEL_OPTIONS))
-
-    def _update_model_hint(self) -> None:
+    def _update_model_row_subtitle(self) -> None:
+        model = str(self.config.get("model", "turbo"))
+        meta = WHISPER_MODEL_META.get(model, {})
+        dev = meta.get("device", "")
+        size = meta.get("size", "")
+        extra = " · ".join(p for p in (dev, size) if p)
         self.model_row.set_subtitle(
-            MODEL_HINTS.get(self._cv(self.model_row, MODEL_OPTIONS), ""))
+            f"{model_display_name(model)}{('  ·  ' + extra) if extra else ''}")
+
+    def _open_model_picker(self) -> None:
+        """Subpage with a card per Whisper model: name + quality/speed stars
+        (real icons) + device + size + note + a checkmark on the current one."""
+        page = Adw.PreferencesPage()
+        current = str(self.config.get("model", "turbo"))
+        gpu_group = Adw.PreferencesGroup(
+            title="GPU-Modelle (OpenVINO)",
+            description="Schnell auf der Intel-GPU — empfohlen.")
+        cpu_group = Adw.PreferencesGroup(
+            title="CPU-Modelle",
+            description="Laufen ohne GPU über faster-whisper.")
+        page.add(gpu_group)
+        page.add(cpu_group)
+        for model_id, _lbl in MODEL_OPTIONS:
+            meta = WHISPER_MODEL_META.get(model_id, {})
+            row = Adw.ActionRow(title=model_display_name(model_id),
+                                subtitle=meta.get("note", ""), activatable=True)
+            metrics = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                              valign=Gtk.Align.CENTER, margin_end=6)
+            q = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            ql = Gtk.Label(label="Qualität", xalign=1)
+            ql.add_css_class("dimmed")
+            ql.add_css_class("metric-caption")
+            ql.set_size_request(58, -1)
+            q.append(ql)
+            q.append(star_box(int(meta.get("quality", 0))))
+            metrics.append(q)
+            s = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            sl = Gtk.Label(label="Tempo", xalign=1)
+            sl.add_css_class("dimmed")
+            sl.add_css_class("metric-caption")
+            sl.set_size_request(58, -1)
+            s.append(sl)
+            s.append(star_box(int(meta.get("speed", 0))))
+            metrics.append(s)
+            row.add_suffix(metrics)
+            size_lbl = Gtk.Label(label=meta.get("size", ""), valign=Gtk.Align.CENTER)
+            size_lbl.add_css_class("dimmed")
+            size_lbl.add_css_class("numeric")
+            row.add_suffix(size_lbl)
+            check = Gtk.Image(icon_name="object-select-symbolic", valign=Gtk.Align.CENTER)
+            check.set_visible(model_id == current)
+            row.add_suffix(check)
+            row.connect("activated", lambda _r, m=model_id: self._pick_model(m))
+            (gpu_group if meta.get("device") == "GPU" else cpu_group).add(row)
+        subpage = Adw.NavigationPage(title="Modell wählen", child=page)
+        self.push_subpage(subpage)
+
+    def _pick_model(self, model_id: str) -> None:
+        self._apply("model", model_id)
+        self._update_model_row_subtitle()
+        try:
+            self.pop_subpage()
+        except Exception:
+            pass
 
     def refresh_status(self) -> None:
         def work():
@@ -3546,27 +3665,57 @@ class PrefsDialog(Adw.PreferencesDialog):
             GLib.idle_add(self.status_row.set_subtitle, "läuft" if running else "gestoppt")
         threading.Thread(target=work, daemon=True).start()
 
-    def _mark_installed_ollama_models(self) -> None:
-        """Prefix installed models with '✓' once `ollama list` answered (async)."""
-        def apply_marks(installed: set) -> bool:
-            if not installed:
-                return False
-            self._updating = True
-            try:
-                selected = self.ollama_model_row.get_selected()
-                self._llm_model_opts[:] = [
-                    (v, ("✓ " + lbl if v in installed and not lbl.startswith("✓ ") else lbl))
-                    for v, lbl in self._llm_model_opts
-                ]
-                self.ollama_model_row.set_model(
-                    Gtk.StringList.new([lbl for _, lbl in self._llm_model_opts]))
-                self.ollama_model_row.set_selected(selected)
-            finally:
-                self._updating = False
-            return False
+    def _build_ollama_model_rows(self, installed: set | None = None) -> None:
+        """Populate the Ollama expander with one radio row per model."""
+        current = str(self.config.get("ollama_model", "qwen2.5:7b"))
+        for row in getattr(self, "_ollama_rows", []):
+            self.ollama_expander.remove(row)
+        self._ollama_rows = []
+        self._ollama_radio_group = None
+        options = list(LLM_MODEL_META.items())
+        if current not in dict(options):
+            options.append((current, {"quality": 0, "note": "eigenes"}))
+        for model_id, meta in options:
+            row = Adw.ActionRow(title=model_id, subtitle=str(meta.get("note", "")),
+                                activatable=True)
+            radio = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+            if self._ollama_radio_group is None:
+                self._ollama_radio_group = radio
+            else:
+                radio.set_group(self._ollama_radio_group)
+            radio.set_active(model_id == current)
+            radio.connect("toggled", lambda b, m=model_id:
+                          self._on_ollama_pick(m) if b.get_active() else None)
+            row.add_prefix(radio)
+            row.set_activatable_widget(radio)
+            if int(meta.get("quality", 0)):
+                row.add_suffix(star_box(int(meta["quality"])))
+            if installed is not None:
+                badge = Gtk.Label(label="installiert" if model_id in installed else "nicht installiert",
+                                  valign=Gtk.Align.CENTER)
+                badge.add_css_class("dimmed")
+                badge.add_css_class("metric-caption")
+                if model_id in installed:
+                    badge.add_css_class("success")
+                row.add_suffix(badge)
+            self.ollama_expander.add_row(row)
+            self._ollama_rows.append(row)
+        self.ollama_expander.set_subtitle(current)
+        if installed is None:
+            self._mark_installed_ollama_models()
 
+    def _on_ollama_pick(self, model_id: str) -> None:
+        self.ollama_expander.set_subtitle(model_id)
+        self._apply("ollama_model", model_id)
+        if bool(self.config.get("ollama_postprocess")):
+            self._warn_if_model_missing_id(model_id)
+
+    def _mark_installed_ollama_models(self) -> None:
+        """Add installed/not-installed badges once `ollama list` answered."""
         def work():
-            GLib.idle_add(apply_marks, self.win._installed_ollama_models())
+            installed = self.win._installed_ollama_models()
+            if installed:
+                GLib.idle_add(self._build_ollama_model_rows, installed)
         threading.Thread(target=work, daemon=True).start()
 
     # ── Key capture (press a key to set it) ───────────────────────────────
