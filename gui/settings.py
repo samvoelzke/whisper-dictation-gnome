@@ -305,7 +305,25 @@ def install_app_css() -> None:
           background: transparent;
         }
         .editor-card textview {
-          padding: 2px;
+          padding: 4px;
+        }
+        /* Hero record buttons (GNOME-Sound-Recorder-style) */
+        .record-circle {
+          min-width: 64px;
+          min-height: 64px;
+          -gtk-icon-size: 26px;
+        }
+        .record-circle-small {
+          min-width: 42px;
+          min-height: 42px;
+          -gtk-icon-size: 17px;
+        }
+        .hero-timer {
+          font-size: 1.5em;
+          font-weight: 300;
+        }
+        .hero-hint {
+          font-size: 0.85em;
         }
     """)
     Gtk.StyleContext.add_provider_for_display(
@@ -555,27 +573,49 @@ class WorkbenchView(Gtk.Box):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         clamp.set_child(box)
 
-        rec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        self.rec_btn = Gtk.Button()
-        self._rec_btn_content = Adw.ButtonContent(
-            icon_name="media-record-symbolic", label="Aufnehmen")
-        self.rec_btn.set_child(self._rec_btn_content)
-        self.rec_btn.add_css_class("pill")
+        # Hero: one big circular record button, status underneath.
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                       halign=Gtk.Align.CENTER, margin_top=4)
+        self.rec_btn = Gtk.Button(icon_name="media-record-symbolic",
+                                  halign=Gtk.Align.CENTER)
+        self.rec_btn.add_css_class("circular")
+        self.rec_btn.add_css_class("record-circle")
         self.rec_btn.add_css_class("suggested-action")
+        self.rec_btn.set_tooltip_text("Aufnehmen (Strg+R)")
         self.rec_btn.connect("clicked", self._toggle_record)
-        rec_row.append(self.rec_btn)
+        hero.append(self.rec_btn)
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                             halign=Gtk.Align.CENTER)
         self.spinner = Gtk.Spinner(visible=False)
-        rec_row.append(self.spinner)
-        self.status = Gtk.Label(label="Bereit", xalign=0, hexpand=True)
+        status_row.append(self.spinner)
+        self.status = Gtk.Label(label="Bereit")
         self.status.add_css_class("dim-label")
-        rec_row.append(self.status)
-        box.append(rec_row)
+        status_row.append(self.status)
+        hero.append(status_row)
+        box.append(hero)
 
         # Live volume visualization while dictating (waves / bar / off).
         self._viz = AudioVisualizer(mode=str(load_config().get("audio_visualizer", "waves")), height=40)
         self._viz.set_visible(False)
         box.append(self._viz)
         self._meter = LevelMeter(self._viz.push)
+
+        # Editor with its own compact toolbar (title + clear/copy).
+        editor_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        editor_title = Gtk.Label(label="Text", xalign=0, hexpand=True)
+        editor_title.add_css_class("heading")
+        editor_head.append(editor_title)
+        clear_btn = Gtk.Button(icon_name="edit-clear-all-symbolic", valign=Gtk.Align.CENTER)
+        clear_btn.add_css_class("flat")
+        clear_btn.set_tooltip_text("Leeren")
+        clear_btn.connect("clicked", lambda *_: self._set_text(""))
+        editor_head.append(clear_btn)
+        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
+        copy_btn.add_css_class("flat")
+        copy_btn.set_tooltip_text("Kopieren")
+        copy_btn.connect("clicked", self._copy)
+        editor_head.append(copy_btn)
+        box.append(editor_head)
 
         scroller = Gtk.ScrolledWindow(vexpand=True)
         scroller.add_css_class("card")
@@ -610,20 +650,12 @@ class WorkbenchView(Gtk.Box):
         self.instr.set_placeholder_text("Anweisung an die KI … (formaler · zusammenfassen · auf Englisch)")
         self.instr.connect("activate", self._run_instruction)
         instr_row.append(self.instr)
-        self.send_btn = Gtk.Button(label="Ausführen")
+        self.send_btn = Gtk.Button()
+        self.send_btn.set_child(Adw.ButtonContent(icon_name="document-send-symbolic",
+                                                  label="Ausführen"))
         self.send_btn.connect("clicked", self._run_instruction)
         instr_row.append(self.send_btn)
         box.append(instr_row)
-
-        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.END)
-        clear_btn = Gtk.Button(label="Leeren")
-        clear_btn.connect("clicked", lambda *_: self._set_text(""))
-        bottom.append(clear_btn)
-        copy_btn = Gtk.Button()
-        copy_btn.set_child(Adw.ButtonContent(icon_name="edit-copy-symbolic", label="Kopieren"))
-        copy_btn.connect("clicked", self._copy)
-        bottom.append(copy_btn)
-        box.append(bottom)
 
     def _start_viz(self) -> None:
         mode = str(load_config().get("audio_visualizer", "waves"))
@@ -675,8 +707,8 @@ class WorkbenchView(Gtk.Box):
             except Exception as exc:
                 self._set_status(f"arecord-Fehler: {exc}", error=True)
                 return
-            self._rec_btn_content.set_icon_name("media-playback-stop-symbolic")
-            self._rec_btn_content.set_label("Stopp")
+            self.rec_btn.set_icon_name("media-playback-stop-symbolic")
+            self.rec_btn.set_tooltip_text("Stopp (Strg+R)")
             self.rec_btn.remove_css_class("suggested-action")
             self.rec_btn.add_css_class("destructive-action")
             self._set_status("Aufnahme läuft …")
@@ -690,8 +722,8 @@ class WorkbenchView(Gtk.Box):
             pass
         self.rec_proc = None
         self._stop_viz()
-        self._rec_btn_content.set_icon_name("media-record-symbolic")
-        self._rec_btn_content.set_label("Aufnehmen")
+        self.rec_btn.set_icon_name("media-record-symbolic")
+        self.rec_btn.set_tooltip_text("Aufnehmen (Strg+R)")
         self.rec_btn.remove_css_class("destructive-action")
         self.rec_btn.add_css_class("suggested-action")
         self._set_status("Transkribiere …", busy=True)
@@ -831,24 +863,24 @@ class RecorderView(Gtk.Box):
 
     def _rec_button_state(self, recording: bool, saving: bool = False) -> None:
         if saving:
-            self._rec_content.set_icon_name("media-playback-stop-symbolic")
-            self._rec_content.set_label("Speichere …")
+            self.rec_btn.set_icon_name("media-playback-stop-symbolic")
+            self.rec_btn.set_tooltip_text("Speichere …")
             return
         if recording:
-            self._rec_content.set_icon_name("media-playback-stop-symbolic")
-            self._rec_content.set_label("Aufnahme stoppen")
+            self.rec_btn.set_icon_name("media-playback-stop-symbolic")
+            self.rec_btn.set_tooltip_text("Aufnahme stoppen")
             self.rec_btn.remove_css_class("suggested-action")
             self.rec_btn.add_css_class("destructive-action")
         else:
-            self._rec_content.set_icon_name("media-record-symbolic")
-            self._rec_content.set_label("Aufnahme starten")
+            self.rec_btn.set_icon_name("media-record-symbolic")
+            self.rec_btn.set_tooltip_text("Aufnahme starten")
             self.rec_btn.remove_css_class("destructive-action")
             self.rec_btn.add_css_class("suggested-action")
 
     def _pause_button_state(self, paused: bool) -> None:
-        self._pause_content.set_icon_name(
+        self.pause_btn.set_icon_name(
             "media-playback-start-symbolic" if paused else "media-playback-pause-symbolic")
-        self._pause_content.set_label("Fortsetzen" if paused else "Pause")
+        self.pause_btn.set_tooltip_text("Fortsetzen" if paused else "Pause")
 
     def _toast(self, t):
         if self._toast_cb:
@@ -905,35 +937,65 @@ class RecorderView(Gtk.Box):
         clamp.set_child(outer)
         cfg = load_config()
 
-        ctl = Adw.PreferencesGroup(
-            title="Neue Aufnahme",
-            description="Für Vorlesungen und Calls. Wird laufend gespeichert — "
-                        "ein Absturz kostet höchstens die letzten Sekunden.")
-        outer.append(ctl)
+        # Hero: big circular record button + pause + timer, source toggle and
+        # title underneath (GNOME-Sound-Recorder-style, no form rows).
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                       halign=Gtk.Align.CENTER, margin_top=4)
+        controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16,
+                           halign=Gtk.Align.CENTER)
+        self.pause_btn = Gtk.Button(icon_name="media-playback-pause-symbolic",
+                                    valign=Gtk.Align.CENTER)
+        self.pause_btn.add_css_class("circular")
+        self.pause_btn.add_css_class("record-circle-small")
+        self.pause_btn.set_tooltip_text("Pause")
+        self.pause_btn.set_visible(False)
+        self.pause_btn.connect("clicked", self._toggle_pause)
+        controls.append(self.pause_btn)
+        self.rec_btn = Gtk.Button(icon_name="media-record-symbolic",
+                                  valign=Gtk.Align.CENTER)
+        self.rec_btn.add_css_class("circular")
+        self.rec_btn.add_css_class("record-circle")
+        self.rec_btn.add_css_class("suggested-action")
+        self.rec_btn.set_tooltip_text("Aufnahme starten")
+        self.rec_btn.connect("clicked", self._toggle_record)
+        controls.append(self.rec_btn)
+        self.timer_label = Gtk.Label(label="", valign=Gtk.Align.CENTER)
+        self.timer_label.add_css_class("hero-timer")
+        self.timer_label.add_css_class("numeric")
+        controls.append(self.timer_label)
+        hero.append(controls)
+
         current_source = str(cfg.get("recorder_source", "both"))
         if hasattr(Adw, "ToggleGroup"):
             # One-click switching between call (Mic+System) and lecture (Mic).
-            source_row = Adw.ActionRow(title="Quelle")
-            self._source_toggle = Adw.ToggleGroup(valign=Gtk.Align.CENTER)
+            self._source_toggle = Adw.ToggleGroup(halign=Gtk.Align.CENTER)
             for value, label in (("both", "Mic + System"), ("system", "System"), ("mic", "Mic")):
                 toggle = Adw.Toggle(label=label)
                 toggle.set_name(value)
                 self._source_toggle.add(toggle)
             self._source_toggle.set_active_name(current_source)
             self._source_toggle.connect("notify::active", self._on_source_changed)
-            source_row.add_suffix(self._source_toggle)
+            hero.append(self._source_toggle)
             self.source_row = None
-            ctl.add(source_row)
         else:
             self._source_toggle = None
+        self.title_row = Gtk.Entry(halign=Gtk.Align.CENTER, width_chars=30)
+        self.title_row.set_placeholder_text("Titel (optional)")
+        hero.append(self.title_row)
+        hint = Gtk.Label(label="Wird laufend gespeichert — ein Absturz kostet höchstens Sekunden.")
+        hint.add_css_class("dim-label")
+        hint.add_css_class("hero-hint")
+        hero.append(hint)
+        outer.append(hero)
+
+        opt_group = Adw.PreferencesGroup()
+        outer.append(opt_group)
+        opt = Adw.ExpanderRow(title="Optionen", subtitle="Geräte, Modell, Qualität, Sprache, Chunk-Länge")
+        opt_group.add(opt)
+        if self._source_toggle is None:
             self.source_row = self._combo("Quelle", REC_SOURCE_OPTIONS, current_source)
             self.source_row.connect("notify::selected", self._on_source_changed)
-            ctl.add(self.source_row)
-        self.title_row = Adw.EntryRow(title="Titel (optional)")
-        ctl.add(self.title_row)
-
-        opt = Adw.ExpanderRow(title="Optionen", subtitle="Geräte, Modell, Qualität, Sprache, Chunk-Länge")
-        ctl.add(opt)
+            opt.add_row(self.source_row)
         # Device combos start with just the defaults; the real list is filled in
         # asynchronously by _load_devices_async() so construction never blocks.
         self._mic_opts = [("", "Standard-Mikrofon")]
@@ -1002,30 +1064,6 @@ class RecorderView(Gtk.Box):
         sys_box.append(self._sys_viz)
         self._meters_group.add(sys_box)
         self._meters_group.set_visible(False)
-
-        ctlbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12,
-                         halign=Gtk.Align.CENTER, margin_top=6)
-        outer.append(ctlbox)
-        self.rec_btn = Gtk.Button()
-        self._rec_content = Adw.ButtonContent(icon_name="media-record-symbolic",
-                                              label="Aufnahme starten")
-        self.rec_btn.set_child(self._rec_content)
-        self.rec_btn.add_css_class("pill")
-        self.rec_btn.add_css_class("suggested-action")
-        self.rec_btn.connect("clicked", self._toggle_record)
-        ctlbox.append(self.rec_btn)
-        self.pause_btn = Gtk.Button()
-        self._pause_content = Adw.ButtonContent(icon_name="media-playback-pause-symbolic",
-                                                label="Pause")
-        self.pause_btn.set_child(self._pause_content)
-        self.pause_btn.add_css_class("pill")
-        self.pause_btn.set_visible(False)
-        self.pause_btn.connect("clicked", self._toggle_pause)
-        ctlbox.append(self.pause_btn)
-        self.timer_label = Gtk.Label(label="")
-        self.timer_label.add_css_class("title-2")
-        self.timer_label.add_css_class("numeric")
-        ctlbox.append(self.timer_label)
 
         # Recordings are grouped by date (Heute/Gestern/…) at refresh time.
         self._list_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
