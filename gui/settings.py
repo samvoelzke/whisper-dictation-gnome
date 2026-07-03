@@ -325,6 +325,15 @@ def install_app_css() -> None:
         .hero-hint {
           font-size: 0.85em;
         }
+        /* List row actions appear on hover/keyboard focus only (calm rows) */
+        row .row-actions {
+          opacity: 0;
+          transition: opacity 150ms ease;
+        }
+        row:hover .row-actions,
+        row:focus-within .row-actions {
+          opacity: 1;
+        }
     """)
     Gtk.StyleContext.add_provider_for_display(
         display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
@@ -390,6 +399,8 @@ def fmt_duration(seconds: float) -> str:
 
 
 def fmt_size(num_bytes: int) -> str:
+    if num_bytes < 1024 * 1024:
+        return f"{max(1, round(num_bytes / 1024))} KB"
     mb = num_bytes / (1024 * 1024)
     return f"{mb:.0f} MB" if mb >= 10 else f"{mb:.1f} MB"
 
@@ -981,11 +992,9 @@ class RecorderView(Gtk.Box):
             self._source_toggle = None
         self.title_row = Gtk.Entry(halign=Gtk.Align.CENTER, width_chars=30)
         self.title_row.set_placeholder_text("Titel (optional)")
+        self.title_row.set_tooltip_text(
+            "Wird laufend gespeichert — ein Absturz kostet höchstens Sekunden.")
         hero.append(self.title_row)
-        hint = Gtk.Label(label="Wird laufend gespeichert — ein Absturz kostet höchstens Sekunden.")
-        hint.add_css_class("dim-label")
-        hint.add_css_class("hero-hint")
-        hero.append(hint)
         outer.append(hero)
 
         opt_group = Adw.PreferencesGroup()
@@ -1391,16 +1400,13 @@ class RecorderView(Gtk.Box):
         return False
 
     def _status_line(self, item):
-        parts = [fmt_duration(item.get("duration_seconds", 0)),
-                 REC_SOURCE_SHORT.get(item.get("source", ""), item.get("source", ""))]
+        # Slim on purpose: transcript/notes state lives in the leading icon,
+        # source + more detail on the detail page.
+        parts = [fmt_duration(item.get("duration_seconds", 0))]
         try:
             parts.append(fmt_size((RECORDINGS_DIR / f"{item['base']}.opus").stat().st_size))
         except OSError:
-            pass
-        if item.get("transcribed"):
-            parts.append("✓ Transkript")
-        if item.get("summarized"):
-            parts.append("✓ Notizen")
+            parts.append("Audio entfernt")
         return " · ".join(p for p in parts if p)
 
     def _add_row(self, item, group):
@@ -1432,8 +1438,11 @@ class RecorderView(Gtk.Box):
             row.add_suffix(Gtk.Spinner(spinning=True, valign=Gtk.Align.CENTER))
             return
         row.set_subtitle(self._status_line(item))
+        # Play/delete only appear on hover or keyboard focus (calm rows);
+        # 'Transkribieren' stays visible — it is the row's pending action.
         play = Gtk.Button(icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER)
         play.add_css_class("flat")
+        play.add_css_class("row-actions")
         play.set_tooltip_text("Anhören")
         play.connect("clicked", lambda b, x=base: self._toggle_row_preview(x, b))
         row.add_suffix(play)
@@ -1444,6 +1453,7 @@ class RecorderView(Gtk.Box):
             row.add_suffix(b)
         trash = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
         trash.add_css_class("flat")
+        trash.add_css_class("row-actions")
         trash.set_tooltip_text("Löschen")
         trash.connect("clicked", lambda _b, x=base: self._delete(x))
         row.add_suffix(trash)
@@ -2405,6 +2415,8 @@ class RecorderView(Gtk.Box):
         self._preview_btn = btn
         btn.set_icon_name("media-playback-stop-symbolic")
         btn.set_tooltip_text("Stopp")
+        # Keep the button visible while playing (it is hover-only otherwise).
+        btn.remove_css_class("row-actions")
         media.connect("notify::ended",
                       lambda m, _p: self._stop_row_preview() if m is self._preview_media else None)
         media.play()
@@ -2419,6 +2431,7 @@ class RecorderView(Gtk.Box):
             try:
                 self._preview_btn.set_icon_name("media-playback-start-symbolic")
                 self._preview_btn.set_tooltip_text("Anhören")
+                self._preview_btn.add_css_class("row-actions")
             except Exception:
                 pass
         self._preview_media = None
@@ -3200,8 +3213,10 @@ class SettingsWindow(Adw.ApplicationWindow):
             row.set_title(GLib.markup_escape_text(preview))
             row._search_text = text.lower()
 
+            # Actions appear on hover/focus only — rows stay calm.
             copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
             copy.add_css_class("flat")
+            copy.add_css_class("row-actions")
             copy.set_tooltip_text("Kopieren")
             copy.connect("clicked", lambda _b, t=text: self._copy_text(t))
             row.add_suffix(copy)
@@ -3209,15 +3224,18 @@ class SettingsWindow(Adw.ApplicationWindow):
             if raw and raw != text:
                 raw_btn = Gtk.Button(icon_name="edit-undo-symbolic", valign=Gtk.Align.CENTER)
                 raw_btn.add_css_class("flat")
+                raw_btn.add_css_class("row-actions")
                 raw_btn.set_tooltip_text("Rohtext kopieren (vor KI-Bearbeitung)")
                 raw_btn.connect("clicked", lambda _b, t=raw: self._copy_text(t))
                 row.add_suffix(raw_btn)
             load = Gtk.Button(label="In Werkbank", valign=Gtk.Align.CENTER)
             load.add_css_class("flat")
+            load.add_css_class("row-actions")
             load.connect("clicked", lambda _b, t=text: self._load_to_workbench(t))
             row.add_suffix(load)
             trash = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
             trash.add_css_class("flat")
+            trash.add_css_class("row-actions")
             trash.set_tooltip_text("Eintrag löschen")
             trash.connect("clicked", lambda _b, t=ts: self._delete_history_entry(t))
             row.add_suffix(trash)
