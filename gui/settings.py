@@ -318,6 +318,28 @@ def install_app_css() -> None:
           min-height: 42px;
           -gtk-icon-size: 17px;
         }
+        /* Idle record button: soft red tint (red dot = record, universally
+           understood); while recording the button switches to solid
+           destructive red with a stop icon. */
+        .record-idle {
+          color: @error_color;
+          background: alpha(@error_color, 0.1);
+        }
+        .record-idle:hover {
+          background: alpha(@error_color, 0.18);
+        }
+        .record-idle:active {
+          background: alpha(@error_color, 0.26);
+        }
+        /* Preset chips: quiet pills instead of naked text */
+        .chip {
+          border-radius: 9999px;
+          padding: 3px 12px;
+          background: alpha(@window_fg_color, 0.07);
+        }
+        .chip:hover {
+          background: alpha(@window_fg_color, 0.13);
+        }
         .hero-timer {
           font-size: 1.5em;
           font-weight: 300;
@@ -591,7 +613,7 @@ class WorkbenchView(Gtk.Box):
                                   halign=Gtk.Align.CENTER)
         self.rec_btn.add_css_class("circular")
         self.rec_btn.add_css_class("record-circle")
-        self.rec_btn.add_css_class("suggested-action")
+        self.rec_btn.add_css_class("record-idle")
         self.rec_btn.set_tooltip_text("Aufnehmen (Strg+R)")
         self.rec_btn.connect("clicked", self._toggle_record)
         hero.append(self.rec_btn)
@@ -637,7 +659,22 @@ class WorkbenchView(Gtk.Box):
         )
         self.text_view.add_css_class("editor-view")
         scroller.set_child(self.text_view)
-        box.append(scroller)
+        # Placeholder in the empty editor (vanishes with the first character).
+        overlay = Gtk.Overlay()
+        overlay.set_child(scroller)
+        self._placeholder = Gtk.Label(
+            label="Diktiere mit dem Aufnahme-Knopf –\noder tippe einfach los …",
+            halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
+            justify=Gtk.Justification.CENTER,
+        )
+        self._placeholder.add_css_class("dim-label")
+        self._placeholder.set_can_target(False)  # clicks fall through to the editor
+        overlay.add_overlay(self._placeholder)
+        self.text_view.get_buffer().connect(
+            "changed",
+            lambda buf: self._placeholder.set_visible(buf.get_char_count() == 0),
+        )
+        box.append(overlay)
 
         # Adw.WrapBox (libadwaita >= 1.7) wraps unevenly sized chips naturally;
         # FlowBox stays as fallback for older libadwaita.
@@ -652,6 +689,7 @@ class WorkbenchView(Gtk.Box):
         for label, instruction in WB_PRESETS:
             chip = Gtk.Button(label=label)
             chip.add_css_class("flat")
+            chip.add_css_class("chip")
             chip.connect("clicked", lambda _b, i=instruction: self._do_instruct(i))
             presets.append(chip)
         box.append(presets)
@@ -720,7 +758,7 @@ class WorkbenchView(Gtk.Box):
                 return
             self.rec_btn.set_icon_name("media-playback-stop-symbolic")
             self.rec_btn.set_tooltip_text("Stopp (Strg+R)")
-            self.rec_btn.remove_css_class("suggested-action")
+            self.rec_btn.remove_css_class("record-idle")
             self.rec_btn.add_css_class("destructive-action")
             self._set_status("Aufnahme läuft …")
             self._start_viz()
@@ -736,7 +774,7 @@ class WorkbenchView(Gtk.Box):
         self.rec_btn.set_icon_name("media-record-symbolic")
         self.rec_btn.set_tooltip_text("Aufnehmen (Strg+R)")
         self.rec_btn.remove_css_class("destructive-action")
-        self.rec_btn.add_css_class("suggested-action")
+        self.rec_btn.add_css_class("record-idle")
         self._set_status("Transkribiere …", busy=True)
         wav = self.rec_wav
 
@@ -880,13 +918,13 @@ class RecorderView(Gtk.Box):
         if recording:
             self.rec_btn.set_icon_name("media-playback-stop-symbolic")
             self.rec_btn.set_tooltip_text("Aufnahme stoppen")
-            self.rec_btn.remove_css_class("suggested-action")
+            self.rec_btn.remove_css_class("record-idle")
             self.rec_btn.add_css_class("destructive-action")
         else:
             self.rec_btn.set_icon_name("media-record-symbolic")
             self.rec_btn.set_tooltip_text("Aufnahme starten")
             self.rec_btn.remove_css_class("destructive-action")
-            self.rec_btn.add_css_class("suggested-action")
+            self.rec_btn.add_css_class("record-idle")
 
     def _pause_button_state(self, paused: bool) -> None:
         self.pause_btn.set_icon_name(
@@ -966,7 +1004,7 @@ class RecorderView(Gtk.Box):
                                   valign=Gtk.Align.CENTER)
         self.rec_btn.add_css_class("circular")
         self.rec_btn.add_css_class("record-circle")
-        self.rec_btn.add_css_class("suggested-action")
+        self.rec_btn.add_css_class("record-idle")
         self.rec_btn.set_tooltip_text("Aufnahme starten")
         self.rec_btn.connect("clicked", self._toggle_record)
         controls.append(self.rec_btn)
