@@ -693,13 +693,22 @@ def cmd_summarize(args: argparse.Namespace) -> int:
 
     # ~3000 words (~4k tokens) per map block: well within qwen2.5's 32k context,
     # while keeping the number of LLM calls (and latency) low on long transcripts.
+    # Style rules keep the notes lean: no top-level title (the page already
+    # shows it), scope follows the recording length, no empty boilerplate
+    # sections on short recordings.
+    style = (
+        "Beginne DIREKT mit dem Inhalt — keine Hauptueberschrift, kein Titel, "
+        "keine Vorrede. Passe den Umfang der Laenge an: kurze Aufnahme = wenige "
+        "praegnante Stichpunkte ohne Gliederungs-Geruest; nur bei langen "
+        "Aufnahmen ##-Abschnitte. Keine leeren oder inhaltslosen Abschnitte."
+    )
     blocks = _split_words(transcript, 3000)
     if len(blocks) == 1:
         summary = _ollama_chat(cfg,
             "Du bist ein praeziser Notiz-Assistent. Antworte auf Deutsch, behalte "
-            "englische Fachbegriffe bei und erfinde nichts.",
-            f"Erstelle aus dieser Transkription eine gut strukturierte Zusammenfassung "
-            f"mit Markdown-Ueberschriften und Stichpunkten. Fokus: {focus}.\n\n{transcript}")
+            "englische Fachbegriffe bei und erfinde nichts. " + style,
+            f"Erstelle aus dieser Transkription kompakte Markdown-Notizen "
+            f"(Stichpunkte, ggf. ##-Abschnitte). Fokus: {focus}.\n\n{transcript}")
     else:
         partials = []
         for idx, block in enumerate(blocks, 1):
@@ -712,18 +721,26 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         print("[recorder] summarize reduce", flush=True)
         summary = _ollama_chat(cfg,
             "Du bist ein praeziser Notiz-Assistent. Antworte auf Deutsch, behalte englische "
-            "Fachbegriffe bei, erfinde nichts.",
+            "Fachbegriffe bei, erfinde nichts. " + style,
             f"Hier sind Teil-Zusammenfassungen einer langen Aufnahme (in Reihenfolge). "
-            f"Fuege sie zu EINER zusammenhaengenden, gut strukturierten Zusammenfassung mit "
-            f"Markdown-Ueberschriften und Stichpunkten zusammen. Fokus: {focus}.\n\n"
+            f"Fuege sie zu EINER zusammenhaengenden, gut strukturierten Zusammenfassung "
+            f"mit ##-Abschnitten und Stichpunkten zusammen. Fokus: {focus}.\n\n"
             + "\n\n".join(partials), timeout=420)
 
-    meta = _read_json(RECORDINGS_DIR / f"{base}.meta.json", {})
-    header = f"# {meta.get('title', base)}\n\n*Fokus: {focus}*\n\n"
-    summary_path = RECORDINGS_DIR / f"{base}.summary.md"
-    summary_path.write_text(header + summary + "\n", encoding="utf-8")
+    # Notes accumulate: several summaries with different foci can coexist
+    # (Protokoll + Action-Items side by side). The GUI shows one card each.
+    notes_path = RECORDINGS_DIR / f"{base}.notes.json"
+    notes = _read_json(notes_path, [])
+    if not isinstance(notes, list):
+        notes = []
+    notes.append({
+        "focus": focus,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "text": summary.strip(),
+    })
+    _write_json(notes_path, notes)
     _notify("Zusammenfassung fertig", base)
-    print(json.dumps({"base": base, "status": "done", "summary": str(summary_path)}))
+    print(json.dumps({"base": base, "status": "done", "notes": len(notes)}))
     return 0
 
 
@@ -848,7 +865,10 @@ def cmd_list(_args: argparse.Namespace) -> int:
             "transcribed": txt.exists() and prog.get("status") == "done",
             "transcribe_status": prog.get("status", ""),
             "percent": prog.get("percent"),
-            "summarized": (RECORDINGS_DIR / f"{base}.summary.md").exists(),
+            "summarized": (
+                (RECORDINGS_DIR / f"{base}.summary.md").exists()
+                or bool(_read_json(RECORDINGS_DIR / f"{base}.notes.json", []))
+            ),
         })
     print(json.dumps({"recordings": items, "active": active}))
     return 0
@@ -857,7 +877,7 @@ def cmd_list(_args: argparse.Namespace) -> int:
 def cmd_delete(args: argparse.Namespace) -> int:
     base = args.base
     for suffix in (".opus", ".meta.json", ".txt", ".progress.json",
-                   ".summary.md", ".chapters.json"):
+                   ".summary.md", ".notes.json", ".chapters.json"):
         (RECORDINGS_DIR / f"{base}{suffix}").unlink(missing_ok=True)
     print(json.dumps({"base": base, "status": "deleted"}))
     return 0
