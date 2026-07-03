@@ -4746,17 +4746,16 @@ class SettingsWindow(Adw.ApplicationWindow):
                 bucket, stamp = "Älter", ""
             if bucket != current_bucket:
                 group = Adw.PreferencesGroup(title=bucket)
-                if not self._history_groups:
-                    group.set_description("Zuletzt eingesprochene Texte — kopieren "
-                                          "oder in der Werkbank weiterbearbeiten.")
                 self._history_page.add(group)
                 self._history_groups.append(group)
                 current_bucket = bucket
-            preview = (text[:90] + "…") if len(text) > 90 else (text or "(leer)")
-            words = len(text.split())
-            sub = f"{stamp} · {words} Wörter" if stamp and words else stamp
-            row = Adw.ExpanderRow(subtitle=sub)
+            # One calm line per dictation: ellipsized preview, time on the
+            # right (messaging-app style); details live in the expansion.
+            preview = " ".join(text.split())[:120] or "(leer)"
+            row = Adw.ExpanderRow()
             row.set_title(GLib.markup_escape_text(preview))
+            if hasattr(row, "set_title_lines"):
+                row.set_title_lines(1)
             row._search_text = text.lower()
             row._group = group
 
@@ -4786,11 +4785,24 @@ class SettingsWindow(Adw.ApplicationWindow):
             trash.set_tooltip_text("Eintrag löschen")
             trash.connect("clicked", lambda _b, t=ts: self._delete_history_entry(t))
             row.add_suffix(trash)
+            time_lbl = Gtk.Label(label=stamp, valign=Gtk.Align.CENTER)
+            time_lbl.add_css_class("caption")
+            time_lbl.add_css_class("numeric")
+            time_lbl.add_css_class("dimmed")
+            row.add_suffix(time_lbl)
 
-            full = Gtk.Label(label=text, wrap=True, xalign=0, selectable=True,
-                             margin_top=8, margin_bottom=10,
-                             margin_start=14, margin_end=14)
-            row.add_row(full)
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                           margin_top=8, margin_bottom=10,
+                           margin_start=14, margin_end=14)
+            words = len(text.split())
+            meta = Gtk.Label(label=f"{words} {'Wort' if words == 1 else 'Wörter'}",
+                             xalign=0)
+            meta.add_css_class("caption")
+            meta.add_css_class("dimmed")
+            body.append(meta)
+            body.append(Gtk.Label(label=text, wrap=True, xalign=0,
+                                  selectable=True))
+            row.add_row(body)
 
             group.add(row)
             self._history_rows.append(row)
