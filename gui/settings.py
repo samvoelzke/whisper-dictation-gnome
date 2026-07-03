@@ -1734,106 +1734,113 @@ class RecorderView(Gtk.Box):
         if self._poll_id is None:
             self._poll_id = GLib.timeout_add(400, self._poll_progress)
 
-    # One-click summary styles for the common cases (free text stays possible).
-    # Protokoll first: the all-in-one (topics + decisions + resulting tasks).
+    # One-click AI tools: (label, icon, one-line description, focus prompt).
     FOCUS_PRESETS = (
-        ("Protokoll",
+        ("Zusammenfassung", "view-paged-symbolic",
+         "Kurz und knapp: die wichtigsten Inhalte",
+         "die wichtigsten Inhalte und Kernaussagen — als kompakte Zusammenfassung"),
+        ("Protokoll", "text-editor-symbolic",
+         "Themen, Entscheidungen und nächste Schritte",
          "besprochene Themen und getroffene Entscheidungen — als Protokoll, mit einem "
          "Abschnitt 'Nächste Schritte' für die daraus resultierenden Aufgaben"),
-        ("Vorlesungsnotizen",
+        ("Vorlesungsnotizen", "accessories-dictionary-symbolic",
+         "Lernstoff, Definitionen, Beispiele",
          "prüfungsrelevante Inhalte, Definitionen und Beispiele — als strukturierte Lernnotizen"),
-        ("Aufgaben",
+        ("Aufgaben", "checkbox-checked-symbolic",
+         "To-do-Liste mit Verantwortlichen und Fristen",
          "Aufgaben, Verantwortliche und Fristen — als kompakte Aufgabenliste"),
     )
 
     def _open_ai_tools(self, base):
-        """One entry point on the transcript: pick a template (built-in or
-        own, deletable) or run a one-off custom instruction — each result
-        becomes its own tab named after the chosen category."""
+        """One entry point on the transcript: pick a tool (built-in preset or
+        saved template) or write a custom instruction — each result becomes
+        its own tab named after the chosen category."""
         if not (RECORDINGS_DIR / f"{base}.txt").exists():
             self._toast("Erst transkribieren — die KI arbeitet auf dem Transkript.")
             return
-        dlg = Adw.AlertDialog(
-            heading="KI-Tools",
-            body="Was soll aus dem Transkript erstellt werden?")
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-
-        if hasattr(Adw, "WrapBox"):
-            chips = Adw.WrapBox(child_spacing=6, line_spacing=6)
-        else:
-            chips = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        dlg = Adw.Dialog(title="KI-Tools", content_width=460)
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                        margin_top=6, margin_bottom=18, margin_start=18, margin_end=18)
 
         def run(focus: str, label: str) -> None:
             dlg.force_close()
             self._summarize(base, focus, label)
 
-        for label, focus in self.FOCUS_PRESETS:
-            chip = Gtk.Button(label=label)
-            chip.add_css_class("pill")
-            chip.connect("clicked", lambda _b, f=focus, l=label: run(f, l))
-            chips.append(chip)
-        # user templates: runnable + deletable
-        for preset in list(load_config().get("note_presets") or []):
-            p_label = str(preset.get("label", "")).strip()
-            p_focus = str(preset.get("focus", "")).strip()
-            if not p_label or not p_focus:
-                continue
-            group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-            chip = Gtk.Button(label=p_label)
-            chip.add_css_class("pill")
-            chip.add_css_class("chip-accent")
-            chip.set_tooltip_text(p_focus)
-            chip.connect("clicked", lambda _b, f=p_focus, l=p_label: run(f, l))
-            group.append(chip)
-            remove = Gtk.Button(icon_name="window-close-symbolic", valign=Gtk.Align.CENTER)
-            remove.add_css_class("flat")
-            remove.set_tooltip_text("Vorlage löschen")
-            remove.connect("clicked",
-                           lambda _b, l=p_label, g=group: self._delete_note_preset(l, g))
-            group.append(remove)
-            chips.append(group)
-        content.append(chips)
+        # Built-in tools as a boxed list with icon + description
+        tools = Adw.PreferencesGroup(
+            description="Was soll aus dem Transkript erstellt werden?")
+        for label, icon, desc, focus in self.FOCUS_PRESETS:
+            row = Adw.ActionRow(title=label, subtitle=desc, activatable=True)
+            row.add_prefix(Gtk.Image(icon_name=icon))
+            row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            row.connect("activated", lambda _r, f=focus, l=label: run(f, l))
+            tools.add(row)
+        outer.append(tools)
 
-        label_entry = Gtk.Entry()
-        label_entry.set_placeholder_text("Oberkategorie / Tab-Name (z. B. Q&A-Liste)")
-        content.append(label_entry)
-        focus_entry = Gtk.Entry()
-        focus_entry.set_placeholder_text("Eigener Auftrag an die KI …")
-        content.append(focus_entry)
-        save_check = Gtk.CheckButton(label="Als Vorlage speichern (wiederverwendbar)")
-        content.append(save_check)
-        dlg.set_extra_child(content)
-        dlg.add_response("cancel", "Abbrechen")
-        dlg.add_response("go", "Ausführen")
-        dlg.set_response_appearance("go", Adw.ResponseAppearance.SUGGESTED)
-        dlg.set_default_response("go")
+        # Saved templates (deletable)
+        presets = [p for p in (load_config().get("note_presets") or [])
+                   if str(p.get("label", "")).strip() and str(p.get("focus", "")).strip()]
+        if presets:
+            tpl_group = Adw.PreferencesGroup(title="Eigene Vorlagen")
+            for preset in presets:
+                p_label = str(preset["label"]).strip()
+                p_focus = str(preset["focus"]).strip()
+                row = Adw.ActionRow(title=p_label, subtitle=p_focus, activatable=True)
+                row.add_prefix(Gtk.Image(icon_name="starred-symbolic"))
+                row.connect("activated", lambda _r, f=p_focus, l=p_label: run(f, l))
+                remove = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
+                remove.add_css_class("flat")
+                remove.set_tooltip_text("Vorlage löschen")
+                remove.connect("clicked",
+                               lambda _b, l=p_label, r=row, g=tpl_group:
+                               (g.remove(r), self._delete_note_preset(l)))
+                row.add_suffix(remove)
+                tpl_group.add(row)
+            outer.append(tpl_group)
 
-        def run_custom() -> None:
-            focus = focus_entry.get_text().strip()
-            label = label_entry.get_text().strip() or "Zusammenfassung"
-            if save_check.get_active() and focus:
+        # Custom instruction
+        custom = Adw.PreferencesGroup(title="Eigener Auftrag")
+        label_row = Adw.EntryRow(title="Name / Tab (z. B. Fragenliste)")
+        custom.add(label_row)
+        focus_row = Adw.EntryRow(title="Auftrag an die KI …")
+        custom.add(focus_row)
+        save_row = Adw.SwitchRow(title="Als Vorlage speichern",
+                                 subtitle="Wiederverwendbar im KI-Tools-Menü")
+        custom.add(save_row)
+        run_row = Adw.ButtonRow(title="Ausführen")
+        run_row.add_css_class("suggested-action")
+        custom.add(run_row)
+        outer.append(custom)
+
+        def run_custom(*_a) -> None:
+            focus = focus_row.get_text().strip()
+            if not focus:
+                self._toast("Bitte einen Auftrag eingeben.")
+                return
+            label = label_row.get_text().strip() or "Zusammenfassung"
+            if save_row.get_active():
                 cfg = load_config()
-                presets = [p for p in (cfg.get("note_presets") or [])
-                           if str(p.get("label", "")) != label]
-                presets.append({"label": label[:30], "focus": focus})
-                cfg["note_presets"] = presets
+                kept = [p for p in (cfg.get("note_presets") or [])
+                        if str(p.get("label", "")) != label]
+                kept.append({"label": label[:30], "focus": focus})
+                cfg["note_presets"] = kept
                 save_config(cfg)
                 self._toast(f"Vorlage „{label}“ gespeichert ✓")
-            self._summarize(base, focus, label)
+            run(focus, label)
 
-        dlg.connect("response",
-                    lambda _d, resp: run_custom() if resp == "go" else None)
-        focus_entry.connect("activate", lambda *_: (dlg.force_close(), run_custom()))
+        run_row.connect("activated", run_custom)
+        focus_row.connect("entry-activated", run_custom)
+        toolbar.set_content(outer)
+        dlg.set_child(toolbar)
         dlg.present(self.get_root())
 
-    def _delete_note_preset(self, label: str, widget) -> None:
+    def _delete_note_preset(self, label: str) -> None:
         cfg = load_config()
         cfg["note_presets"] = [p for p in (cfg.get("note_presets") or [])
                                if str(p.get("label", "")) != label]
         save_config(cfg)
-        parent = widget.get_parent()
-        if parent is not None:
-            parent.remove(widget)
         self._toast(f"Vorlage „{label}“ gelöscht")
 
     def _summarize(self, base, focus, label: str = "Zusammenfassung"):
@@ -2638,7 +2645,11 @@ class RecorderView(Gtk.Box):
             return label
         # Older notes have no stored label — derive a meaningful one from
         # the focus (or the note text for pre-label summaries).
-        hint = (str(note.get("focus", "")) + " " + str(note.get("text", ""))[:200]).lower()
+        focus = str(note.get("focus", "")).strip()
+        for preset_label, _icon, _desc, preset_focus in self.FOCUS_PRESETS:
+            if focus == preset_focus:
+                return preset_label
+        hint = (focus + " " + str(note.get("text", ""))[:200]).lower()
         if "protokoll" in hint:
             return "Protokoll"
         if "action-item" in hint or "aufgaben" in hint:
