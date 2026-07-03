@@ -623,7 +623,8 @@ def _maybe_auto_note(base: str, cfg: dict[str, Any], duration: float) -> None:
     label, focus = KIND_NOTES[kind]
     print(f"[recorder] auto-note: {kind} -> {label}", flush=True)
     try:
-        cmd_summarize(argparse.Namespace(base=base, focus=focus, label=label))
+        cmd_summarize(argparse.Namespace(base=base, focus=focus, label=label,
+                                         quiet=True))
     except Exception as exc:  # noqa: BLE001 — best effort
         print(f"[recorder] auto-note failed: {exc}", file=sys.stderr, flush=True)
 
@@ -772,7 +773,7 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
             and total >= 20:
         _progress(total, "speakers", segs)
         try:
-            cmd_diarize(argparse.Namespace(base=base))
+            cmd_diarize(argparse.Namespace(base=base, quiet=True))
         except Exception as exc:  # noqa: BLE001 — best effort
             print(f"[recorder] speakers skipped: {exc}", file=sys.stderr, flush=True)
     if cfg.get("recorder_auto_chapters", True) and total >= 120:
@@ -885,7 +886,8 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         "text": summary.strip(),
     })
     _write_json(notes_path, notes)
-    _notify("Zusammenfassung fertig", base)
+    if not getattr(args, "quiet", False):  # pipeline: one notification at the end
+        _notify("Zusammenfassung fertig", base)
     print(json.dumps({"base": base, "status": "done", "notes": len(notes)}))
     return 0
 
@@ -1013,7 +1015,8 @@ def cmd_diarize(args: argparse.Namespace) -> int:
         atomic_write(txt_path, "\n\n".join(out_lines) + "\n")
 
     n_speakers = len({l for _, _, l in labels})
-    _notify("Sprecher erkannt", f"{base}: {n_speakers} Sprecher")
+    if not getattr(args, "quiet", False):  # pipeline: one notification at the end
+        _notify("Sprecher erkannt", f"{base}: {n_speakers} Sprecher")
     print(json.dumps({"base": base, "speakers": n_speakers,
                       "has_me": any(l == "Ich" for _, _, l in labels)}))
     return 0

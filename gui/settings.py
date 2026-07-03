@@ -465,6 +465,15 @@ def install_app_css() -> None:
         .record-idle:active {
           background: alpha(@error_color, 0.26);
         }
+        /* While recording: a soft sonar pulse around the button - visible
+           from across the room that the mic is hot */
+        @keyframes rec-pulse {
+          from { box-shadow: 0 0 0 0 alpha(@error_color, 0.40); }
+          to   { box-shadow: 0 0 0 16px alpha(@error_color, 0.0); }
+        }
+        .record-live {
+          animation: rec-pulse 1.5s ease-out infinite;
+        }
         /* Document-style reading views: no visible box, larger comfortable
            text - Transkript/Notizen read like an article, not a form field */
         textview.doc-view,
@@ -1002,11 +1011,12 @@ class WorkbenchView(Gtk.Box):
         box.append(self._viz)
         self._meter = LevelMeter(self._viz.push)
 
-        # Editor with its own compact toolbar (title + clear/copy).
+        # Editor with its own compact toolbar (live word count + clear/copy).
         editor_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        editor_title = Gtk.Label(label="Text", xalign=0, hexpand=True)
-        editor_title.add_css_class("heading")
-        editor_head.append(editor_title)
+        self._count_lbl = Gtk.Label(label="", xalign=0, hexpand=True)
+        self._count_lbl.add_css_class("caption")
+        self._count_lbl.add_css_class("dimmed")
+        editor_head.append(self._count_lbl)
         clear_btn = Gtk.Button(icon_name="edit-clear-all-symbolic", valign=Gtk.Align.CENTER)
         clear_btn.add_css_class("flat")
         clear_btn.set_tooltip_text("Leeren")
@@ -1039,10 +1049,7 @@ class WorkbenchView(Gtk.Box):
         self._placeholder.add_css_class("dimmed")
         self._placeholder.set_can_target(False)  # clicks fall through to the editor
         overlay.add_overlay(self._placeholder)
-        self.text_view.get_buffer().connect(
-            "changed",
-            lambda buf: self._placeholder.set_visible(buf.get_char_count() == 0),
-        )
+        self.text_view.get_buffer().connect("changed", self._on_buffer_changed)
         box.append(overlay)
 
         # Adw.WrapBox (libadwaita >= 1.7) wraps unevenly sized chips naturally;
@@ -1074,6 +1081,16 @@ class WorkbenchView(Gtk.Box):
         self.send_btn.connect("clicked", self._run_instruction)
         instr_row.append(self.send_btn)
         box.append(instr_row)
+
+    def _on_buffer_changed(self, buf) -> None:
+        chars = buf.get_char_count()
+        self._placeholder.set_visible(chars == 0)
+        if chars == 0:
+            self._count_lbl.set_label("")
+            return
+        words = len(buf.get_text(buf.get_start_iter(), buf.get_end_iter(),
+                                 False).split())
+        self._count_lbl.set_label(f"{words} Wörter · {chars} Zeichen")
 
     def _start_viz(self) -> None:
         mode = str(load_config().get("audio_visualizer", "waves"))
@@ -1133,6 +1150,7 @@ class WorkbenchView(Gtk.Box):
             self.rec_btn.set_tooltip_text("Stopp (Strg+R)")
             self.rec_btn.remove_css_class("record-idle")
             self.rec_btn.add_css_class("destructive-action")
+            self.rec_btn.add_css_class("record-live")
             self._set_status("Aufnahme läuft …")
             self._start_viz()
             return
@@ -1147,6 +1165,7 @@ class WorkbenchView(Gtk.Box):
         self.rec_btn.set_icon_name("media-record-symbolic")
         self.rec_btn.set_tooltip_text("Aufnehmen (Strg+R)")
         self.rec_btn.remove_css_class("destructive-action")
+        self.rec_btn.remove_css_class("record-live")
         self.rec_btn.add_css_class("record-idle")
         self._set_status("Transkribiere …", busy=True)
         wav = self.rec_wav
@@ -1338,10 +1357,12 @@ class RecorderView(Gtk.Box):
             self.rec_btn.set_tooltip_text("Aufnahme stoppen")
             self.rec_btn.remove_css_class("record-idle")
             self.rec_btn.add_css_class("destructive-action")
+            self.rec_btn.add_css_class("record-live")
         else:
             self.rec_btn.set_icon_name("media-record-symbolic")
             self.rec_btn.set_tooltip_text("Aufnahme starten")
             self.rec_btn.remove_css_class("destructive-action")
+            self.rec_btn.remove_css_class("record-live")
             self.rec_btn.add_css_class("record-idle")
 
     def _pause_button_state(self, paused: bool) -> None:
@@ -3112,6 +3133,12 @@ class RecorderView(Gtk.Box):
         self._detail_base = None
         self._detail = {}
         self._stop_play()
+        if self._media is not None:  # don't keep playing behind the list
+            try:
+                self._media.pause()
+            except Exception:
+                pass
+            self._media = None
         # back on the list: resume live meters
         self._start_meters()
 
@@ -4620,23 +4647,24 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _build_history_page(self) -> Gtk.Box:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        search_clamp = Adw.Clamp(maximum_size=940, tightening_threshold=720,
-                                 margin_top=12, margin_start=12, margin_end=12)
-        self._history_search = Gtk.SearchEntry(placeholder_text="Verlauf durchsuchen …")
+        top_clamp = Adw.Clamp(maximum_size=940, tightening_threshold=720,
+                              margin_top=12, margin_start=12, margin_end=12)
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._history_search = Gtk.SearchEntry(
+            placeholder_text="Verlauf durchsuchen …", hexpand=True)
         self._history_search.connect("search-changed", lambda *_: self._filter_history())
-        search_clamp.set_child(self._history_search)
-        box.append(search_clamp)
-
-        self._history_page = Adw.PreferencesPage(vexpand=True)
-        self._history_group = Adw.PreferencesGroup(
-            title="Verlauf der Diktate",
-            description="Zuletzt eingesprochene Texte — kopieren oder in der Werkbank weiterbearbeiten.",
-        )
-        clear = Gtk.Button(label="Alle löschen", valign=Gtk.Align.CENTER)
+        top.append(self._history_search)
+        clear = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
         clear.add_css_class("flat")
+        clear.set_tooltip_text("Ganzen Verlauf löschen")
         clear.connect("clicked", self._clear_history)
-        self._history_group.set_header_suffix(clear)
-        self._history_page.add(self._history_group)
+        top.append(clear)
+        top_clamp.set_child(top)
+        box.append(top_clamp)
+
+        # Entries grouped by day (Heute/Gestern/…), rebuilt on refresh.
+        self._history_page = Adw.PreferencesPage(vexpand=True)
+        self._history_groups: list = []
         box.append(self._history_page)
 
         self._history_empty = Adw.StatusPage(
@@ -4651,8 +4679,9 @@ class SettingsWindow(Adw.ApplicationWindow):
         return box
 
     def _refresh_history(self) -> None:
-        for row in self._history_rows:
-            self._history_group.remove(row)
+        for group in self._history_groups:
+            self._history_page.remove(group)
+        self._history_groups = []
         self._history_rows = []
         entries = read_history(100)
         has_entries = bool(entries)
@@ -4661,13 +4690,32 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._history_empty.set_visible(not has_entries)
         if not has_entries:
             return
+        import datetime as _dt
+        current_bucket = None
+        group = None
         for entry in reversed(entries):
             text = str(entry.get("text", "")).strip()
             ts = entry.get("ts")
+            try:
+                when = _dt.datetime.fromtimestamp(float(ts))
+                bucket = date_bucket(when.isoformat())
+                stamp = (when.strftime("%H:%M") if bucket in ("Heute", "Gestern")
+                         else when.strftime("%d.%m. %H:%M"))
+            except (TypeError, ValueError, OSError):
+                bucket, stamp = "Älter", ""
+            if bucket != current_bucket:
+                group = Adw.PreferencesGroup(title=bucket)
+                if not self._history_groups:
+                    group.set_description("Zuletzt eingesprochene Texte — kopieren "
+                                          "oder in der Werkbank weiterbearbeiten.")
+                self._history_page.add(group)
+                self._history_groups.append(group)
+                current_bucket = bucket
             preview = (text[:90] + "…") if len(text) > 90 else (text or "(leer)")
-            row = Adw.ExpanderRow(subtitle=format_ts(ts))
+            row = Adw.ExpanderRow(subtitle=stamp)
             row.set_title(GLib.markup_escape_text(preview))
             row._search_text = text.lower()
+            row._group = group
 
             # Actions appear on hover/focus only — rows stay calm.
             copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
@@ -4701,14 +4749,20 @@ class SettingsWindow(Adw.ApplicationWindow):
                              margin_start=14, margin_end=14)
             row.add_row(full)
 
-            self._history_group.add(row)
+            group.add(row)
             self._history_rows.append(row)
         self._filter_history()
 
     def _filter_history(self) -> None:
         needle = self._history_search.get_text().strip().lower()
+        visible_groups = set()
         for row in self._history_rows:
-            row.set_visible(not needle or needle in getattr(row, "_search_text", ""))
+            show = not needle or needle in getattr(row, "_search_text", "")
+            row.set_visible(show)
+            if show:
+                visible_groups.add(getattr(row, "_group", None))
+        for group in self._history_groups:  # day headers without hits vanish
+            group.set_visible(group in visible_groups)
 
     def _delete_history_entry(self, ts) -> None:
         try:
@@ -4736,11 +4790,26 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.stack.set_visible_child_name("werkbank")
 
     def _clear_history(self, *_a) -> None:
-        try:
-            rewrite_history([])
-        except Exception:
-            pass
-        self._refresh_history()
+        dlg = Adw.AlertDialog(
+            heading="Ganzen Verlauf löschen?",
+            body="Alle gespeicherten Diktate werden entfernt. Das lässt sich "
+                 "nicht rückgängig machen.")
+        dlg.add_response("cancel", "Abbrechen")
+        dlg.add_response("clear", "Alle löschen")
+        dlg.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def on_resp(_d, resp):
+            if resp != "clear":
+                return
+            try:
+                rewrite_history([])
+            except Exception:
+                pass
+            self._refresh_history()
+            self._toast("Verlauf gelöscht")
+
+        dlg.connect("response", on_resp)
+        dlg.present(self)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

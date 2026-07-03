@@ -131,10 +131,15 @@ in der Werkbank, `Strg+1–3` Ansichten, `Strg+Q` beenden.
   es, schlägt die App wiederkehrende Wort-Korrekturen fürs Wörterbuch vor.
 - **Sprechererkennung** (Einstellungen → KI, optional, ~34 MB Modell-Download):
   Die App lernt deine Stimme **automatisch aus jedem Diktat** (du sprichst ja
-  ohnehin). In Rekorder-Aufnahmen unterscheidet sie dann per ⋮ → „Sprecher
-  erkennen“ **„Ich“ von anderen Sprechern** und schreibt die Namen ins
-  Transkript. Komplett lokal via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
-  (CAM++-Embeddings, kein PyTorch).
+  ohnehin). In Rekorder-Aufnahmen unterscheidet sie dann **„Ich“ von anderen
+  Sprechern** — automatisch nach jeder Transkription — und schreibt die Namen
+  farbig ins Transkript. Komplett lokal via
+  [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (CAM++-Embeddings,
+  kein PyTorch).
+- **Stimm-Register**: Benenne einen Sprecher einmal per Klick auf seinen
+  Chip („Sprecher 2“ → „Anna“) — die Stimme wird gemerkt und in **allen
+  künftigen Aufnahmen automatisch erkannt**. Verwalten unter Einstellungen →
+  KI → „Bekannte Stimmen“.
 
 ## Dateien
 
@@ -206,17 +211,20 @@ ein Absturz nicht alles verliert:
    Dateien ohne Dauer-Metadaten). Chunk-Länge: `recorder_chunk_seconds`.
    Das Transkript bekommt **`[mm:ss]`-Zeitmarken** pro Absatz (farbig
    hervorgehoben) — ein Klick auf eine Marke springt im Player genau dorthin.
-   Danach schlägt die KI automatisch einen **Titel** vor (abschaltbar:
-   `recorder_auto_title`) und erkennt bei Aufnahmen ab 2 Minuten
-   **Themen-Kapitel** wie bei YouTube: klickbare Sprungmarken unter dem
-   Player (abschaltbar: `recorder_auto_chapters`; manuell über ⋮ → „Kapitel
-   erkennen"). Auch „Frag die Aufnahme" zitiert Zeitmarken — mit
-   Sprung-Knopf direkt zur Stelle.
-3. **Zusammenfassung** – optional via Ollama (Map-Reduce). Ein Klick auf ein
-   **Preset** (Vorlesungsnotizen / Meeting-Protokoll / Action-Items) oder ein
-   eigener **Fokus-Prompt** (z. B. „prüfungsrelevante Definitionen") liefert
-   strukturierte Notizen. Transkript + Notizen lassen sich als Markdown
-   **nach Obsidian exportieren** (Vault-Pfad: `obsidian_vault`).
+3. **Auto-Analyse** – direkt nach der Transkription übernimmt die KI:
+   **Titel** vorschlagen (`recorder_auto_title`), **Sprecher erkennen**
+   (`recorder_auto_speakers`, wenn Sprechererkennung aktiv), ab 2 Minuten
+   **Themen-Kapitel** wie bei YouTube (`recorder_auto_chapters`, Sprungliste
+   am Player) und die Aufnahme **klassifizieren** (Meeting / Vorlesung /
+   Sprachmemo) → die **passende Notiz entsteht von selbst**: Protokoll mit
+   Aufgaben pro Person, Lernnotizen oder Zusammenfassung
+   (`recorder_auto_note`). Jeder Schritt einzeln abschaltbar (Rekorder →
+   Optionen), manuell nachholbar über ⋮ → „Neu analysieren".
+4. **Notizen auf Zuruf** – weitere Notizen via Ollama (Map-Reduce): Preset
+   oder eigener **Fokus-Prompt** (z. B. „prüfungsrelevante Definitionen").
+   Sind Sprecher markiert, ordnet die KI **Aussagen und Aufgaben den
+   Personen zu** („Ich“ vs. andere). Transkript + Notizen lassen sich als
+   Markdown **nach Obsidian exportieren** (Vault-Pfad: `obsidian_vault`).
 
 Im GUI gibt's außerdem live **Pegel-/Wellen-Anzeigen** (sehen, ob Ton ankommt —
 auch vor der Aufnahme), Pause/Fortsetzen und während der Aufnahme die
@@ -224,15 +232,18 @@ auch vor der Aufnahme), Pause/Fortsetzen und während der Aufnahme die
 Aufnahmen-Liste ist **nach Datum gruppiert** (Heute/Gestern/Diese Woche/Älter),
 und jede Zeile kann direkt **angehört** (▶) und **gelöscht** werden. Die
 Quelle (Mic + System / System / Mic) wechselst du mit einem Klick per
-Toggle-Gruppe. Pro Aufnahme gibt es eine **Detail-Seite** mit richtigem
-**Audio-Player (Spulen, ±10 s, Pause, Lautstärke)**, klickbaren
-Zeitmarken, **Suche im Transkript** (mit Treffer-Hervorhebung), editierbarem
-Transkript, Notizen und **„Frag die Aufnahme"** (inhaltliche Fragen, von der
-KI nur aus dem Transkript beantwortet). Über das ⋮-Menü: Obsidian-Export,
-**Untertitel-Export (.srt / .vtt)** aus den Zeitmarken, erneut
-transkribieren, **„Audio entfernen, Transkript behalten"** (spart bei
-Vorlesungen ~40 MB pro Stunde) und Löschen. Die Visualisierung ist in den
-Einstellungen umschaltbar: **Wellen / Balken / Aus**.
+Toggle-Gruppe. Pro Aufnahme gibt es eine **Detail-Seite**: das Transkript
+als großes Dokument (editierbar, klickbare Zeitmarken, farbige
+Sprecher-Namen), darunter eine schmale **Player-Leiste** (Spulen, ±10 s,
+Pause, Lautstärke) mit **Kapitel-Sprungliste** als Popover. Unter dem Titel
+zeigen **Sprecher-Chips** wer wie lange redet — Klick benennt die Person.
+Der **KI-Knopf** bündelt alles: „Frag die Aufnahme" (Antworten nur aus dem
+Transkript, mit Zeitmarken-Sprung), Presets, eigene gespeicherte Vorlagen.
+Über das ⋮-Menü: Neu analysieren, Obsidian-Export, **Untertitel-Export
+(.srt / .vtt)** aus den Zeitmarken, erneut transkribieren, **„Audio
+entfernen, Transkript behalten"** (spart bei Vorlesungen ~40 MB pro Stunde)
+und Löschen. Die Visualisierung ist in den Einstellungen umschaltbar:
+**Wellen / Balken / Aus**.
 
 Dateien liegen unter `~/.local/share/whisper-dictation/recordings/`
 (`.opus`, `.txt`, `.summary.md`). CLI direkt nutzbar:
