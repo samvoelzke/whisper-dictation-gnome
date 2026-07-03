@@ -24,7 +24,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
 
 def detect_alsa_capture_devices() -> list[tuple[str, str]]:
@@ -412,6 +412,68 @@ def _die_with_parent():
         ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
     except Exception:
         pass
+
+
+_MD_INLINE_RE = re.compile(r"(\*\*.+?\*\*|\*[^*\n]+?\*|`[^`\n]+?`)")
+
+
+def _md_ensure_tags(buf: Gtk.TextBuffer) -> None:
+    if buf.get_tag_table().lookup("md-h1") is not None:
+        return
+    buf.create_tag("md-h1", weight=700, scale=1.4)
+    buf.create_tag("md-h2", weight=700, scale=1.25)
+    buf.create_tag("md-h3", weight=700, scale=1.1)
+    buf.create_tag("md-bold", weight=700)
+    buf.create_tag("md-italic", style=Pango.Style.ITALIC)
+    buf.create_tag("md-code", family="monospace")
+
+
+def _md_insert(buf: Gtk.TextBuffer, text: str, tags: tuple = ()) -> None:
+    if not text:
+        return
+    if tags:
+        buf.insert_with_tags_by_name(buf.get_end_iter(), text, *tags)
+    else:
+        buf.insert(buf.get_end_iter(), text)
+
+
+def render_markdown(view: Gtk.TextView, text: str) -> None:
+    """Lightweight Markdown rendering into a TextView — headings, bullets,
+    bold/italic/code. Enough for LLM summaries, no external dependencies."""
+    buf = view.get_buffer()
+    buf.set_text("")
+    _md_ensure_tags(buf)
+
+    def insert_inline(line: str, extra: tuple = ()) -> None:
+        pos = 0
+        for m in _MD_INLINE_RE.finditer(line):
+            _md_insert(buf, line[pos:m.start()], extra)
+            token = m.group(0)
+            if token.startswith("**"):
+                _md_insert(buf, token[2:-2], extra + ("md-bold",))
+            elif token.startswith("`"):
+                _md_insert(buf, token[1:-1], extra + ("md-code",))
+            else:
+                _md_insert(buf, token[1:-1], extra + ("md-italic",))
+            pos = m.end()
+        _md_insert(buf, line[pos:], extra)
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped in ("---", "***", "___"):
+            continue  # horizontal rules add nothing in a notes card
+        if stripped.startswith("#"):
+            level = len(stripped) - len(stripped.lstrip("#"))
+            tag = "md-h1" if level == 1 else ("md-h2" if level == 2 else "md-h3")
+            insert_inline(stripped.lstrip("#").strip(), (tag,))
+        elif re.match(r"^[-*+]\s+", stripped):
+            indent = (len(line) - len(line.lstrip())) // 2
+            _md_insert(buf, "    " * indent + "•  ")
+            insert_inline(re.sub(r"^[-*+]\s+", "", stripped))
+        else:
+            insert_inline(line)
+        _md_insert(buf, "\n")
 
 
 def pw_record_cmd(device: str) -> list[str]:
@@ -2394,7 +2456,8 @@ class RecorderView(Gtk.Box):
 
         notes = self._notes_text()
         has_notes = bool(notes.strip())
-        self._detail["nt_view"].get_buffer().set_text(notes)
+        # Rendered, not raw: the LLM writes Markdown — show it formatted.
+        render_markdown(self._detail["nt_view"], notes)
         self._detail["nt_scroller"].set_visible(has_notes)
         self._detail["nt_actions"].set_visible(has_notes)
         self._detail["nt_empty"].set_visible(not has_notes and not busy)
