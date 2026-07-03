@@ -1562,7 +1562,8 @@ class RecorderView(Gtk.Box):
         if base in self._busy:
             ico = "content-loading-symbolic"
         elif item.get("summarized"):
-            ico = "emblem-ok-symbolic"
+            # not emblem-ok-symbolic: missing from Fedora's Adwaita theme
+            ico = "object-select-symbolic"
         elif item.get("transcribed"):
             ico = "audio-x-generic-symbolic"
         else:
